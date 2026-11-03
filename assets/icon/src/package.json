@@ -1,0 +1,13 @@
+{
+  "name": "vitrine-icon",
+  "private": true,
+  "description": "Build scripts for the Vitrine app icon (SVG -> PNG frames + vitrine.ico).",
+  "scripts": {
+    "svg": "python acrylic.py",
+    "raster": "node build.js",
+    "build": "python acrylic.py && node build.js"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "2.6.2"
+  }
+}
