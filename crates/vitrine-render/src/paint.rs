@@ -386,26 +386,37 @@ impl Painter<'_> {
         Ok(())
     }
 
+    fn ellipse_path(&self, cx: f32, cy: f32, rx: f32, ry: f32) -> Result<ID2D1Geometry> {
+        unsafe {
+            let geo = self.factory.CreatePathGeometry()?;
+            let sink = geo.Open()?;
+            sink.BeginFigure(pt(cx + rx, cy), D2D1_FIGURE_BEGIN_FILLED);
+            for end in [pt(cx - rx, cy), pt(cx + rx, cy)] {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: end,
+                    size: D2D_SIZE_F {
+                        width: rx,
+                        height: ry,
+                    },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            geo.cast()
+        }
+    }
+
     fn shape_geometry(&self, geom: &Geom) -> Result<Option<ID2D1Geometry>> {
         unsafe {
             Ok(Some(match geom {
                 Geom::Group => return Ok(None),
-                Geom::Circle { cx, cy, r } => self
-                    .factory
-                    .CreateEllipseGeometry(&D2D1_ELLIPSE {
-                        point: pt(*cx, *cy),
-                        radiusX: *r,
-                        radiusY: *r,
-                    })?
-                    .cast()?,
-                Geom::Ellipse { cx, cy, rx, ry } => self
-                    .factory
-                    .CreateEllipseGeometry(&D2D1_ELLIPSE {
-                        point: pt(*cx, *cy),
-                        radiusX: *rx,
-                        radiusY: *ry,
-                    })?
-                    .cast()?,
+                // As in SVG, the outline starts at 3 o'clock and runs clockwise, so
+                // dashed rings (progress arcs) begin where authors expect.
+                Geom::Circle { cx, cy, r } => self.ellipse_path(*cx, *cy, *r, *r)?,
+                Geom::Ellipse { cx, cy, rx, ry } => self.ellipse_path(*cx, *cy, *rx, *ry)?,
                 Geom::Rect { x, y, w, h, rx, ry } => self
                     .factory
                     .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {

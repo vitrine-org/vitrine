@@ -16,6 +16,7 @@ use rquickjs::{CaughtError, Context, Function, Object, Runtime};
 use vitrine_render::scene::Op;
 use vitrine_render::value::PropValue;
 
+pub mod appearance;
 pub mod locale;
 
 /// A request from a widget script to the host application.
@@ -295,19 +296,24 @@ impl WidgetScript {
                     ctx.clone(),
                     move |id: u32,
                           url: String,
-                          method: Opt<String>,
-                          headers: Opt<String>,
-                          body: Opt<String>| {
+                          method: Opt<Option<String>>,
+                          headers: Opt<Option<String>>,
+                          body: Opt<Option<String>>| {
                         let headers: BTreeMap<String, String> = headers
                             .0
+                            .flatten()
                             .and_then(|h| serde_json::from_str(&h).ok())
                             .unwrap_or_default();
                         st.borrow_mut().requests.push(HostRequest::Fetch {
                             id,
                             url,
-                            method: method.0.unwrap_or_else(|| "GET".into()).to_uppercase(),
+                            method: method
+                                .0
+                                .flatten()
+                                .unwrap_or_else(|| "GET".into())
+                                .to_uppercase(),
                             headers: headers.into_iter().collect(),
-                            body: body.0,
+                            body: body.0.flatten(),
                         });
                     },
                 )?,
@@ -340,20 +346,26 @@ impl WidgetScript {
             let st = self.state.clone();
             host.set(
                 "storageSet",
-                Function::new(ctx.clone(), move |key: String, value: Opt<String>| {
-                    let mut s = st.borrow_mut();
-                    let mut map: serde_json::Map<String, serde_json::Value> =
-                        serde_json::from_str(&s.storage_json).unwrap_or_default();
-                    match &value.0 {
-                        Some(v) => map.insert(key.clone(), serde_json::Value::String(v.clone())),
-                        None => map.remove(&key),
-                    };
-                    s.storage_json = serde_json::Value::Object(map).to_string();
-                    s.requests.push(HostRequest::StorageSet {
-                        key,
-                        value: value.0,
-                    });
-                })?,
+                Function::new(
+                    ctx.clone(),
+                    move |key: String, value: Opt<Option<String>>| {
+                        let value = Opt(value.0.flatten());
+                        let mut s = st.borrow_mut();
+                        let mut map: serde_json::Map<String, serde_json::Value> =
+                            serde_json::from_str(&s.storage_json).unwrap_or_default();
+                        match &value.0 {
+                            Some(v) => {
+                                map.insert(key.clone(), serde_json::Value::String(v.clone()))
+                            }
+                            None => map.remove(&key),
+                        };
+                        s.storage_json = serde_json::Value::Object(map).to_string();
+                        s.requests.push(HostRequest::StorageSet {
+                            key,
+                            value: value.0,
+                        });
+                    },
+                )?,
             )?;
             let st = self.state.clone();
             host.set(
@@ -371,6 +383,10 @@ impl WidgetScript {
                         st.borrow_mut().requests.push(HostRequest::OpenUrl(url));
                     }
                 })?,
+            )?;
+            host.set(
+                "appearance",
+                Function::new(ctx.clone(), appearance::appearance_json)?,
             )?;
             host.set(
                 "localeInfo",

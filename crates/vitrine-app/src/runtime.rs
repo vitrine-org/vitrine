@@ -74,6 +74,7 @@ pub enum HostMsg {
     Command(u32),
     SessionLocked(bool),
     DisplayOn(bool),
+    AppearanceChanged,
     Edit(crate::edit::Input),
 }
 
@@ -703,6 +704,12 @@ impl Runtime {
                 self.apply_pause();
             }
             HostMsg::Edit(input) => self.edit_input(input),
+            HostMsg::AppearanceChanged => {
+                let json = vitrine_script::appearance::appearance_json();
+                for l in &mut self.widgets {
+                    l.inst.deliver("appearance", &json);
+                }
+            }
         }
     }
 
@@ -1232,7 +1239,17 @@ unsafe extern "system" fn host_proc(
         WM_TIMER => push(HostMsg::Timer(wparam.0)),
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_EDIT => push(HostMsg::Command(Runtime::CMD_EDIT)),
         WM_DISPLAYCHANGE | WM_DPICHANGED => push(HostMsg::DisplayChanged),
-        WM_SETTINGCHANGE if wparam.0 as u32 == SPI_SETWORKAREA.0 => push(HostMsg::DisplayChanged),
+        WM_SETTINGCHANGE => {
+            if wparam.0 as u32 == SPI_SETWORKAREA.0 {
+                push(HostMsg::DisplayChanged);
+            } else if lparam.0 != 0 {
+                let area =
+                    unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
+                if area == "ImmersiveColorSet" {
+                    push(HostMsg::AppearanceChanged);
+                }
+            }
+        }
         WM_WTSSESSION_CHANGE => match wparam.0 as u32 {
             WTS_SESSION_LOCK => push(HostMsg::SessionLocked(true)),
             WTS_SESSION_UNLOCK => push(HostMsg::SessionLocked(false)),
