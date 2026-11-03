@@ -493,7 +493,11 @@ dependencies = [
 name = "vitrine-script"
 version = "2.0.0"
 dependencies = [
+ "log",
  "rquickjs",
+ "serde_json",
+ "vitrine-render",
+ "windows",
 ]
 
 [[package]]
