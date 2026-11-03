@@ -53,7 +53,7 @@ Data lives in `%APPDATA%\Vitrine` (`layout.json`, `settings.json`, `packages\`, 
 Rust (stable, MSVC) on Windows 10/11:
 
 ```
-cargo build --release -p vitrine-app      # targeteleaseitrine.exe
+cargo build --release -p vitrine-app      # target/release/vitrine.exe
 cargo test
 ```
 
