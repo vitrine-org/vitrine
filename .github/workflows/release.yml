@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v2.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release -p vitrine-app
+
+      - name: Stage files
+        shell: pwsh
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          "VERSION=$version" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force dist/vitrine/packs | Out-Null
+          Copy-Item target/release/vitrine.exe dist/vitrine/
+          Copy-Item LICENSE dist/vitrine/
+          # Bundle the latest Essentials pack (skipped if the repo has no release yet).
+          gh release download --repo vitrine-widgets/essentials --pattern "*.vitrine" --dir dist/vitrine/packs 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Warning "no Essentials release found; installer ships without packs" }
+          Get-ChildItem -Recurse dist/vitrine | Select-Object FullName, Length
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y --no-progress }
+          $nsis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $nsis) { $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          & $nsis /DVERSION=$env:VERSION /DSOURCE_DIR=..\dist\vitrine /DOUTPUT_DIR=..\dist installer\vitrine.nsi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Compress-Archive -Path dist/vitrine/* -DestinationPath "dist/vitrine-$env:VERSION-portable.zip"
+
+      - name: Publish release
+        shell: pwsh
+        run: |
+          $assets = @("dist/VitrineSetup-$env:VERSION.exe", "dist/vitrine-$env:VERSION-portable.zip")
+          gh release view $env:TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG @assets --clobber
+          } else {
+            gh release create $env:TAG @assets --title "Vitrine $env:VERSION" --notes-file docs/release-notes/$env:TAG.md
+          }
