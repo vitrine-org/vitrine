@@ -186,6 +186,12 @@ pub fn uninstall(id: &str, packages_dir: &Path) -> Result<()> {
 }
 
 /// Lists installed packages; invalid ones are skipped with a logged reason.
+/// Opens an unpacked package folder (e.g. a `dist/` folder during development).
+pub fn open_dir(dir: &Path) -> Result<InstalledPackage> {
+    let manifest = load_and_verify(dir)?;
+    Ok(InstalledPackage { manifest, dir: dir.to_path_buf() })
+}
+
 pub fn scan(packages_dir: &Path) -> Vec<InstalledPackage> {
     let Ok(rd) = std::fs::read_dir(packages_dir) else { return Vec::new() };
     let mut out = Vec::new();
