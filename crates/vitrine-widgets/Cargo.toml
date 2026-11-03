@@ -1,0 +1,15 @@
+[package]
+name = "vitrine-widgets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+log = "0.4.35"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+thiserror = "2.0.21"
+zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
