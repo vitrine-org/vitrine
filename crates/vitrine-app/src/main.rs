@@ -7,6 +7,7 @@ mod headless;
 mod instance;
 mod logger;
 mod net;
+mod panel;
 mod power;
 mod runtime;
 mod shellapi;
@@ -168,8 +169,10 @@ fn main() {
         }
         Some("--panel") => {
             logger::init_file();
-            // The Slint panel is not part of this build yet: open the data folder instead.
-            shellapi::open(&vitrine_widgets::paths::data_dir().to_string_lossy());
+            if let Err(e) = panel::run(flag(&args, "--instance").map(str::to_string)) {
+                log::error!("control panel: {e}");
+                std::process::exit(1);
+            }
         }
         None | Some("--background") => {
             logger::init_file();

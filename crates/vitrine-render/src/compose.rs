@@ -88,11 +88,9 @@ impl WindowVisual {
             dc.SetTarget(&bitmap);
             dc.BeginDraw();
             let origin = Transform2D::translate(offset.x as f32, offset.y as f32);
-            dc.SetTransform(&windows_numerics::Matrix3x2::translation(
-                offset.x as f32,
-                offset.y as f32,
-            ));
-            // Clear only our rectangle of the (possibly shared) surface.
+            // Clear only our rectangle of the (possibly shared) surface. The clip is
+            // set in surface space, before the offset transform.
+            dc.SetTransform(&windows_numerics::Matrix3x2::identity());
             dc.PushAxisAlignedClip(
                 &D2D_RECT_F {
                     left: offset.x as f32,
@@ -108,6 +106,10 @@ impl WindowVisual {
                 b: 0.0,
                 a: 0.0,
             }));
+            dc.SetTransform(&windows_numerics::Matrix3x2::translation(
+                offset.x as f32,
+                offset.y as f32,
+            ));
             let result = draw(dc, origin);
             dc.PopAxisAlignedClip();
             let end = dc.EndDraw(None, None);
