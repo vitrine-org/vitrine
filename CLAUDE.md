@@ -11,7 +11,7 @@ Use the **frontend-design** skill (plugin `frontend-design@claude-plugins-offici
 - the edit-mode overlay and any on-desktop chrome (`crates/vitrine-desktop`, `crates/vitrine-app`),
 - the control panel (`crates/vitrine-panel`),
 - built-in widgets and widget packs (`widgets/`, and the `vitrine-widgets/*` pack repos),
-- the website (repo `vitrine-widgets/vitrine-widgets.github.io`).
+- the website (separate repo `vitrine-widgets/vitrine-widgets.github.io`).
 
 Follow Windows 11 Fluent conventions for anything that lives on the desktop or in the panel, and
 keep the website minimal (icon, a few concepts, links).
