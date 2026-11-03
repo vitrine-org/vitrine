@@ -1,0 +1,55 @@
+---
+title: Vitrine
+description: Widget per il desktop di Windows, leggeri e interattivi, disegnati sotto le tue icone.
+template: splash
+hero:
+  title: Il tuo desktop, come una griglia di widget vivi
+  tagline: Vitrine disegna widget leggeri e interattivi sotto le icone del desktop di Windows. Restano al loro posto e non finiscono mai davanti ai tuoi file.
+  image:
+    file: ../../../assets/hero-desktop.svg
+    alt: Un desktop di Windows con i widget di Vitrine disposti su una griglia sotto le icone
+  actions:
+    - text: Leggi l'introduzione
+      link: /it/docs/introduction/
+      icon: right-arrow
+    - text: Seguilo su GitHub
+      link: https://github.com/frascella-dev/vitrine
+      icon: external
+      variant: minimal
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+<Aside type="note" title="In arrivo">
+	Vitrine 2 è una riscrittura completa in Rust ed è in pieno sviluppo. Non c'è ancora una release:
+	aggiungi una stella o segui il repository per restare aggiornato.
+</Aside>
+
+## Perché Vitrine
+
+<CardGrid>
+	<Card title="Sotto le tue icone" icon="laptop">
+		I widget stanno tra lo sfondo e le icone del desktop, esattamente dove devono stare. Le icone restano
+		visibili e cliccabili.
+	</Card>
+	<Card title="Comunque interattivi" icon="approve-check">
+		I clic e lo scroll che non cadono su un'icona arrivano al widget sottostante: pulsanti, liste e
+		interruttori funzionano.
+	</Card>
+	<Card title="Una griglia, non un tema" icon="puzzle">
+		Posiziona, ridimensiona e aggancia i widget a una griglia, su ogni monitor. Puoi usare più istanze
+		dello stesso widget, ognuna con le sue impostazioni.
+	</Card>
+	<Card title="Nativo e parsimonioso" icon="rocket">
+		Un motore in Rust con un renderer proprio, senza browser integrato. Vitrine ridisegna solo ciò che
+		cambia e si mette in pausa quando il desktop è nascosto o il risparmio energetico è attivo.
+	</Card>
+	<Card title="Widget in JSX" icon="pencil">
+		Crea widget in JSX con la reattività a grana fine di SolidJS tramite `@vitrine/sdk` e condividili come
+		un singolo file `.vwidget`.
+	</Card>
+	<Card title="Permessi, non sorprese" icon="setting">
+		Ogni widget dichiara ciò di cui ha bisogno (metriche di sistema, host di rete specifici) e non ottiene
+		nient'altro.
+	</Card>
+</CardGrid>

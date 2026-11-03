@@ -1,7 +1,0 @@
-{
-  "name": "Default",
-  "description": "Classic Conky-style system monitor",
-  "author": "Emanuele Frascella",
-  "version": "1.0.0",
-  "entry": "theme.js"
-}

@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Emanuele Frascella"]
+repository = "https://github.com/frascella-dev/vitrine"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

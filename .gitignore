@@ -1,23 +1,18 @@
-# .NET
-.build/
-*.user
-*.suo
-.vs/
-publish/
-
-# NuGet
-.nuget/
-*.nupkg
-
-# Rider
-.idea/
-
-# VS Code
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db
+# Rust
+/target/
+**/*.rs.bk
 
 # Node
 node_modules/
+dist/
+.astro/
+
+# Widget packages and build output
+*.vwidget
+/publish/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

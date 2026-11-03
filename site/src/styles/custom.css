@@ -1,0 +1,20 @@
+/* Vitrine palette, taken from the app icon. */
+
+/* Dark mode (Starlight default) */
+:root {
+	--sl-color-accent-low: #1c1f4d;
+	--sl-color-accent: #6a7bff;
+	--sl-color-accent-high: #c9cfff;
+}
+
+/* Light mode */
+:root[data-theme='light'] {
+	--sl-color-accent-low: #dfe3ff;
+	--sl-color-accent: #3d5afe;
+	--sl-color-accent-high: #1a237e;
+}
+
+.hero img {
+	border-radius: 1rem;
+	box-shadow: 0 24px 64px -24px rgb(61 90 254 / 0.45);
+}

@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 450" width="720" height="450" role="img" aria-label="A Windows desktop with Vitrine widgets arranged on a grid beneath the desktop icons">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151b45"/>
+      <stop offset="0.55" stop-color="#2a1f5c"/>
+      <stop offset="1" stop-color="#4a2160"/>
+    </linearGradient>
+    <radialGradient id="glow1" cx="0.8" cy="0.15" r="0.5">
+      <stop offset="0" stop-color="#3d5afe" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#3d5afe" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow2" cx="0.15" cy="0.9" r="0.5">
+      <stop offset="0" stop-color="#ff7a45" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ff7a45" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <circle cx="20" cy="20" r="1.2" fill="#ffffff" fill-opacity="0.18"/>
+    </pattern>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffc857"/>
+      <stop offset="1" stop-color="#ff7a45"/>
+    </linearGradient>
+    <clipPath id="screen"><rect width="720" height="450" rx="18"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#screen)">
+    <!-- wallpaper -->
+    <rect width="720" height="450" fill="url(#wall)"/>
+    <rect width="720" height="450" fill="url(#glow1)"/>
+    <rect width="720" height="450" fill="url(#glow2)"/>
+    <rect width="720" height="414" fill="url(#grid)"/>
+
+    <g font-family="Segoe UI, system-ui, sans-serif" fill="#ffffff">
+      <!-- clock widget (6×3 cells) -->
+      <rect x="140" y="40" width="240" height="120" rx="14" fill="#ffffff" fill-opacity="0.07" stroke="#ffffff" stroke-opacity="0.14"/>
+      <text x="164" y="110" font-size="56" font-weight="300" letter-spacing="1">21<tspan fill="url(#accent)">:42</tspan></text>
+      <text x="166" y="138" font-size="12" letter-spacing="2.5" fill-opacity="0.7">TUESDAY · 3 NOVEMBER</text>
+
+      <!-- gauges widget (6×3 cells) -->
+      <rect x="400" y="40" width="240" height="120" rx="14" fill="#ffffff" fill-opacity="0.07" stroke="#ffffff" stroke-opacity="0.14"/>
+      <g fill="none" stroke-width="7" stroke-linecap="round">
+        <circle cx="452" cy="90" r="22" stroke="#ffffff" stroke-opacity="0.15"/>
+        <circle cx="452" cy="90" r="22" stroke="#6a7bff" stroke-dasharray="41 138" transform="rotate(-90 452 90)"/>
+        <circle cx="520" cy="90" r="22" stroke="#ffffff" stroke-opacity="0.15"/>
+        <circle cx="520" cy="90" r="22" stroke="#6a7bff" stroke-dasharray="87 138" transform="rotate(-90 520 90)"/>
+        <circle cx="588" cy="90" r="22" stroke="#ffffff" stroke-opacity="0.15"/>
+        <circle cx="588" cy="90" r="22" stroke="url(#accent)" stroke-dasharray="108 138" transform="rotate(-90 588 90)"/>
+      </g>
+      <g font-size="11" letter-spacing="1.5" text-anchor="middle" fill-opacity="0.75">
+        <text x="452" y="140">CPU</text>
+        <text x="520" y="140">RAM</text>
+        <text x="588" y="140">BATTERY</text>
+      </g>
+
+      <!-- system monitor widget (6×4 cells) -->
+      <rect x="140" y="200" width="240" height="160" rx="14" fill="#ffffff" fill-opacity="0.07" stroke="#ffffff" stroke-opacity="0.14"/>
+      <g font-size="11" letter-spacing="1.2" fill-opacity="0.75">
+        <text x="162" y="232">PROCESSOR</text>
+        <text x="162" y="278">MEMORY</text>
+        <text x="162" y="324">STORAGE  C:</text>
+      </g>
+      <g>
+        <rect x="162" y="242" width="196" height="6" rx="3" fill-opacity="0.12"/>
+        <rect x="162" y="242" width="62" height="6" rx="3" fill="#6a7bff"/>
+        <rect x="162" y="288" width="196" height="6" rx="3" fill-opacity="0.12"/>
+        <rect x="162" y="288" width="124" height="6" rx="3" fill="#6a7bff"/>
+        <rect x="162" y="334" width="196" height="6" rx="3" fill-opacity="0.12"/>
+        <rect x="162" y="334" width="150" height="6" rx="3" fill="url(#accent)"/>
+      </g>
+
+      <!-- weather widget (6×4 cells) -->
+      <rect x="400" y="200" width="240" height="160" rx="14" fill="#ffffff" fill-opacity="0.07" stroke="#ffffff" stroke-opacity="0.14"/>
+      <circle cx="450" cy="250" r="18" fill="url(#accent)"/>
+      <g stroke="#ffc857" stroke-width="3" stroke-linecap="round">
+        <line x1="450" y1="220" x2="450" y2="214"/>
+        <line x1="450" y1="280" x2="450" y2="286"/>
+        <line x1="420" y1="250" x2="414" y2="250"/>
+        <line x1="480" y1="250" x2="486" y2="250"/>
+      </g>
+      <text x="500" y="266" font-size="44" font-weight="300">18°</text>
+      <text x="424" y="318" font-size="13" fill-opacity="0.85">Milan · clear sky</text>
+      <text x="424" y="338" font-size="11" fill-opacity="0.6">min 11° · max 21°</text>
+    </g>
+
+    <!-- desktop icons, drawn above the widgets -->
+    <g font-family="Segoe UI, system-ui, sans-serif" font-size="10" fill="#ffffff" text-anchor="middle">
+      <rect x="30" y="34" width="40" height="34" rx="6" fill="#8ab4ff"/>
+      <rect x="30" y="34" width="40" height="9" rx="3" fill="#5c8dfa"/>
+      <text x="50" y="84">Projects</text>
+      <rect x="30" y="106" width="40" height="34" rx="6" fill="#ffd166"/>
+      <rect x="30" y="106" width="40" height="9" rx="3" fill="#f4b740"/>
+      <text x="50" y="156">Photos</text>
+      <rect x="34" y="176" width="32" height="38" rx="5" fill="#e9ecf5"/>
+      <rect x="40" y="186" width="20" height="3" rx="1.5" fill="#9aa3bd"/>
+      <rect x="40" y="194" width="20" height="3" rx="1.5" fill="#9aa3bd"/>
+      <text x="50" y="230">Notes.txt</text>
+      <!-- an icon sitting over a widget: still on top, still clickable -->
+      <rect x="338" y="306" width="34" height="34" rx="8" fill="#6a7bff" stroke="#ffffff" stroke-opacity="0.9" stroke-width="2"/>
+      <path d="M346 316h18M352 316v-3h6v3M348 319l2 15h10l2-15" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="355" y="354">Recycle</text>
+    </g>
+
+    <!-- pointer -->
+    <path d="M362 326l0 22 6-5 4 9 4-2-4-9 8 0z" fill="#ffffff" stroke="#151b45" stroke-width="1.5" stroke-linejoin="round"/>
+
+    <!-- taskbar -->
+    <rect y="414" width="720" height="36" fill="#0d1030" fill-opacity="0.85"/>
+    <g fill="#ffffff">
+      <rect x="318" y="424" width="16" height="16" rx="3" fill="#6a7bff"/>
+      <rect x="344" y="424" width="16" height="16" rx="3" fill-opacity="0.5"/>
+      <rect x="370" y="424" width="16" height="16" rx="3" fill-opacity="0.5"/>
+      <rect x="396" y="424" width="16" height="16" rx="3" fill-opacity="0.5"/>
+    </g>
+  </g>
+</svg>

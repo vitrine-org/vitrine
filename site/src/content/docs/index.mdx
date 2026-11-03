@@ -1,0 +1,54 @@
+---
+title: Vitrine
+description: Lightweight, interactive desktop widgets for Windows, drawn beneath your icons.
+template: splash
+hero:
+  title: Your desktop, as a grid of living widgets
+  tagline: Vitrine draws lightweight, interactive widgets beneath your Windows desktop icons. They stay out of your way and never get in front of your files.
+  image:
+    file: ../../assets/hero-desktop.svg
+    alt: A Windows desktop with Vitrine widgets arranged on a grid beneath the desktop icons
+  actions:
+    - text: Read the introduction
+      link: /docs/introduction/
+      icon: right-arrow
+    - text: Follow on GitHub
+      link: https://github.com/frascella-dev/vitrine
+      icon: external
+      variant: minimal
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+<Aside type="note" title="Coming soon">
+	Vitrine 2 is a ground-up rewrite in Rust and is under active development. Nothing is released yet:
+	star or watch the repository to follow along.
+</Aside>
+
+## Why Vitrine
+
+<CardGrid>
+	<Card title="Beneath your icons" icon="laptop">
+		Widgets live between the wallpaper and the desktop icons, exactly where they belong. Your icons stay
+		visible and clickable.
+	</Card>
+	<Card title="Still interactive" icon="approve-check">
+		Clicks and scrolls that miss an icon reach the widget underneath, so buttons, lists and toggles just
+		work.
+	</Card>
+	<Card title="A grid, not a theme" icon="puzzle">
+		Place, resize and snap widgets on a grid, on every monitor. Run several instances of the same widget,
+		each with its own settings.
+	</Card>
+	<Card title="Native and frugal" icon="rocket">
+		A Rust engine with its own renderer, no browser engine. Vitrine redraws only what changes and pauses
+		when the desktop is hidden or you are on battery saver.
+	</Card>
+	<Card title="Write widgets in JSX" icon="pencil">
+		Build widgets with JSX and SolidJS fine-grained reactivity through `@vitrine/sdk`, then share them as
+		a single `.vwidget` file.
+	</Card>
+	<Card title="Permissions, not surprises" icon="setting">
+		Every widget declares what it needs (system metrics, specific network hosts) and gets nothing else.
+	</Card>
+</CardGrid>
