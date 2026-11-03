@@ -15,7 +15,13 @@ fn agent() -> ureq::Agent {
 }
 
 /// Performs a request and returns the JSON payload for the widget's `fetch` event.
-pub fn perform(id: u32, method: &str, url: &str, headers: &[(String, String)], body: Option<&str>) -> serde_json::Value {
+pub fn perform(
+    id: u32,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> serde_json::Value {
     let result = (|| -> Result<serde_json::Value, String> {
         let agent = agent();
         let mut builder = ureq::http::Request::builder().method(method).uri(url);

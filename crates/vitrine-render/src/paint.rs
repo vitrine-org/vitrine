@@ -65,7 +65,7 @@ impl Painter<'_> {
     }
 
     fn solid(&self, c: Color) -> Result<ID2D1Brush> {
-        unsafe { Ok(self.dc.CreateSolidColorBrush(&d2d_color(c), None)?.cast()?) }
+        unsafe { self.dc.CreateSolidColorBrush(&d2d_color(c), None)?.cast() }
     }
 
     fn fill_brush(&self, fill: &Fill, r: RectF, opacity: f32) -> Result<ID2D1Brush> {
@@ -135,7 +135,7 @@ impl Painter<'_> {
                     radiusX: tl,
                     radiusY: tl,
                 };
-                return Ok(self.factory.CreateRoundedRectangleGeometry(&rr)?.cast()?);
+                return self.factory.CreateRoundedRectangleGeometry(&rr)?.cast();
             }
             let geo = self.factory.CreatePathGeometry()?;
             let sink = geo.Open()?;
@@ -169,7 +169,7 @@ impl Painter<'_> {
             }
             sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             sink.Close()?;
-            Ok(geo.cast()?)
+            geo.cast()
         }
     }
 

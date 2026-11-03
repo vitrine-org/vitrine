@@ -229,11 +229,11 @@ impl Scene {
                 }
             }
             Op::SetText { id, text } => {
-                if let Some(n) = self.nodes.get_mut(&id) {
-                    if n.text != text {
-                        n.text = text;
-                        self.layout_dirty = true;
-                    }
+                if let Some(n) = self.nodes.get_mut(&id)
+                    && n.text != text
+                {
+                    n.text = text;
+                    self.layout_dirty = true;
                 }
             }
             Op::SetProp { id, name, value } => self.set_prop(id, &name, value, now),

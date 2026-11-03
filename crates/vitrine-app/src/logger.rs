@@ -35,11 +35,18 @@ impl log::Log for Logger {
 fn time_of_day() -> String {
     use windows::Win32::System::SystemInformation::GetLocalTime;
     let t = unsafe { GetLocalTime() };
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
 }
 
 pub fn init_stderr() {
-    let level = if std::env::var_os("VITRINE_DEBUG").is_some() { log::LevelFilter::Debug } else { log::LevelFilter::Info };
+    let level = if std::env::var_os("VITRINE_DEBUG").is_some() {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
     let _ = log::set_boxed_logger(Box::new(Logger { file: None, level }));
     log::set_max_level(level);
 }
@@ -51,14 +58,27 @@ pub fn init_file() {
     let day = &time_of_day()[..10];
     let path = dir.join(format!("vitrine-{day}.log"));
     if let Ok(entries) = std::fs::read_dir(&dir) {
-        let mut logs: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "log")).collect();
+        let mut logs: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "log"))
+            .collect();
         logs.sort();
         while logs.len() > 7 {
             let _ = std::fs::remove_file(logs.remove(0));
         }
     }
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new);
-    let level = if std::env::var_os("VITRINE_DEBUG").is_some() { log::LevelFilter::Debug } else { log::LevelFilter::Info };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+        .map(Mutex::new);
+    let level = if std::env::var_os("VITRINE_DEBUG").is_some() {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
     let _ = log::set_boxed_logger(Box::new(Logger { file, level }));
     log::set_max_level(level);
 }

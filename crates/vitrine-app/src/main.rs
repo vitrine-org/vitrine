@@ -1,10 +1,15 @@
 #![windows_subsystem = "windows"]
 //! Vitrine — desktop widgets for Windows, drawn beneath the desktop icons.
 
+mod edit;
+mod grid;
 mod headless;
 mod instance;
 mod logger;
 mod net;
+mod power;
+mod runtime;
+mod shellapi;
 
 use std::path::PathBuf;
 
@@ -15,6 +20,7 @@ USAGE:
   vitrine                         run Vitrine (tray icon, widgets on the desktop)
   vitrine --dev <package-dir>     run and live-reload an unpacked widget package
   vitrine --panel                 open the control panel
+  vitrine --edit | --quit         toggle edit mode / quit the running instance
   vitrine install <file.vitrine>  install a widget package
   vitrine render <package> <widget> [--cells WxH | --size WxH] [--scale S]
                  [--settings JSON] [--wait MS] [--network] --out <file.png>
@@ -35,7 +41,58 @@ fn parse_pair(s: &str) -> Option<(f32, f32)> {
 }
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Opens the control panel (a separate process), optionally on one widget instance.
+pub fn open_panel(instance: Option<&str>) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--panel");
+    if let Some(id) = instance {
+        cmd.args(["--instance", id]);
+    }
+    if let Err(e) = cmd.spawn() {
+        log::error!("cannot open the control panel: {e}");
+    }
+}
+
+/// Returns false if another Vitrine is already running in this session.
+fn single_instance() -> bool {
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+    unsafe {
+        let handle = CreateMutexW(None, true, windows::core::w!("Local\\Vitrine.Singleton"));
+        // Leaked on purpose: the mutex lives as long as the process.
+        handle.is_ok() && GetLastError() != ERROR_ALREADY_EXISTS
+    }
+}
+
+fn install(path: &str) -> i32 {
+    match vitrine_widgets::package::install(
+        std::path::Path::new(path),
+        &vitrine_widgets::paths::packages_dir(),
+    ) {
+        Ok(p) => {
+            println!(
+                "installed {} {} ({} widgets)",
+                p.manifest.id,
+                p.manifest.version,
+                p.manifest.widgets.len()
+            );
+            runtime::notify_reload();
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
 }
 
 fn main() {
@@ -66,21 +123,74 @@ fn main() {
             let size = if let Some(c) = flag(&args, "--cells").and_then(parse_pair) {
                 headless::cells_to_dips(c.0 as u32, c.1 as u32)
             } else {
-                flag(&args, "--size").and_then(parse_pair).unwrap_or(headless::cells_to_dips(4, 2))
+                flag(&args, "--size")
+                    .and_then(parse_pair)
+                    .unwrap_or(headless::cells_to_dips(4, 2))
             };
             let result = headless::run(headless::RenderArgs {
                 package: PathBuf::from(pkg),
                 widget: widget.to_string(),
                 size,
-                scale: flag(&args, "--scale").and_then(|s| s.parse().ok()).unwrap_or(2.0),
+                scale: flag(&args, "--scale")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2.0),
                 settings: flag(&args, "--settings").map(str::to_string),
                 out: PathBuf::from(flag(&args, "--out").unwrap_or("widget.png")),
-                wait_ms: flag(&args, "--wait").and_then(|s| s.parse().ok()).unwrap_or(300),
+                wait_ms: flag(&args, "--wait")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(300),
                 network: args.iter().any(|a| a == "--network"),
             });
             if let Err(e) = result {
                 eprintln!("error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some("install") => {
+            attach_console();
+            let Some(path) = args.get(1) else {
+                eprintln!("{}", usage());
+                std::process::exit(2);
+            };
+            std::process::exit(install(path));
+        }
+        Some("--edit") | Some("--quit") => {
+            let cmd = if cmd == Some("--edit") {
+                runtime::Runtime::CMD_EDIT
+            } else {
+                runtime::Runtime::CMD_QUIT
+            };
+            if !runtime::send_command(cmd) {
+                attach_console();
+                eprintln!("Vitrine is not running");
+                std::process::exit(1);
+            }
+        }
+        Some("--panel") => {
+            logger::init_file();
+            // The Slint panel is not part of this build yet: open the data folder instead.
+            shellapi::open(&vitrine_widgets::paths::data_dir().to_string_lossy());
+        }
+        None | Some("--background") => {
+            logger::init_file();
+            if !single_instance() {
+                log::info!("already running; asking it to reload");
+                runtime::notify_reload();
+                return;
+            }
+            log::info!("Vitrine {} starting", env!("CARGO_PKG_VERSION"));
+            if let Err(e) = runtime::run() {
+                log::error!("fatal: {e}");
+                std::process::exit(1);
+            }
+            log::info!("Vitrine stopped");
+        }
+        Some(path) if path.ends_with(".vitrine") => {
+            // Double-clicked package (file association).
+            logger::init_file();
+            let code = install(path);
+            if code == 0 && !runtime::notify_reload() {
+                let _ = std::process::Command::new(std::env::current_exe().unwrap()).spawn();
             }
         }
         _ => {

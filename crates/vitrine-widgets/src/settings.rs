@@ -82,7 +82,9 @@ fn num_value(n: f64) -> Value {
     if n.fract() == 0.0 && n.abs() < 9.0e15 {
         Value::from(n as i64)
     } else {
-        serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null)
+        serde_json::Number::from_f64(n)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -184,7 +186,8 @@ impl SettingsSchema {
                 let def: SettingDef = serde_json::from_value(val)
                     .map_err(|e| Error::Schema(format!("setting `{key}`: {e}")))?;
                 if let Some(p) = &def.pattern {
-                    Regex::new(p).map_err(|e| Error::Schema(format!("setting `{key}`: bad pattern: {e}")))?;
+                    Regex::new(p)
+                        .map_err(|e| Error::Schema(format!("setting `{key}`: bad pattern: {e}")))?;
                 }
                 if let (Some(a), Some(b)) = (def.min, def.max)
                     && a > b
@@ -197,7 +200,10 @@ impl SettingsSchema {
                 }
                 settings.push((key, def));
             }
-            sections.push(Section { title: rs.title, settings });
+            sections.push(Section {
+                title: rs.title,
+                settings,
+            });
         }
         Ok(SettingsSchema { sections })
     }
@@ -214,13 +220,18 @@ impl SettingsSchema {
 
     /// All declared defaults, in schema order.
     pub fn defaults(&self) -> Map<String, Value> {
-        self.iter().map(|(k, d)| (k.to_string(), d.default_value())).collect()
+        self.iter()
+            .map(|(k, d)| (k.to_string(), d.default_value()))
+            .collect()
     }
 
     /// Fills defaults, drops unknown keys, coerces types, clamps numbers,
     /// rejects values outside `options` and values failing `pattern`.
     /// Returns every per-key error if any value is invalid.
-    pub fn normalize(&self, values: &Map<String, Value>) -> std::result::Result<Map<String, Value>, KeyErrors> {
+    pub fn normalize(
+        &self,
+        values: &Map<String, Value>,
+    ) -> std::result::Result<Map<String, Value>, KeyErrors> {
         let mut out = Map::new();
         let mut errors = Vec::new();
         for (key, def) in self.iter() {
@@ -235,7 +246,11 @@ impl SettingsSchema {
                 Err(e) => errors.push((key.to_string(), e)),
             }
         }
-        if errors.is_empty() { Ok(out) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(out)
+        } else {
+            Err(errors)
+        }
     }
 
     fn effective(&self, key: &str, values: &Map<String, Value>) -> Option<Value> {
@@ -246,7 +261,8 @@ impl SettingsSchema {
     }
 
     fn matches(&self, c: &Condition, values: &Map<String, Value>) -> bool {
-        self.effective(&c.key, values).is_some_and(|v| values_equal(&v, &c.value))
+        self.effective(&c.key, values)
+            .is_some_and(|v| values_equal(&v, &c.value))
     }
 
     /// False when the setting's `visibleWhen` condition is not met.
@@ -307,14 +323,19 @@ mod tests {
     #[test]
     fn normalize_fills_drops_coerces_clamps() {
         let n = schema()
-            .normalize(&map(json!({"size": "50", "zeta": "false", "unknown": 1, "font": "b"})))
+            .normalize(&map(
+                json!({"size": "50", "zeta": "false", "unknown": 1, "font": "b"}),
+            ))
             .unwrap();
         assert_eq!(n["size"], json!(20));
         assert_eq!(n["zeta"], json!(false));
         assert_eq!(n["font"], json!("b"));
         assert_eq!(n["color"], json!("#ffffff"));
         assert!(!n.contains_key("unknown"));
-        assert_eq!(schema().normalize(&map(json!({"size": 1}))).unwrap()["size"], json!(5));
+        assert_eq!(
+            schema().normalize(&map(json!({"size": 1}))).unwrap()["size"],
+            json!(5)
+        );
     }
 
     #[test]
@@ -340,8 +361,15 @@ mod tests {
     #[test]
     fn parse_errors() {
         assert!(SettingsSchema::parse("{}").is_err());
-        assert!(SettingsSchema::parse(r#"[{"title":"t","settings":{"a":{"type":"color"}}}]"#).is_err());
-        assert!(SettingsSchema::parse(r#"[{"title":"t","settings":{"a":{"type":"string","pattern":"("}}}]"#).is_err());
+        assert!(
+            SettingsSchema::parse(r#"[{"title":"t","settings":{"a":{"type":"color"}}}]"#).is_err()
+        );
+        assert!(
+            SettingsSchema::parse(
+                r#"[{"title":"t","settings":{"a":{"type":"string","pattern":"("}}}]"#
+            )
+            .is_err()
+        );
         assert!(SettingsSchema::parse(
             r#"[{"title":"t","settings":{"a":{"type":"string"}}},{"title":"u","settings":{"a":{"type":"string"}}}]"#
         )

@@ -6,6 +6,9 @@
 
 pub mod dcomp;
 pub mod icons;
+pub mod input;
+pub mod monitors;
 pub mod shell;
 pub mod surface;
 pub mod util;
+pub mod window;

@@ -16,7 +16,9 @@ use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGet
 use windows::Win32::System::SystemInformation::{
     GetSystemInfo, GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
 };
-use windows::Win32::System::Threading::{GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{
+    GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::core::PCWSTR;
 
 use crate::Metric;
@@ -141,10 +143,18 @@ impl Sampler {
 }
 
 fn read_cpu_times() -> Option<CpuTimes> {
-    let (mut idle, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
+    let (mut idle, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
     // SAFETY: all three pointers are valid for the call.
     unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }.ok()?;
-    Some(CpuTimes { idle: ft_to_u64(idle), kernel: ft_to_u64(kernel), user: ft_to_u64(user) })
+    Some(CpuTimes {
+        idle: ft_to_u64(idle),
+        kernel: ft_to_u64(kernel),
+        user: ft_to_u64(user),
+    })
 }
 
 fn logical_cores() -> u32 {
@@ -214,16 +224,23 @@ fn drives() -> Value {
         }
         let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
         // SAFETY: out-pointers are valid locals.
-        if unsafe { GetDiskFreeSpaceExW(root_p, Some(&mut avail), Some(&mut total), Some(&mut free)) }.is_err() {
+        if unsafe {
+            GetDiskFreeSpaceExW(root_p, Some(&mut avail), Some(&mut total), Some(&mut free))
+        }
+        .is_err()
+        {
             continue;
         }
         let mut label = [0u16; 261];
         // SAFETY: the label buffer is valid; other outputs are not requested.
-        let label = if unsafe { GetVolumeInformationW(root_p, Some(&mut label), None, None, None, None) }.is_ok() {
-            from_wide(&label)
-        } else {
-            String::new()
-        };
+        let label =
+            if unsafe { GetVolumeInformationW(root_p, Some(&mut label), None, None, None, None) }
+                .is_ok()
+            {
+                from_wide(&label)
+            } else {
+                String::new()
+            };
         list.push(json!({
             "name": format!("{letter}:"),
             "label": label,
@@ -270,7 +287,8 @@ fn processes() -> Value {
 
 fn working_set(pid: u32) -> Option<u64> {
     // SAFETY: failure (protected process, exited) is reported via Err.
-    let h = OwnedHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+    let h =
+        OwnedHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
     let mut pmc = PROCESS_MEMORY_COUNTERS {
         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
         ..Default::default()
@@ -296,7 +314,8 @@ fn read_net_octets() -> Option<(u64, u64)> {
         for r in rows {
             // Bit 1 of the flags is FilterInterface (duplicate of a real NIC).
             let filter = r.InterfaceAndOperStatusFlags._bitfield & 0b10 != 0;
-            if r.Type != IF_TYPE_SOFTWARE_LOOPBACK && r.OperStatus.0 == IF_OPER_STATUS_UP && !filter {
+            if r.Type != IF_TYPE_SOFTWARE_LOOPBACK && r.OperStatus.0 == IF_OPER_STATUS_UP && !filter
+            {
                 rx += r.InOctets;
                 tx += r.OutOctets;
             }
@@ -338,7 +357,9 @@ fn reg_string(value: &str) -> Option<String> {
 
 fn os_version() -> String {
     let mut product = reg_string("ProductName").unwrap_or_else(|| "Windows".to_string());
-    let build: u32 = reg_string("CurrentBuildNumber").and_then(|b| b.parse().ok()).unwrap_or(0);
+    let build: u32 = reg_string("CurrentBuildNumber")
+        .and_then(|b| b.parse().ok())
+        .unwrap_or(0);
     // ProductName still says "Windows 10" on Windows 11.
     if build >= 22000 {
         product = product.replacen("Windows 10", "Windows 11", 1);
@@ -360,8 +381,16 @@ mod tests {
 
     #[test]
     fn cpu_math() {
-        let a = CpuTimes { idle: 100, kernel: 200, user: 100 };
-        let b = CpuTimes { idle: 150, kernel: 300, user: 200 };
+        let a = CpuTimes {
+            idle: 100,
+            kernel: 200,
+            user: 100,
+        };
+        let b = CpuTimes {
+            idle: 150,
+            kernel: 300,
+            user: 200,
+        };
         // total delta 200, idle delta 50 -> 75 %
         assert_eq!(cpu_usage(a, b), 75.0);
         assert_eq!(cpu_usage(a, a), 0.0);

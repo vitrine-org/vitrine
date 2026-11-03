@@ -1,7 +1,6 @@
 //! A running widget: its script, its renderer and the permission checks
 //! between them and the rest of the system.
 
-use std::path::Path;
 use std::time::Instant;
 
 use vitrine_render::gpu::Gpu;
@@ -14,14 +13,25 @@ use vitrine_widgets::package::InstalledPackage;
 /// Side effects a widget asks the application to perform.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    Subscribe { metrics: Vec<String>, interval_ms: u32 },
-    Fetch { id: u32, url: String, method: String, headers: Vec<(String, String)>, body: Option<String> },
-    StorageSet { key: String, value: Option<String> },
+    Subscribe {
+        metrics: Vec<String>,
+        interval_ms: u32,
+    },
+    Fetch {
+        id: u32,
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    },
+    StorageSet {
+        key: String,
+        value: Option<String>,
+    },
     OpenUrl(String),
 }
 
 pub struct WidgetInstance {
-    pub instance_id: String,
     pub package_id: String,
     pub widget: WidgetManifest,
     pub script: WidgetScript,
@@ -34,7 +44,9 @@ pub struct WidgetInstance {
 }
 
 fn host_of(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let host = rest.split(['/', '?', '#']).next()?;
     let host = host.rsplit('@').next()?;
     Some(host.split(':').next()?.to_ascii_lowercase())
@@ -42,7 +54,9 @@ fn host_of(url: &str) -> Option<String> {
 
 /// Whether a `net:<pattern>` permission allows `host` (`*.example.com` matches subdomains).
 pub fn net_allowed(perms: &[Permission], url: &str) -> bool {
-    let Some(host) = host_of(url) else { return false };
+    let Some(host) = host_of(url) else {
+        return false;
+    };
     perms.iter().any(|p| match p {
         Permission::Net(pattern) => {
             let pattern = pattern.to_ascii_lowercase();
@@ -67,7 +81,12 @@ impl WidgetInstance {
     ) -> Result<Self, String> {
         let widget = package
             .widget(widget_id)
-            .ok_or_else(|| format!("package {} has no widget `{widget_id}`", package.manifest.id))?
+            .ok_or_else(|| {
+                format!(
+                    "package {} has no widget `{widget_id}`",
+                    package.manifest.id
+                )
+            })?
             .clone();
         let fonts: Vec<Vec<u8>> = package
             .manifest
@@ -75,7 +94,8 @@ impl WidgetInstance {
             .iter()
             .filter_map(|f| std::fs::read(package.resolve(f)).ok())
             .collect();
-        let mut renderer = WidgetRenderer::new(gpu, Box::new(DirAssets(package.dir.clone())), &fonts);
+        let mut renderer =
+            WidgetRenderer::new(gpu, Box::new(DirAssets(package.dir.clone())), &fonts);
         renderer.set_size(size.0, size.1);
         let info = InitInfo {
             instance_id: instance_id.into(),
@@ -89,7 +109,6 @@ impl WidgetInstance {
         };
         let script = WidgetScript::new(Limits::default(), info).map_err(|e| e.to_string())?;
         let mut inst = Self {
-            instance_id: instance_id.into(),
             package_id: package.manifest.id.clone(),
             widget,
             script,
@@ -121,7 +140,10 @@ impl WidgetInstance {
     }
 
     fn allows_metric(&self, m: &str) -> bool {
-        self.widget.permissions.iter().any(|p| matches!(p, Permission::System(s) if s == m))
+        self.widget
+            .permissions
+            .iter()
+            .any(|p| matches!(p, Permission::System(s) if s == m))
     }
 
     /// Applies script output to the renderer and returns effects for the app.
@@ -131,7 +153,10 @@ impl WidgetInstance {
         for req in self.script.drain() {
             match req {
                 HostRequest::Ops(ops) => self.renderer.apply(ops, now),
-                HostRequest::Subscribe { metrics, interval_ms } => {
+                HostRequest::Subscribe {
+                    metrics,
+                    interval_ms,
+                } => {
                     let (allowed, denied): (Vec<String>, Vec<String>) =
                         metrics.into_iter().partition(|m| self.allows_metric(m));
                     if !denied.is_empty() {
@@ -142,16 +167,35 @@ impl WidgetInstance {
                             denied.join(", ")
                         );
                     }
-                    self.subscription = (!allowed.is_empty()).then(|| (allowed.clone(), interval_ms));
-                    effects.push(Effect::Subscribe { metrics: allowed, interval_ms });
+                    self.subscription =
+                        (!allowed.is_empty()).then(|| (allowed.clone(), interval_ms));
+                    effects.push(Effect::Subscribe {
+                        metrics: allowed,
+                        interval_ms,
+                    });
                 }
-                HostRequest::Fetch { id, url, method, headers, body } => {
+                HostRequest::Fetch {
+                    id,
+                    url,
+                    method,
+                    headers,
+                    body,
+                } => {
                     if net_allowed(&self.widget.permissions, &url) {
-                        effects.push(Effect::Fetch { id, url, method, headers, body });
+                        effects.push(Effect::Fetch {
+                            id,
+                            url,
+                            method,
+                            headers,
+                            body,
+                        });
                     } else {
                         let msg = format!("host not allowed by permissions: {url}");
                         log::warn!("[{}/{}] {msg}", self.package_id, self.widget.id);
-                        self.deliver("fetch", &serde_json::json!({ "id": id, "error": msg }).to_string());
+                        self.deliver(
+                            "fetch",
+                            &serde_json::json!({ "id": id, "error": msg }).to_string(),
+                        );
                     }
                 }
                 HostRequest::Log { level, message } => {
@@ -163,7 +207,9 @@ impl WidgetInstance {
                         LogLevel::Error => log::error!("[{target}] {message}"),
                     }
                 }
-                HostRequest::StorageSet { key, value } => effects.push(Effect::StorageSet { key, value }),
+                HostRequest::StorageSet { key, value } => {
+                    effects.push(Effect::StorageSet { key, value })
+                }
                 HostRequest::OpenUrl(url) => effects.push(Effect::OpenUrl(url)),
             }
         }
@@ -201,27 +247,6 @@ impl WidgetInstance {
             let _ = self.script.set_settings(json);
         }
     }
-
-    /// Sends a pointer event at widget coordinates (DIPs) to the node under it.
-    pub fn pointer(&mut self, ty: &str, x: f32, y: f32, delta_y: f32) -> bool {
-        let target = match self.renderer.hit_test(x, y) {
-            Some(t) => t,
-            None => return false,
-        };
-        let json = serde_json::json!({ "type": ty, "target": target, "x": x, "y": y, "deltaY": delta_y }).to_string();
-        self.deliver("pointer", &json);
-        true
-    }
-
-    /// Whether this widget currently accepts pointer input at a point.
-    pub fn accepts_pointer(&self, x: f32, y: f32) -> bool {
-        self.renderer.hit_test(x, y).is_some()
-    }
-}
-
-/// Reads `widgets/<id>/preview.png`-style paths safely relative to a package.
-pub fn package_file(pkg: &InstalledPackage, rel: &str) -> Option<std::path::PathBuf> {
-    vitrine_widgets::manifest::is_safe_relative_path(rel).then(|| pkg.resolve(rel)).filter(|p: &std::path::PathBuf| Path::new(p).exists())
 }
 
 #[cfg(test)]
@@ -230,8 +255,14 @@ mod tests {
 
     #[test]
     fn net_permissions() {
-        let p = vec![Permission::Net("api.open-meteo.com".into()), Permission::Net("*.example.com".into())];
-        assert!(net_allowed(&p, "https://api.open-meteo.com/v1/forecast?x=1"));
+        let p = vec![
+            Permission::Net("api.open-meteo.com".into()),
+            Permission::Net("*.example.com".into()),
+        ];
+        assert!(net_allowed(
+            &p,
+            "https://api.open-meteo.com/v1/forecast?x=1"
+        ));
         assert!(net_allowed(&p, "https://a.b.example.com/x"));
         assert!(net_allowed(&p, "https://example.com"));
         assert!(!net_allowed(&p, "https://evil.com/?api.open-meteo.com"));

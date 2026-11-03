@@ -36,7 +36,9 @@ impl InstalledPackage {
 
     /// Loads the widget's settings schema, if it declares one.
     pub fn read_settings_schema(&self, widget: &WidgetManifest) -> Result<Option<SettingsSchema>> {
-        let Some(rel) = &widget.settings else { return Ok(None) };
+        let Some(rel) = &widget.settings else {
+            return Ok(None);
+        };
         if !is_safe_relative_path(rel) {
             return Err(Error::Manifest(format!("unsafe settings path `{rel}`")));
         }
@@ -72,7 +74,11 @@ fn unique_suffix() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("{}-{ms:x}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{}-{ms:x}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Safely extracts `archive` into `dest` (which must exist and be empty).
@@ -86,7 +92,10 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
     let mut declared = 0u64;
     for i in 0..zip.len() {
         let entry = zip.by_index(i)?;
-        let name = entry.name().map_err(|e| Error::Archive(format!("bad entry name: {e}")))?.into_owned();
+        let name = entry
+            .name()
+            .map_err(|e| Error::Archive(format!("bad entry name: {e}")))?
+            .into_owned();
         safe_entry_name(&name)?;
         if entry.is_symlink() || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             return archive_err(format!("symlink entry `{}`", name));
@@ -101,7 +110,10 @@ fn extract(archive: &Path, dest: &Path) -> Result<()> {
     let mut written = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().map_err(|e| Error::Archive(format!("bad entry name: {e}")))?.into_owned();
+        let name = entry
+            .name()
+            .map_err(|e| Error::Archive(format!("bad entry name: {e}")))?
+            .into_owned();
         let rel = safe_entry_name(&name)?;
         let target = dest.join(rel);
         if entry.is_dir() {
@@ -140,7 +152,9 @@ fn load_and_verify(dir: &Path) -> Result<PackageManifest> {
     for rel in manifest.referenced_files() {
         let p = dir.join(rel);
         if !p.is_file() {
-            return Err(Error::Manifest(format!("referenced file `{rel}` is missing")));
+            return Err(Error::Manifest(format!(
+                "referenced file `{rel}` is missing"
+            )));
         }
     }
     Ok(manifest)
@@ -169,7 +183,10 @@ pub fn install(archive: &Path, packages_dir: &Path) -> Result<InstalledPackage> 
         std::fs::rename(&tmp.0, &target)?;
     }
     // `tmp` no longer exists; its Drop is a harmless no-op.
-    Ok(InstalledPackage { manifest, dir: target })
+    Ok(InstalledPackage {
+        manifest,
+        dir: target,
+    })
 }
 
 /// Removes `packages_dir/<id>/`. Missing packages are not an error.
@@ -189,11 +206,16 @@ pub fn uninstall(id: &str, packages_dir: &Path) -> Result<()> {
 /// Opens an unpacked package folder (e.g. a `dist/` folder during development).
 pub fn open_dir(dir: &Path) -> Result<InstalledPackage> {
     let manifest = load_and_verify(dir)?;
-    Ok(InstalledPackage { manifest, dir: dir.to_path_buf() })
+    Ok(InstalledPackage {
+        manifest,
+        dir: dir.to_path_buf(),
+    })
 }
 
 pub fn scan(packages_dir: &Path) -> Vec<InstalledPackage> {
-    let Ok(rd) = std::fs::read_dir(packages_dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(packages_dir) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let dir = entry.path();
@@ -235,7 +257,9 @@ pub fn pack(src_dir: &Path, out_file: &Path) -> Result<()> {
     let mut files = Vec::new();
     collect_files(src_dir, src_dir, &mut files)?;
     let out_abs = std::fs::canonicalize(out_file).ok();
-    files.retain(|rel| std::fs::canonicalize(src_dir.join(rel)).ok() != out_abs || out_abs.is_none());
+    files.retain(|rel| {
+        std::fs::canonicalize(src_dir.join(rel)).ok() != out_abs || out_abs.is_none()
+    });
     if files.len() > MAX_FILES {
         return archive_err(format!("too many files ({} > {MAX_FILES})", files.len()));
     }
@@ -297,8 +321,14 @@ mod tests {
 
     fn base_files(id: &str, version: &str) -> Vec<(String, Vec<u8>)> {
         vec![
-            ("vitrine.json".into(), manifest_json(id, version).into_bytes()),
-            ("widgets/clock/index.js".into(), format!("// {version}").into_bytes()),
+            (
+                "vitrine.json".into(),
+                manifest_json(id, version).into_bytes(),
+            ),
+            (
+                "widgets/clock/index.js".into(),
+                format!("// {version}").into_bytes(),
+            ),
             (
                 "widgets/clock/settings.json".into(),
                 br#"[{"title":"G","settings":{"a":{"type":"boolean","default":true}}}]"#.to_vec(),
@@ -350,7 +380,10 @@ mod tests {
     #[test]
     fn install_valid_and_upgrade() {
         let sb = Sandbox::new("ok");
-        let z1 = sb.zip("whatever-name.vitrine", &base_files("dev.vitrine.t", "1.0.0"));
+        let z1 = sb.zip(
+            "whatever-name.vitrine",
+            &base_files("dev.vitrine.t", "1.0.0"),
+        );
         let p = install(&z1, &sb.pkgs()).unwrap();
         assert_eq!(p.dir, sb.pkgs().join("dev.vitrine.t"));
         assert!(p.dir.join("widgets/clock/index.js").is_file());
@@ -364,7 +397,10 @@ mod tests {
         let p2 = install(&z2, &sb.pkgs()).unwrap();
         assert_eq!(p2.manifest.version, "2.0.0");
         assert!(!p2.dir.join("stale.txt").exists());
-        assert_eq!(std::fs::read_to_string(p2.dir.join("widgets/clock/index.js")).unwrap(), "// 2.0.0");
+        assert_eq!(
+            std::fs::read_to_string(p2.dir.join("widgets/clock/index.js")).unwrap(),
+            "// 2.0.0"
+        );
         assert!(leftovers(&sb.pkgs()).is_empty());
 
         let found = scan(&sb.pkgs());
@@ -415,13 +451,18 @@ mod tests {
         w.add_symlink("link", "/etc/passwd", o).unwrap();
         w.finish().unwrap();
         let err = install(&path, &sb.pkgs()).unwrap_err();
-        assert!(matches!(err, Error::Archive(ref m) if m.contains("symlink")), "{err}");
+        assert!(
+            matches!(err, Error::Archive(ref m) if m.contains("symlink")),
+            "{err}"
+        );
         assert!(leftovers(&sb.pkgs()).is_empty());
     }
 
     #[test]
     fn rejects_oversized_and_too_many() {
-        rejects("big", |f| f.push(("big.bin".into(), vec![0u8; 65 * 1024 * 1024])));
+        rejects("big", |f| {
+            f.push(("big.bin".into(), vec![0u8; 65 * 1024 * 1024]))
+        });
         rejects("many", |f| {
             for i in 0..MAX_FILES {
                 f.push((format!("f/{i}.txt"), vec![]));

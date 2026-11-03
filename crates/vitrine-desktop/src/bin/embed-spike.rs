@@ -429,15 +429,14 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         if matches!(
             msg,
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MOUSEWHEEL
-        ) {
-            if let Some(widget) = route(info.pt) {
-                if msg == WM_LBUTTONDOWN {
-                    unsafe {
-                        let _ = PostMessageW(Some(widget), WM_WIDGET_CLICK, WPARAM(0), LPARAM(0));
-                    }
+        ) && let Some(widget) = route(info.pt)
+        {
+            if msg == WM_LBUTTONDOWN {
+                unsafe {
+                    let _ = PostMessageW(Some(widget), WM_WIDGET_CLICK, WPARAM(0), LPARAM(0));
                 }
-                return LRESULT(1); // swallow: the desktop must not start a selection here
             }
+            return LRESULT(1); // swallow: the desktop must not start a selection here
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }

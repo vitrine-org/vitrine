@@ -16,7 +16,11 @@ pub struct GridConfig {
 
 impl Default for GridConfig {
     fn default() -> Self {
-        Self { cell: 64.0, gap: 8.0, margin: 24.0 }
+        Self {
+            cell: 64.0,
+            gap: 8.0,
+            margin: 24.0,
+        }
     }
 }
 
@@ -45,7 +49,11 @@ pub struct Layout {
 
 impl Default for Layout {
     fn default() -> Self {
-        Self { version: 1, grid: GridConfig::default(), instances: Vec::new() }
+        Self {
+            version: 1,
+            grid: GridConfig::default(),
+            instances: Vec::new(),
+        }
     }
 }
 
@@ -72,7 +80,12 @@ impl Layout {
 
     /// Whether the rectangle `(x, y, w, h)` overlaps any instance on `monitor`,
     /// ignoring the instance whose id is `ignore` (used when moving/resizing).
-    pub fn rect_collides(&self, monitor: &str, rect: (i32, i32, i32, i32), ignore: Option<&str>) -> bool {
+    pub fn rect_collides(
+        &self,
+        monitor: &str,
+        rect: (i32, i32, i32, i32),
+        ignore: Option<&str>,
+    ) -> bool {
         self.instances.iter().any(|i| {
             i.monitor == monitor
                 && Some(i.id.as_str()) != ignore
@@ -81,7 +94,14 @@ impl Layout {
     }
 
     /// First free `w`x`h` spot in a `cols`x`rows` grid, scanning row-major.
-    pub fn find_free_spot(&self, monitor: &str, cols: i32, rows: i32, w: i32, h: i32) -> Option<(i32, i32)> {
+    pub fn find_free_spot(
+        &self,
+        monitor: &str,
+        cols: i32,
+        rows: i32,
+        w: i32,
+        h: i32,
+    ) -> Option<(i32, i32)> {
         if w < 1 || h < 1 || w > cols || h > rows {
             return None;
         }

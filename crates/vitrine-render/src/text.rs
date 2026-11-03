@@ -180,10 +180,10 @@ impl TextEngine {
                     layout.SetFontFamilyName(PCWSTR(fam.as_ptr()), range)?;
                     layout.SetFontCollection(self.collection_for(&st.family).as_ref(), range)?;
                 }
-                if st.letter_spacing != 0.0 {
-                    if let Some(l1) = &layout1 {
-                        l1.SetCharacterSpacing(0.0, st.letter_spacing, 0.0, range)?;
-                    }
+                if st.letter_spacing != 0.0
+                    && let Some(l1) = &layout1
+                {
+                    l1.SetCharacterSpacing(0.0, st.letter_spacing, 0.0, range)?;
                 }
                 pos += len;
             }

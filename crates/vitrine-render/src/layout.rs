@@ -317,15 +317,15 @@ impl Builder<'_> {
                     .filter(|v| v.len() == 4);
                 let view_box = view_box.map(|v| [v[0], v[1], v[2], v[3]]);
                 // width/height attributes act as the default size
-                if matches!(style.size.width, d if d == auto()) {
-                    if let Some(w) = self.attr(id, "width").and_then(|v| v.as_f32()) {
-                        style.size.width = length(w);
-                    }
+                if matches!(style.size.width, d if d == auto())
+                    && let Some(w) = self.attr(id, "width").and_then(|v| v.as_f32())
+                {
+                    style.size.width = length(w);
                 }
-                if matches!(style.size.height, d if d == auto()) {
-                    if let Some(h) = self.attr(id, "height").and_then(|v| v.as_f32()) {
-                        style.size.height = length(h);
-                    }
+                if matches!(style.size.height, d if d == auto())
+                    && let Some(h) = self.attr(id, "height").and_then(|v| v.as_f32())
+                {
+                    style.size.height = length(h);
                 }
                 // With only one dimension known, derive the other from the viewBox
                 // (explicitly, so that `align-items: stretch` does not distort it).

@@ -176,14 +176,14 @@ pub fn parse_grid_template(v: &PropValue) -> Vec<GridTemplateComponent<String>> 
             .strip_prefix("repeat(")
             .and_then(|r| r.strip_suffix(')'))
         {
-            if let Some((count, body)) = inner.split_once(',') {
-                if let Ok(n) = count.trim().parse::<u16>() {
-                    let tracks: Vec<TrackSizingFunction> =
-                        split_tracks(body).iter().filter_map(|t| track(t)).collect();
-                    for _ in 0..n {
-                        for t in &tracks {
-                            out.push(GridTemplateComponent::Single(*t));
-                        }
+            if let Some((count, body)) = inner.split_once(',')
+                && let Ok(n) = count.trim().parse::<u16>()
+            {
+                let tracks: Vec<TrackSizingFunction> =
+                    split_tracks(body).iter().filter_map(|t| track(t)).collect();
+                for _ in 0..n {
+                    for t in &tracks {
+                        out.push(GridTemplateComponent::Single(*t));
                     }
                 }
             }

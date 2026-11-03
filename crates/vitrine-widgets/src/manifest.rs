@@ -13,8 +13,7 @@ use crate::{Error, Result};
 pub const MANIFEST_FILE: &str = "vitrine.json";
 
 /// System metrics a widget may request.
-pub const SYSTEM_METRICS: &[&str] =
-    &["cpu", "memory", "battery", "drives", "processes", "network"];
+pub const SYSTEM_METRICS: &[&str] = &["cpu", "memory", "battery", "drives", "processes", "network"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Permission {
@@ -36,8 +35,7 @@ impl Permission {
             let ok = !h.is_empty()
                 && h.len() <= 253
                 && h.split('.').all(|l| {
-                    !l.is_empty()
-                        && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
                 });
             if ok {
                 return Ok(Permission::Net(h.to_ascii_lowercase()));
@@ -79,7 +77,11 @@ pub struct SizeSpec {
 
 impl Default for SizeSpec {
     fn default() -> Self {
-        Self { default: [4, 3], min: [1, 1], max: [16, 16] }
+        Self {
+            default: [4, 3],
+            min: [1, 1],
+            max: [16, 16],
+        }
     }
 }
 
@@ -164,7 +166,10 @@ pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     let mut it = core.split('.');
     let mut next = || -> Option<u64> {
         let p = it.next()?;
-        if p.is_empty() || (p.len() > 1 && p.starts_with('0')) || !p.bytes().all(|b| b.is_ascii_digit()) {
+        if p.is_empty()
+            || (p.len() > 1 && p.starts_with('0'))
+            || !p.bytes().all(|b| b.is_ascii_digit())
+        {
             return None;
         }
         p.parse().ok()
@@ -265,7 +270,11 @@ impl WidgetManifest {
         if self.name.trim().is_empty() {
             return err(format!("widget `{id}`: name is empty"));
         }
-        for (label, p) in [("entry", Some(&self.entry)), ("settings", self.settings.as_ref()), ("preview", self.preview.as_ref())] {
+        for (label, p) in [
+            ("entry", Some(&self.entry)),
+            ("settings", self.settings.as_ref()),
+            ("preview", self.preview.as_ref()),
+        ] {
             if let Some(p) = p
                 && !is_safe_relative_path(p)
             {
@@ -280,7 +289,9 @@ impl WidgetManifest {
         }
         for i in 0..2 {
             if !(s.min[i] <= s.default[i] && s.default[i] <= s.max[i]) {
-                return err(format!("widget `{id}`: size must satisfy min <= default <= max"));
+                return err(format!(
+                    "widget `{id}`: size must satisfy min <= default <= max"
+                ));
             }
         }
         Ok(())
@@ -311,8 +322,14 @@ mod tests {
     #[test]
     fn valid_manifest() {
         let m = PackageManifest::parse_validated(VALID).unwrap();
-        assert_eq!(m.widgets[0].permissions[0], Permission::System("cpu".into()));
-        assert_eq!(m.widgets[0].permissions[2], Permission::Net("api.open-meteo.com".into()));
+        assert_eq!(
+            m.widgets[0].permissions[0],
+            Permission::System("cpu".into())
+        );
+        assert_eq!(
+            m.widgets[0].permissions[2],
+            Permission::Net("api.open-meteo.com".into())
+        );
         assert_eq!(m.referenced_files().len(), 4);
         let again = PackageManifest::parse(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(m, again);
@@ -333,11 +350,13 @@ mod tests {
 
     #[test]
     fn duplicate_widget_ids() {
-        assert!(with(|m| {
-            let w = m.widgets[0].clone();
-            m.widgets.push(w);
-        })
-        .is_err());
+        assert!(
+            with(|m| {
+                let w = m.widgets[0].clone();
+                m.widgets.push(w);
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -350,7 +369,9 @@ mod tests {
 
     #[test]
     fn path_rules() {
-        for bad in ["/a", "../a", "a/../b", "C:/a", "a\\b", "a//b", "", "a/", "./a"] {
+        for bad in [
+            "/a", "../a", "a/../b", "C:/a", "a\\b", "a//b", "", "a/", "./a",
+        ] {
             assert!(!is_safe_relative_path(bad), "{bad}");
             assert!(with(|m| m.widgets[0].entry = bad.into()).is_err(), "{bad}");
         }

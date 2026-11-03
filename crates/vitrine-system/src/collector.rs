@@ -29,7 +29,10 @@ pub struct Scheduler {
 
 impl Default for Scheduler {
     fn default() -> Self {
-        Self { entries: Vec::new(), multiplier: 1.0 }
+        Self {
+            entries: Vec::new(),
+            multiplier: 1.0,
+        }
     }
 }
 
@@ -39,7 +42,8 @@ impl Scheduler {
     }
 
     fn interval(&self, base_ms: u32) -> Duration {
-        let ms = (base_ms.max(MIN_INTERVAL_MS) as f64 * f64::from(self.multiplier)).max(f64::from(MIN_INTERVAL_MS));
+        let ms = (base_ms.max(MIN_INTERVAL_MS) as f64 * f64::from(self.multiplier))
+            .max(f64::from(MIN_INTERVAL_MS));
         Duration::from_millis(ms as u64)
     }
 
@@ -63,7 +67,11 @@ impl Scheduler {
                 .iter()
                 .find(|e| e.metric == metric && e.base_ms == ms)
                 .map_or(now, |e| e.next_due);
-            next.push(Entry { metric, base_ms: ms, next_due });
+            next.push(Entry {
+                metric,
+                base_ms: ms,
+                next_due,
+            });
         }
         self.entries = next;
     }
@@ -245,8 +253,14 @@ fn run(shared: Arc<Shared>, on_snapshot: impl Fn(Value)) {
         }
         let due = sched.take_due(now);
         if due.is_empty() {
-            let wait = sched.next_wakeup().map_or(Duration::from_secs(1), |t| t.saturating_duration_since(now));
-            state = shared.cv.wait_timeout(state, wait).unwrap_or_else(|p| p.into_inner()).0;
+            let wait = sched
+                .next_wakeup()
+                .map_or(Duration::from_secs(1), |t| t.saturating_duration_since(now));
+            state = shared
+                .cv
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
             continue;
         }
         drop(state);
@@ -270,14 +284,33 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Scheduler::new();
         assert!(s.is_empty() && s.next_wakeup().is_none());
-        s.set_plan(&[(Metric::Cpu, 1000), (Metric::Memory, 3000), (Metric::Battery, 10)], t0);
+        s.set_plan(
+            &[
+                (Metric::Cpu, 1000),
+                (Metric::Memory, 3000),
+                (Metric::Battery, 10),
+            ],
+            t0,
+        );
         // Everything due at start; Battery's interval is clamped to 1000.
-        assert_eq!(s.take_due(t0), vec![Metric::Cpu, Metric::Memory, Metric::Battery]);
+        assert_eq!(
+            s.take_due(t0),
+            vec![Metric::Cpu, Metric::Memory, Metric::Battery]
+        );
         assert!(s.take_due(t0 + ms(500)).is_empty());
         assert_eq!(s.next_wakeup(), Some(t0 + ms(1000)));
-        assert_eq!(s.take_due(t0 + ms(1000)), vec![Metric::Cpu, Metric::Battery]);
-        assert_eq!(s.take_due(t0 + ms(2000)), vec![Metric::Cpu, Metric::Battery]);
-        assert_eq!(s.take_due(t0 + ms(3000)), vec![Metric::Cpu, Metric::Memory, Metric::Battery]);
+        assert_eq!(
+            s.take_due(t0 + ms(1000)),
+            vec![Metric::Cpu, Metric::Battery]
+        );
+        assert_eq!(
+            s.take_due(t0 + ms(2000)),
+            vec![Metric::Cpu, Metric::Battery]
+        );
+        assert_eq!(
+            s.take_due(t0 + ms(3000)),
+            vec![Metric::Cpu, Metric::Memory, Metric::Battery]
+        );
     }
 
     #[test]
@@ -287,9 +320,22 @@ mod tests {
         s.set_plan(&[(Metric::Cpu, 2000), (Metric::Drives, 5000)], t0);
         s.take_due(t0);
         // Cpu unchanged keeps its deadline, Drives changes -> due now, Network new -> due now.
-        s.set_plan(&[(Metric::Cpu, 2000), (Metric::Drives, 4000), (Metric::Network, 1000)], t0 + ms(500));
-        assert_eq!(s.take_due(t0 + ms(500)), vec![Metric::Drives, Metric::Network]);
-        assert_eq!(s.take_due(t0 + ms(2000)), vec![Metric::Cpu, Metric::Network]);
+        s.set_plan(
+            &[
+                (Metric::Cpu, 2000),
+                (Metric::Drives, 4000),
+                (Metric::Network, 1000),
+            ],
+            t0 + ms(500),
+        );
+        assert_eq!(
+            s.take_due(t0 + ms(500)),
+            vec![Metric::Drives, Metric::Network]
+        );
+        assert_eq!(
+            s.take_due(t0 + ms(2000)),
+            vec![Metric::Cpu, Metric::Network]
+        );
         s.set_plan(&[], t0 + ms(2000));
         assert!(s.is_empty() && s.take_due(t0 + ms(9000)).is_empty());
     }
