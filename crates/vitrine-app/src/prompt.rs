@@ -50,6 +50,8 @@ fn text(v: &Value, key: &str, max: usize) -> String {
 pub fn run(options: &str, at: Option<(i32, i32)>) -> Result<(), String> {
     let v: Value = serde_json::from_str(options).unwrap_or_default();
     let ui = PromptWindow::new().map_err(|e| e.to_string())?;
+    crate::i18n::apply_to_slint();
+    ui.set_ui_font(crate::i18n::ui_font().into());
     let heading = text(&v, "title", 80);
     if !heading.is_empty() {
         ui.set_heading(heading.into());

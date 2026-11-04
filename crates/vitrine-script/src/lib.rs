@@ -103,6 +103,8 @@ pub struct InitInfo {
     pub width: f32,
     pub height: f32,
     pub engine_version: String,
+    /// Vitrine's UI language (`"en"`, `"it"`, `"pt-BR"`, `"zh"`, …).
+    pub language: String,
 }
 
 #[derive(Default)]
@@ -423,6 +425,7 @@ impl WidgetScript {
                 "widgetId": info.widget_id,
                 "packageId": info.package_id,
                 "engineVersion": info.engine_version,
+                "language": if info.language.is_empty() { "en" } else { info.language.as_str() },
             })
             .to_string();
             host.set("info", meta)?;
@@ -580,6 +583,40 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn info_carries_the_ui_language() {
+        let mut s = WidgetScript::new(
+            Limits::default(),
+            InitInfo {
+                language: "pt-BR".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.run_bundle(
+            "__vitrine.log('info', JSON.parse(__vitrine.info).language);",
+            "t.js",
+        )
+        .unwrap();
+        let reqs = s.drain();
+        assert!(
+            reqs.iter()
+                .any(|r| matches!(r, HostRequest::Log { message, .. } if message == "pt-BR"))
+        );
+        // Without a language the widget sees English.
+        let mut s = script();
+        s.run_bundle(
+            "__vitrine.log('info', JSON.parse(__vitrine.info).language);",
+            "t.js",
+        )
+        .unwrap();
+        assert!(
+            s.drain()
+                .iter()
+                .any(|r| matches!(r, HostRequest::Log { message, .. } if message == "en"))
+        );
     }
 
     #[test]

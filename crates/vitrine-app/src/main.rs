@@ -6,6 +6,7 @@ mod flyout;
 mod glass;
 mod grid;
 mod headless;
+mod i18n;
 mod instance;
 mod logger;
 mod net;
@@ -202,6 +203,9 @@ fn strip_verbatim(p: &std::path::Path) -> PathBuf {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let config = vitrine_widgets::config::Config::load(&vitrine_widgets::paths::config_path())
+        .unwrap_or_default();
+    i18n::init(config.language.as_deref());
     match parse_args(&args) {
         Cmd::Version => {
             attach_console();

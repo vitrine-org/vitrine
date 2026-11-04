@@ -236,7 +236,9 @@ export component PanelWindow inherits Window {
     preferred-height: 680px;
     min-width: 760px;
     min-height: 500px;
-    default-font-family: "Segoe UI Variable Text";
+    // Set from Rust: the Windows UI font for CJK languages.
+    in property <string> ui-font: "Segoe UI Variable Text";
+    default-font-family: root.ui-font;
     default-font-size: 14px;
 
     // 0 widgets, 1 gallery, 2 packages, 3 general, 4 instance settings, 5 widget detail
@@ -255,6 +257,9 @@ export component PanelWindow inherits Window {
     in-out property <bool> slow-on-battery;
     in-out property <string> hotkey;
     in property <string> hotkey-error;
+    // "System" first, then each language in its own name.
+    in property <[string]> languages;
+    in-out property <int> language-index;
 
     in property <LibraryRow> detail;
     in property <image> detail-preview;
@@ -279,6 +284,7 @@ export component PanelWindow inherits Window {
     callback set-autostart(bool);
     callback set-slow-on-battery(bool);
     callback set-hotkey(string);
+    callback set-language(int);
     callback open-folder();
     callback open-site();
     callback edit-layout();
@@ -310,25 +316,25 @@ export component PanelWindow inherits Window {
                 }
                 NavItem {
                     glyph: "\u{E8A9}";
-                    label: "My widgets";
+                    label: @tr("My widgets");
                     selected: root.page == 0 || root.page == 4;
                     clicked => { root.page = 0; }
                 }
                 NavItem {
                     glyph: "\u{E710}";
-                    label: "Add widgets";
+                    label: @tr("Add widgets");
                     selected: root.page == 1 || root.page == 5;
                     clicked => { root.page = 1; }
                 }
                 NavItem {
                     glyph: "\u{E7B8}";
-                    label: "Packages";
+                    label: @tr("Packages");
                     selected: root.page == 2;
                     clicked => { root.page = 2; }
                 }
                 NavItem {
                     glyph: "\u{E713}";
-                    label: "General";
+                    label: @tr("General");
                     selected: root.page == 3;
                     clicked => { root.page = 3; }
                 }
@@ -341,7 +347,7 @@ export component PanelWindow inherits Window {
                     animate opacity { duration: 200ms; }
                 }
                 Caption {
-                    text: "Version " + root.version;
+                    text: @tr("Version {}", root.version);
                     x: 12px;
                 }
             }
@@ -354,18 +360,18 @@ export component PanelWindow inherits Window {
             Page {
                 active: root.page == 0;
                 HorizontalLayout {
-                    PageTitle { text: "My widgets"; }
+                    PageTitle { text: @tr("My widgets"); }
                     Rectangle { }
                     VerticalLayout {
                         alignment: center;
                         Button {
-                            text: "Edit layout";
+                            text: @tr("Edit layout");
                             clicked => { root.edit-layout(); }
                         }
                     }
                 }
                 Caption {
-                    text: "Widgets on your desktop. Arrange them in Edit layout (Ctrl+Alt+V): your windows step aside while you do.";
+                    text: @tr("The widgets on your desktop. Arrange them in Edit layout (Ctrl+Alt+V); your windows step aside while you do.");
                 }
                 Rectangle { height: 8px; }
                 if root.instances.length == 0: Card {
@@ -374,13 +380,13 @@ export component PanelWindow inherits Window {
                         alignment: center;
                         spacing: 10px;
                         Caption {
-                            text: "No widgets yet.";
+                            text: @tr("No widgets yet.");
                             horizontal-alignment: center;
                         }
                         HorizontalLayout {
                             alignment: center;
                             Button {
-                                text: "Browse widgets";
+                                text: @tr("Browse widgets");
                                 primary: true;
                                 clicked => { root.page = 1; }
                             }
@@ -406,14 +412,14 @@ export component PanelWindow inherits Window {
                         if item.has-settings: VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Settings";
+                                text: @tr("Settings");
                                 clicked => { root.open-settings(item.id); }
                             }
                         }
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Remove";
+                                text: @tr("Remove");
                                 clicked => { root.remove-instance(item.id); }
                             }
                         }
@@ -424,17 +430,17 @@ export component PanelWindow inherits Window {
             Page {
                 active: root.page == 1;
                 HorizontalLayout {
-                    PageTitle { text: "Add widgets"; }
+                    PageTitle { text: @tr("Add widgets"); }
                     Rectangle { }
                     VerticalLayout {
                         alignment: center;
                         Button {
-                            text: "Get more widgets";
+                            text: @tr("Get more widgets");
                             clicked => { root.open-site(); }
                         }
                     }
                 }
-                Caption { text: "Choose a widget to preview it, pick a size and add it to your desktop."; }
+                Caption { text: @tr("Choose a widget to preview it, pick a size and add it to your desktop."); }
                 Rectangle { height: 8px; }
                 grid := Rectangle {
                     property <length> gap: 12px;
@@ -456,19 +462,19 @@ export component PanelWindow inherits Window {
             Page {
                 active: root.page == 2;
                 HorizontalLayout {
-                    PageTitle { text: "Packages"; }
+                    PageTitle { text: @tr("Packages"); }
                     Rectangle { }
                     VerticalLayout {
                         alignment: center;
                         Button {
-                            text: "Install package…";
+                            text: @tr("Install package…");
                             primary: true;
                             clicked => { root.install-file(); }
                         }
                     }
                 }
                 Caption {
-                    text: "A package (.vitrine) contains one or more widgets. Double-click a .vitrine file to install it.";
+                    text: @tr("A package (.vitrine) contains one or more widgets. Double-click a .vitrine file to install it.");
                 }
                 Rectangle { height: 8px; }
                 for item in root.packages: Card {
@@ -485,7 +491,7 @@ export component PanelWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Uninstall";
+                                text: @tr("Uninstall");
                                 clicked => { root.uninstall(item.id); }
                             }
                         }
@@ -495,7 +501,7 @@ export component PanelWindow inherits Window {
 
             Page {
                 active: root.page == 3;
-                PageTitle { text: "General"; }
+                PageTitle { text: @tr("General"); }
                 Rectangle { height: 8px; }
                 Card {
                     height: 68px;
@@ -504,8 +510,8 @@ export component PanelWindow inherits Window {
                         padding-right: 16px;
                         VerticalLayout {
                             alignment: center;
-                            Text { text: "Start with Windows"; }
-                            Caption { text: "Show your widgets when you sign in."; }
+                            Text { text: @tr("Start with Windows"); }
+                            Caption { text: @tr("Show your widgets when you sign in."); }
                         }
                         Rectangle { }
                         Switch {
@@ -521,8 +527,8 @@ export component PanelWindow inherits Window {
                         padding-right: 16px;
                         VerticalLayout {
                             alignment: center;
-                            Text { text: "Save battery"; }
-                            Caption { text: "Update system widgets less often on battery power."; }
+                            Text { text: @tr("Save battery"); }
+                            Caption { text: @tr("Update system widgets less often on battery power."); }
                         }
                         Rectangle { }
                         Switch {
@@ -540,8 +546,8 @@ export component PanelWindow inherits Window {
                         spacing: 12px;
                         VerticalLayout {
                             alignment: center;
-                            Text { text: "Edit layout shortcut"; }
-                            Caption { text: "For example Ctrl+Alt+V. Applies the next time Vitrine starts."; }
+                            Text { text: @tr("Edit layout shortcut"); }
+                            Caption { text: @tr("For example Ctrl+Alt+V. Takes effect the next time Vitrine starts."); }
                             if root.hotkey-error != "": Text {
                                 text: root.hotkey-error;
                                 color: #e81123;
@@ -565,16 +571,39 @@ export component PanelWindow inherits Window {
                     HorizontalLayout {
                         padding-left: 16px;
                         padding-right: 16px;
+                        spacing: 12px;
                         VerticalLayout {
                             alignment: center;
-                            Text { text: "Data folder"; }
-                            Caption { text: "Layout, settings, packages and logs."; }
+                            Text { text: @tr("Language"); }
+                            Caption { text: @tr("Used by Vitrine and by widgets that support it."); }
+                        }
+                        Rectangle { }
+                        VerticalLayout {
+                            alignment: center;
+                            ComboBox {
+                                width: 220px;
+                                model: root.languages;
+                                current-index <=> root.language-index;
+                                selected => { root.set-language(self.current-index); }
+                            }
+                        }
+                    }
+                }
+                Card {
+                    height: 68px;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        VerticalLayout {
+                            alignment: center;
+                            Text { text: @tr("Data folder"); }
+                            Caption { text: @tr("Layout, settings, packages and logs."); }
                         }
                         Rectangle { }
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Open";
+                                text: @tr("Open");
                                 clicked => { root.open-folder(); }
                             }
                         }
@@ -671,7 +700,7 @@ export component PanelWindow inherits Window {
                 HorizontalLayout {
                     padding-top: 8px;
                     Button {
-                        text: "Reset to defaults";
+                        text: @tr("Reset to defaults");
                         clicked => { root.reset-settings(); }
                     }
                     Rectangle { }
@@ -701,7 +730,7 @@ export component PanelWindow inherits Window {
                 }
                 Rectangle { height: 12px; }
                 Text {
-                    text: "Size";
+                    text: @tr("Size");
                     font-weight: 600;
                 }
                 HorizontalLayout {
@@ -721,12 +750,12 @@ export component PanelWindow inherits Window {
                     spacing: 8px;
                     alignment: start;
                     Button {
-                        text: "Add to desktop";
+                        text: @tr("Add to desktop");
                         primary: true;
                         clicked => { root.add-detail(); }
                     }
                     Button {
-                        text: "Place it myself…";
+                        text: @tr("Place it myself…");
                         clicked => { root.place-detail(); }
                     }
                 }
@@ -737,7 +766,9 @@ export component PanelWindow inherits Window {
 
 // A one-line text prompt for widgets (they never get keyboard focus).
 export component PromptWindow inherits Window {
-    in property <string> heading: "Add item";
+    in property <string> ui-font: "Segoe UI Variable Text";
+    default-font-family: root.ui-font;
+    in property <string> heading: @tr("Add item");
     in property <string> placeholder;
     in property <string> initial;
     callback accepted(string);
@@ -773,11 +804,11 @@ export component PromptWindow inherits Window {
                 alignment: end;
                 spacing: 8px;
                 Button {
-                    text: "Cancel";
+                    text: @tr("Cancel");
                     clicked => { root.cancelled(); }
                 }
                 Button {
-                    text: "Save";
+                    text: @tr("Save");
                     primary: true;
                     clicked => { root.accepted(input.text); }
                 }

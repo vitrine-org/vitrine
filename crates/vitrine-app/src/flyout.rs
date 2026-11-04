@@ -299,6 +299,7 @@ struct Fonts {
 
 impl Fonts {
     fn new(dwrite: &IDWriteFactory5) -> Result<Fonts> {
+        let locale = windows::core::HSTRING::from(crate::i18n::locale_name());
         unsafe {
             let make = |family: PCWSTR, size: f32, center: bool| -> Result<IDWriteTextFormat> {
                 let f = dwrite.CreateTextFormat(
@@ -308,7 +309,7 @@ impl Fonts {
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
                     size,
-                    w!("en-us"),
+                    &locale,
                 )?;
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;

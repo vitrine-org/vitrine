@@ -17,6 +17,7 @@ use vitrine_widgets::paths;
 use vitrine_widgets::settings::{SettingDef, SettingType, SettingsSchema};
 
 use crate::grid::Geometry;
+use crate::i18n::{self, t, tf, tn};
 use crate::runtime;
 use crate::shellapi;
 
@@ -39,6 +40,15 @@ struct State {
     preview_gen: Arc<AtomicU64>,
     /// Debounces settings-page previews while the user types.
     preview_timer: Rc<slint::Timer>,
+}
+
+/// Installed packages, with names and descriptions in the UI language.
+fn scan_packages() -> Vec<InstalledPackage> {
+    let mut packages = package::scan(&paths::packages_dir());
+    for p in &mut packages {
+        p.manifest.localize(i18n::language());
+    }
+    packages
 }
 
 fn layout_stamp() -> Option<SystemTime> {
@@ -69,7 +79,7 @@ impl State {
 
     fn load() -> State {
         State {
-            packages: package::scan(&paths::packages_dir()),
+            packages: scan_packages(),
             layout: Layout::load(&paths::layout_path()).unwrap_or_default(),
             layout_stamp: layout_stamp(),
             config: Config::load(&paths::config_path()).unwrap_or_default(),
@@ -222,6 +232,19 @@ fn size_choices(w: &vitrine_widgets::manifest::WidgetManifest) -> Vec<(i32, i32)
     out
 }
 
+/// The language selector: "Windows default", then each language in its own name.
+fn set_languages(ui: &PanelWindow, config: &Config) {
+    let mut names = vec![s(t("language.system"))];
+    names.extend(i18n::LANGUAGES.iter().map(|(_, name)| s(*name)));
+    ui.set_languages(ModelRc::new(VecModel::from(names)));
+    let chosen = config.language.as_deref().unwrap_or(i18n::SYSTEM);
+    let index = i18n::LANGUAGES
+        .iter()
+        .position(|(c, _)| c.eq_ignore_ascii_case(chosen))
+        .map_or(0, |i| i as i32 + 1);
+    ui.set_language_index(index);
+}
+
 fn open_detail(ui: &PanelWindow, st: &mut State, package: &str, widget: &str) {
     let Some(pkg) = st.package(package).cloned() else {
         return;
@@ -305,7 +328,7 @@ fn instance_rows(st: &State) -> Vec<InstanceRow> {
             let pkg = st.package(&i.package);
             let w = pkg.and_then(|p| p.widget(&i.widget));
             let monitor = if i.monitor.eq_ignore_ascii_case("primary") {
-                "main monitor".to_string()
+                t("row.main_monitor")
             } else {
                 i.monitor.trim_start_matches(r"\\.\").to_string()
             };
@@ -316,7 +339,7 @@ fn instance_rows(st: &State) -> Vec<InstanceRow> {
                     .unwrap_or_else(|| i.widget.clone())),
                 detail: s(match pkg {
                     Some(p) => format!("{} · {}×{} · {}", p.manifest.name, i.w, i.h, monitor),
-                    None => format!("Missing package {}", i.package),
+                    None => tf("row.missing_package", &[("id", &i.package)]),
                 }),
                 has_settings: w.is_some_and(|w| w.settings.is_some()),
                 preview: match (pkg, w) {
@@ -349,12 +372,10 @@ fn package_rows(st: &State) -> Vec<PackageRow> {
     st.packages
         .iter()
         .map(|p| {
-            let n = p.manifest.widgets.len();
             let mut detail = format!(
-                "Version {} · {} widget{}",
-                p.manifest.version,
-                n,
-                if n == 1 { "" } else { "s" }
+                "{} · {}",
+                tf("row.version", &[("version", &p.manifest.version)]),
+                tn("row.widgets", p.manifest.widgets.len() as u64)
             );
             if !p.manifest.author.is_empty() {
                 detail.push_str(&format!(" · {}", p.manifest.author));
@@ -478,16 +499,19 @@ fn open_settings(ui: &PanelWindow, st: &mut State, id: &str) {
     let Some(w) = pkg.widget(&inst.widget).cloned() else {
         return;
     };
-    let schema = pkg.read_settings_schema(&w).ok().flatten();
+    let schema = pkg.read_settings_schema(&w).ok().flatten().map(|mut s| {
+        s.localize(i18n::language());
+        s
+    });
     let mut values = schema.as_ref().map(|s| s.defaults()).unwrap_or_default();
     values.extend(inst.settings.clone());
     st.editing = Some(id.to_string());
     st.schema = schema;
     st.values = values;
     ui.set_settings_title(s(w.name.as_str()));
-    ui.set_settings_subtitle(s(format!(
-        "{} · changes apply immediately",
-        pkg.manifest.name
+    ui.set_settings_subtitle(s(tf(
+        "row.settings_subtitle",
+        &[("pack", &pkg.manifest.name)],
     )));
     ui.set_settings(ModelRc::new(VecModel::from(settings_rows(st))));
     ui.set_settings_preview(preview_image(&pkg, &w));
@@ -516,7 +540,7 @@ fn apply_setting(ui: &PanelWindow, st: &mut State, key: &str, value: Value) {
                     i.settings = stored;
                 }
             }) {
-                ui.set_status(s(format!("Could not save: {e}")));
+                ui.set_status(s(tf("status.could_not_save", &[("error", &e)])));
             }
             String::new()
         }
@@ -525,7 +549,7 @@ fn apply_setting(ui: &PanelWindow, st: &mut State, key: &str, value: Value) {
             errors
                 .into_iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, m)| m)
+                .map(|(_, m)| error_text(&schema, key, m))
                 .unwrap_or_default()
         }
     };
@@ -550,6 +574,23 @@ fn apply_setting(ui: &PanelWindow, st: &mut State, key: &str, value: Value) {
         }
         model.set_row_data(i, row);
     }
+}
+
+/// A validation error in the UI language: the widget's own (localised)
+/// `patternMessage`, or a generic message for the engine's checks.
+fn error_text(schema: &SettingsSchema, key: &str, message: String) -> String {
+    if schema
+        .get(key)
+        .and_then(|d| d.pattern_message.as_ref())
+        .is_some_and(|m| *m == message)
+    {
+        return message;
+    }
+    t(match message.as_str() {
+        "expected a number" => "setting.error_number",
+        "value is not one of the allowed options" => "setting.error_option",
+        _ => "setting.error_invalid",
+    })
 }
 
 fn refresh(ui: &PanelWindow, st: &State) {
@@ -577,9 +618,9 @@ fn add_widget(
         .ok_or("no monitor")?;
     let g = Geometry::for_monitor(&st.layout.grid, primary);
     let (cw, ch) = size.unwrap_or((w.size.default[0] as i32, w.size.default[1] as i32));
-    let mut placed = Err(format!(
-        "No free space for {} ({cw}×{ch}). Make room in Edit layout.",
-        w.name
+    let mut placed = Err(tf(
+        "status.no_space",
+        &[("name", &w.name), ("size", &format!("{cw}×{ch}"))],
     ));
     st.update_layout(|l| {
         if let Some((x, y)) = l.find_free_spot("primary", g.cols, g.rows, cw, ch) {
@@ -594,7 +635,7 @@ fn add_widget(
                 h: ch,
                 settings: Map::new(),
             });
-            placed = Ok(format!("Added {}", w.name));
+            placed = Ok(tf("status.added", &[("name", &w.name)]));
         }
     })?;
     placed
@@ -605,22 +646,25 @@ fn pick_package() -> Option<std::path::PathBuf> {
     use windows::Win32::System::Com::*;
     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
     use windows::Win32::UI::Shell::*;
-    use windows::core::w;
+    use windows::core::{HSTRING, PCWSTR, w};
+    let packages = HSTRING::from(t("dialog.filter_packages"));
+    let all = HSTRING::from(t("dialog.filter_all"));
+    let title = HSTRING::from(t("dialog.install_title"));
     unsafe {
         let dialog: IFileOpenDialog =
             CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         let filters = [
             COMDLG_FILTERSPEC {
-                pszName: w!("Vitrine packages"),
+                pszName: PCWSTR(packages.as_ptr()),
                 pszSpec: w!("*.vitrine"),
             },
             COMDLG_FILTERSPEC {
-                pszName: w!("All files"),
+                pszName: PCWSTR(all.as_ptr()),
                 pszSpec: w!("*.*"),
             },
         ];
         dialog.SetFileTypes(&filters).ok()?;
-        dialog.SetTitle(w!("Install a widget package")).ok()?;
+        dialog.SetTitle(&title).ok()?;
         dialog.Show(None).ok()?;
         let item = dialog.GetResult().ok()?;
         let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
@@ -638,9 +682,12 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         );
     }
     let ui = PanelWindow::new().map_err(|e| e.to_string())?;
+    i18n::apply_to_slint();
+    ui.set_ui_font(s(i18n::ui_font()));
     let st = Rc::new(RefCell::new(State::load()));
     {
         let st = st.borrow();
+        set_languages(&ui, &st.config);
         ui.set_version(s(env!("CARGO_PKG_VERSION")));
         ui.set_autostart(shellapi::autostart_enabled());
         ui.set_slow_on_battery(st.config.pause_on_battery_saver);
@@ -671,8 +718,8 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
     ui.on_remove_instance(with!(|ui, st, id: SharedString| {
         let id = id.to_string();
         match st.update_layout(|l| l.instances.retain(|i| i.id != id)) {
-            Ok(()) => ui.set_status(s("Widget removed")),
-            Err(e) => ui.set_status(s(format!("Could not save: {e}"))),
+            Ok(()) => ui.set_status(s(t("status.widget_removed"))),
+            Err(e) => ui.set_status(s(tf("status.could_not_save", &[("error", &e)]))),
         }
         refresh(&ui, st);
     }));
@@ -717,9 +764,9 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
     }));
     ui.on_place_detail(with!(|ui, _st| {
         if runtime::send_command(runtime::Runtime::CMD_GALLERY) {
-            ui.set_status(s("Drag the widget from the gallery onto your desktop"));
+            ui.set_status(s(t("status.place_hint")));
         } else {
-            ui.set_status(s("Vitrine is not running"));
+            ui.set_status(s(t("status.not_running")));
         }
     }));
     ui.on_uninstall(with!(|ui, st, id: SharedString| {
@@ -727,10 +774,13 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         match package::uninstall(&id, &paths::packages_dir()) {
             Ok(()) => {
                 let _ = st.update_layout(|l| l.instances.retain(|i| i.package != id));
-                st.packages = package::scan(&paths::packages_dir());
-                ui.set_status(s("Package uninstalled"));
+                st.packages = scan_packages();
+                ui.set_status(s(t("status.uninstalled")));
             }
-            Err(e) => ui.set_status(s(format!("Could not uninstall: {e}"))),
+            Err(e) => ui.set_status(s(tf(
+                "status.could_not_uninstall",
+                &[("error", &e.to_string())],
+            ))),
         }
         refresh(&ui, st);
     }));
@@ -738,15 +788,20 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         let Some(path) = pick_package() else { return };
         match package::install(&path, &paths::packages_dir()) {
             Ok(p) => {
-                ui.set_status(s(format!(
-                    "Installed {} {}",
-                    p.manifest.name, p.manifest.version
+                let mut m = p.manifest.clone();
+                m.localize(i18n::language());
+                ui.set_status(s(tf(
+                    "status.installed",
+                    &[("name", &m.name), ("version", &m.version)],
                 )));
-                st.packages = package::scan(&paths::packages_dir());
+                st.packages = scan_packages();
                 notify();
                 ui.set_page(1);
             }
-            Err(e) => ui.set_status(s(format!("Could not install: {e}"))),
+            Err(e) => ui.set_status(s(tf(
+                "status.could_not_install",
+                &[("error", &e.to_string())],
+            ))),
         }
         refresh(&ui, st);
     }));
@@ -792,11 +847,14 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
             }
         });
         open_settings(&ui, st, &id);
-        ui.set_status(s("Settings reset"));
+        ui.set_status(s(t("status.settings_reset")));
     }));
     ui.on_set_autostart(with!(|ui, st, on: bool| {
         if let Err(e) = shellapi::set_autostart(on) {
-            ui.set_status(s(format!("Could not change autostart: {e}")));
+            ui.set_status(s(tf(
+                "status.could_not_autostart",
+                &[("error", &e.to_string())],
+            )));
         }
         st.config.start_with_windows = on;
         let _ = st.config.save(&paths::config_path());
@@ -805,7 +863,40 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         st.config.pause_on_battery_saver = on;
         let _ = st.config.save(&paths::config_path());
         notify();
-        ui.set_status(s("Saved"));
+        ui.set_status(s(t("status.saved")));
+    }));
+    ui.on_set_language(with!(|ui, st, index: i32| {
+        let code = match index {
+            i if i <= 0 => i18n::SYSTEM,
+            i => i18n::LANGUAGES
+                .get(i as usize - 1)
+                .map_or(i18n::SYSTEM, |(c, _)| *c),
+        };
+        st.config.language = Some(code.to_string());
+        if let Err(e) = st.config.save(&paths::config_path()) {
+            ui.set_status(s(tf("status.could_not_save", &[("error", &e.to_string())])));
+        }
+        // The panel switches now; Vitrine on reload.
+        i18n::set(Some(code));
+        i18n::apply_to_slint();
+        ui.set_ui_font(s(i18n::ui_font()));
+        set_languages(&ui, &st.config);
+        st.packages = scan_packages();
+        refresh(&ui, st);
+        if let Some(id) = st.editing.clone()
+            && ui.get_page() == 4
+        {
+            open_settings(&ui, st, &id);
+        }
+        if let Some((package, widget, _)) = st.detail.clone()
+            && ui.get_page() == 5
+        {
+            let size = ui.get_detail_size();
+            open_detail(&ui, st, &package, &widget);
+            ui.set_detail_size(size);
+        }
+        ui.set_status(s(""));
+        notify();
     }));
     ui.on_set_hotkey(with!(|ui, st, text: SharedString| {
         if runtime::parse_hotkey(&text).is_some() {
@@ -813,16 +904,14 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
             st.config.edit_hotkey = text.trim().to_string();
             let _ = st.config.save(&paths::config_path());
         } else {
-            ui.set_hotkey_error(s(
-                "Use modifiers and a key, e.g. Ctrl+Alt+V or Win+Shift+F9.",
-            ));
+            ui.set_hotkey_error(s(t("status.hotkey_invalid")));
         }
     }));
     ui.on_open_folder(|| shellapi::open(&paths::data_dir().to_string_lossy()));
     ui.on_open_site(|| shellapi::open("https://vitrine-org.github.io/"));
     ui.on_edit_layout(with!(|ui, _st| {
         if !runtime::send_command(runtime::Runtime::CMD_EDIT) {
-            ui.set_status(s("Vitrine is not running"));
+            ui.set_status(s(t("status.not_running")));
         }
     }));
 
@@ -834,7 +923,7 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         with!(|ui, st| {
             if layout_stamp() != st.layout_stamp {
                 st.reload_layout();
-                st.packages = package::scan(&paths::packages_dir());
+                st.packages = scan_packages();
                 refresh(&ui, st);
             }
         }),
@@ -1092,7 +1181,7 @@ mod tests {
         let rows = instance_rows(&st);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].name, "Clock");
-        assert_eq!(rows[0].detail, "Pack A · 3×2 · main monitor");
+        assert_eq!(rows[0].detail, "Pack A · 3×2 · Main display");
         assert!(rows[0].has_settings);
         assert_eq!(rows[1].detail, "Pack A · 3×2 · DISPLAY2");
         assert!(!rows[1].has_settings);

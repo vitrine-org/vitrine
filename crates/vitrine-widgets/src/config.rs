@@ -19,7 +19,8 @@ impl Default for Config {
             start_with_windows: false,
             edit_hotkey: "Ctrl+Alt+V".to_string(),
             pause_on_battery_saver: true,
-            language: None,
+            // `"system"` (or no value) follows the Windows display language.
+            language: Some("system".into()),
         }
     }
 }

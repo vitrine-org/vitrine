@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::locale::{self, Translations};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +20,9 @@ pub struct SettingOption {
     pub value: Value,
     #[serde(default)]
     pub label: String,
+    /// `label` by language tag.
+    #[serde(default, skip_serializing_if = "Translations::is_empty")]
+    pub labels: Translations,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,14 +40,23 @@ pub struct SettingDef {
     pub default: Option<Value>,
     #[serde(default)]
     pub label: String,
+    /// `label` by language tag (`{"it": "Secondi"}`).
+    #[serde(default, skip_serializing_if = "Translations::is_empty")]
+    pub labels: Translations,
     #[serde(default)]
     pub description: String,
+    /// `description` by language tag.
+    #[serde(default, skip_serializing_if = "Translations::is_empty")]
+    pub descriptions: Translations,
     #[serde(default)]
     pub options: Vec<SettingOption>,
     #[serde(default)]
     pub pattern: Option<String>,
     #[serde(default)]
     pub pattern_message: Option<String>,
+    /// `patternMessage` by language tag.
+    #[serde(default, skip_serializing_if = "Translations::is_empty")]
+    pub pattern_messages: Translations,
     #[serde(default)]
     pub visible_when: Option<Condition>,
     #[serde(default)]
@@ -59,6 +72,8 @@ pub struct SettingDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub title: String,
+    /// `title` by language tag.
+    pub titles: Translations,
     /// Settings in declaration order.
     pub settings: Vec<(String, SettingDef)>,
 }
@@ -72,6 +87,8 @@ pub struct SettingsSchema {
 struct RawSection {
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    titles: Translations,
     settings: Map<String, Value>,
 }
 
@@ -185,6 +202,14 @@ impl SettingsSchema {
                 }
                 let def: SettingDef = serde_json::from_value(val)
                     .map_err(|e| Error::Schema(format!("setting `{key}`: {e}")))?;
+                let what = |field: &str| format!("setting `{key}`: {field}");
+                locale::validate(&def.labels, &what("labels"))
+                    .and_then(|_| locale::validate(&def.descriptions, &what("descriptions")))
+                    .and_then(|_| locale::validate(&def.pattern_messages, &what("patternMessages")))
+                    .map_err(Error::Schema)?;
+                for o in &def.options {
+                    locale::validate(&o.labels, &what("option labels")).map_err(Error::Schema)?;
+                }
                 if let Some(p) = &def.pattern {
                     Regex::new(p)
                         .map_err(|e| Error::Schema(format!("setting `{key}`: bad pattern: {e}")))?;
@@ -200,12 +225,32 @@ impl SettingsSchema {
                 }
                 settings.push((key, def));
             }
+            locale::validate(&rs.titles, "section titles").map_err(Error::Schema)?;
             sections.push(Section {
                 title: rs.title,
+                titles: rs.titles,
                 settings,
             });
         }
         Ok(SettingsSchema { sections })
+    }
+
+    /// Replaces titles, labels, descriptions and pattern messages with their
+    /// `lang` variants (closest tag; missing ones keep the schema's own text).
+    pub fn localize(&mut self, lang: &str) {
+        for section in &mut self.sections {
+            locale::apply(&mut section.title, &section.titles, lang);
+            for (_, def) in &mut section.settings {
+                locale::apply(&mut def.label, &def.labels, lang);
+                locale::apply(&mut def.description, &def.descriptions, lang);
+                if let Some(v) = locale::pick(&def.pattern_messages, lang) {
+                    def.pattern_message = Some(v.to_string());
+                }
+                for o in &mut def.options {
+                    locale::apply(&mut o.label, &o.labels, lang);
+                }
+            }
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &SettingDef)> {
@@ -305,6 +350,57 @@ mod tests {
 
     fn schema() -> SettingsSchema {
         SettingsSchema::parse(SCHEMA).unwrap()
+    }
+
+    #[test]
+    fn label_maps_localize_and_are_optional() {
+        let json = r##"[
+          { "title": "Look", "titles": { "it": "Aspetto" }, "settings": {
+            "seconds": { "type": "boolean", "label": "Seconds",
+                         "labels": { "it": "Secondi", "zh-CN": "秒" },
+                         "description": "Show seconds", "descriptions": { "de": "Sekunden anzeigen" } },
+            "unit": { "type": "string", "default": "c", "label": "Unit", "options": [
+              { "value": "c", "label": "Celsius", "labels": { "it": "Celsius (°C)" } },
+              { "value": "f", "label": "Fahrenheit" } ] },
+            "color": { "type": "string", "pattern": "^#", "patternMessage": "Use #RRGGBB",
+                       "patternMessages": { "it": "Usa #RRGGBB" } }
+          }}
+        ]"##;
+        let base = SettingsSchema::parse(json).unwrap();
+        let mut it = base.clone();
+        it.localize("it-IT");
+        assert_eq!(it.sections[0].title, "Aspetto");
+        let s = &it.sections[0].settings;
+        assert_eq!(s[0].1.label, "Secondi");
+        assert_eq!(s[0].1.description, "Show seconds");
+        assert_eq!(s[1].1.options[0].label, "Celsius (°C)");
+        assert_eq!(s[1].1.options[1].label, "Fahrenheit");
+        assert_eq!(s[2].1.pattern_message.as_deref(), Some("Usa #RRGGBB"));
+        let mut zh = base.clone();
+        zh.localize("zh");
+        assert_eq!(zh.sections[0].title, "Look");
+        assert_eq!(zh.sections[0].settings[0].1.label, "秒");
+        let mut de = base.clone();
+        de.localize("de");
+        assert_eq!(
+            de.sections[0].settings[0].1.description,
+            "Sekunden anzeigen"
+        );
+        // The plain schema is unchanged by an unknown language.
+        let mut en = base.clone();
+        en.localize("en");
+        assert_eq!(en, base);
+
+        for bad in [
+            r#"[{"settings":{"a":{"type":"string","labels":{"it!":"x"}}}}]"#,
+            r#"[{"settings":{"a":{"type":"string","labels":{"it":""}}}}]"#,
+            r#"[{"settings":{"a":{"type":"string","labels":"x"}}}]"#,
+            r#"[{"titles":{"it":3},"settings":{}}]"#,
+            r#"[{"titles":{"??":"x"},"settings":{}}]"#,
+            r#"[{"settings":{"a":{"type":"string","options":[{"value":1,"labels":{"x y":"a"}}]}}}]"#,
+        ] {
+            assert!(SettingsSchema::parse(bad).is_err(), "{bad}");
+        }
     }
 
     fn map(v: Value) -> Map<String, Value> {

@@ -4,6 +4,7 @@ pub mod config;
 pub mod error;
 mod fsutil;
 pub mod layout;
+pub mod locale;
 pub mod manifest;
 pub mod package;
 pub mod paths;

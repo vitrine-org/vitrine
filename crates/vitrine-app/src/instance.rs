@@ -111,6 +111,7 @@ impl WidgetInstance {
             width: size.0,
             height: size.1,
             engine_version: env!("CARGO_PKG_VERSION").into(),
+            language: crate::i18n::language().into(),
         };
         let script = WidgetScript::new(Limits::default(), info).map_err(|e| e.to_string())?;
         let mut inst = Self {

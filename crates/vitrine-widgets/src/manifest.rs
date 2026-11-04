@@ -1,12 +1,13 @@
 //! `vitrine.json` package manifest.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::locale;
 use crate::{Error, Result};
 
 /// Name of the manifest file at the package root.
@@ -122,6 +123,40 @@ pub struct PackageManifest {
     #[serde(default)]
     pub fonts: Vec<String>,
     pub widgets: Vec<WidgetManifest>,
+    /// Localised names and descriptions, by language tag (`"it"`, `"pt-BR"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub locales: BTreeMap<String, PackageLocale>,
+}
+
+/// One language of `locales`: every field is optional and falls back to the
+/// manifest's own (English) text.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PackageLocale {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// By widget id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub widgets: BTreeMap<String, WidgetLocale>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WidgetLocale {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn set_text(dst: &mut String, src: &Option<String>) {
+    if let Some(v) = src
+        && !v.trim().is_empty()
+    {
+        *dst = v.clone();
+    }
 }
 
 fn package_id_re() -> &'static Regex {
@@ -249,7 +284,40 @@ impl PackageManifest {
             }
             w.validate()?;
         }
+        for (tag, l) in &self.locales {
+            if !locale::is_valid_tag(tag) {
+                return err(format!("locales: invalid language tag `{tag}`"));
+            }
+            let blank = |v: &Option<String>| v.as_ref().is_some_and(|v| v.trim().is_empty());
+            if blank(&l.name) || blank(&l.description) {
+                return err(format!("locales.{tag}: empty text"));
+            }
+            for (id, wl) in &l.widgets {
+                if !seen.contains(id.as_str()) {
+                    return err(format!("locales.{tag}: unknown widget `{id}`"));
+                }
+                if blank(&wl.name) || blank(&wl.description) {
+                    return err(format!("locales.{tag}.widgets.{id}: empty text"));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Replaces names and descriptions with their `lang` variants from
+    /// `locales` (closest tag; missing texts keep the manifest's own).
+    pub fn localize(&mut self, lang: &str) {
+        let Some(l) = locale::best(&self.locales, lang).cloned() else {
+            return;
+        };
+        set_text(&mut self.name, &l.name);
+        set_text(&mut self.description, &l.description);
+        for w in &mut self.widgets {
+            if let Some(wl) = l.widgets.get(&w.id) {
+                set_text(&mut w.name, &wl.name);
+                set_text(&mut w.description, &wl.description);
+            }
+        }
     }
 
     /// Every file path referenced by the manifest (entry, settings, preview, fonts).
@@ -317,6 +385,78 @@ mod tests {
         let mut m = PackageManifest::parse(VALID).unwrap();
         f(&mut m);
         m.validate()
+    }
+
+    const LOCALISED: &str = r#"{
+      "id": "dev.vitrine.sargas", "name": "Sargas", "version": "2.0.0",
+      "widgets": [{ "id": "clock", "name": "Clock", "description": "Time", "entry": "i.js" },
+                  { "id": "date", "name": "Date", "entry": "d.js" }],
+      "locales": {
+        "it": { "name": "Sargas IT", "widgets": { "clock": { "name": "Orologio", "description": "Ora" } } },
+        "zh-CN": { "widgets": { "date": { "name": "日期" } } },
+        "pt": { "description": "Pacote" }
+      }
+    }"#;
+
+    #[test]
+    fn locales_parse_and_apply() {
+        let m = PackageManifest::parse_validated(LOCALISED).unwrap();
+        assert_eq!(m.locales.len(), 3);
+        assert_eq!(
+            m.locales["it"].widgets["clock"].name.as_deref(),
+            Some("Orologio")
+        );
+
+        let mut it = m.clone();
+        it.localize("it");
+        assert_eq!(it.name, "Sargas IT");
+        assert_eq!(
+            (
+                it.widgets[0].name.as_str(),
+                it.widgets[0].description.as_str()
+            ),
+            ("Orologio", "Ora")
+        );
+        assert_eq!(it.widgets[1].name, "Date");
+
+        let mut zh = m.clone();
+        zh.localize("zh");
+        assert_eq!(zh.name, "Sargas");
+        assert_eq!(zh.widgets[1].name, "日期");
+
+        let mut pt = m.clone();
+        pt.localize("pt-BR");
+        assert_eq!(pt.description, "Pacote");
+
+        let mut de = m.clone();
+        de.localize("de");
+        assert_eq!(de.widgets[0].name, "Clock");
+
+        // Manifests without `locales` still parse; serialising skips the empty map.
+        let plain = PackageManifest::parse(VALID).unwrap();
+        assert!(plain.locales.is_empty());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("locales"));
+    }
+
+    #[test]
+    fn bad_locales_are_rejected() {
+        let bad = |locales: &str| {
+            let json =
+                LOCALISED.replace(r#""locales": {"#, &format!(r#""locales": {{ {locales}, "#));
+            PackageManifest::parse_validated(&json).is_err()
+        };
+        assert!(bad(r#""it!": {}"#));
+        assert!(bad(r#""de": { "name": " " }"#));
+        assert!(bad(r#""de": { "widgets": { "nope": { "name": "X" } } }"#));
+        assert!(bad(
+            r#""de": { "widgets": { "clock": { "description": "" } } }"#
+        ));
+        assert!(
+            PackageManifest::parse(
+                &LOCALISED.replace(r#""locales": {"#, r#""locales": { "de": 3, "#)
+            )
+            .is_err()
+        );
     }
 
     #[test]

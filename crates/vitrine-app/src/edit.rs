@@ -23,6 +23,7 @@ use windows::core::{BOOL, Interface, PCWSTR, Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::grid::Geometry;
+use crate::i18n::t;
 use crate::runtime::HostMsg;
 use vitrine_render::compose::WindowVisual;
 use vitrine_render::gpu::Gpu;
@@ -245,6 +246,7 @@ fn icon_family(dwrite: &IDWriteFactory5) -> PCWSTR {
 
 impl Fonts {
     fn new(dwrite: &IDWriteFactory5, s: f32) -> Result<Fonts> {
+        let locale = windows::core::HSTRING::from(crate::i18n::locale_name());
         let make = |family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT, center: bool| unsafe {
             let f = dwrite.CreateTextFormat(
                 family,
@@ -253,7 +255,7 @@ impl Fonts {
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
                 size * s,
-                w!(""),
+                &locale,
             )?;
             f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
@@ -387,7 +389,10 @@ impl EditMode {
         };
         let s = o.geo.scale;
         let px = |v: f32| (v * s).round() as i32;
-        let (add_w, done_w, pad, h) = (px(148.0), px(100.0), px(6.0), px(44.0));
+        let label = |key: &str| self.text_width(&t(key), &o.text.button).ceil() as i32;
+        let add_w = px(148.0).max(px(28.0 + 18.0) + label("edit.add_widget"));
+        let done_w = px(100.0).max(px(32.0) + label("edit.done"));
+        let (pad, h) = (px(6.0), px(44.0));
         let width = pad * 3 + add_w + done_w;
         let left = (o.rect.left + o.rect.right) / 2 - width / 2;
         let top = o.rect.top + px(20.0);
@@ -1176,7 +1181,7 @@ impl Painter<'_> {
                     color(0xFFFFFF, 0.95),
                 );
                 draw_text(
-                    "Add widget",
+                    &t("edit.add_widget"),
                     &o.text.button,
                     D2D_RECT_F {
                         left: ar.left + 28.0 * s,
@@ -1192,14 +1197,20 @@ impl Painter<'_> {
                         e.a("hot:done") * 0.6,
                     ),
                 );
-                draw_text("Done", &o.text.button, rf(done), color(0x000000, 0.92));
+                draw_text(
+                    &t("edit.done"),
+                    &o.text.button,
+                    rf(done),
+                    color(0x000000, 0.92),
+                );
                 // Hint.
                 let hint_top = b.bottom + 10.0 * s;
-                let hint = if e.gallery_open {
-                    "Drag a widget onto the desktop, or click it to add it"
+                let hint = t(if e.gallery_open {
+                    "edit.hint_gallery"
                 } else {
-                    "Drag widgets to move them · drag the corner dot to resize · Esc to finish"
-                };
+                    "edit.hint"
+                });
+                let hint = hint.as_str();
                 let hr = D2D_RECT_F {
                     left: full.left,
                     top: hint_top,
@@ -1229,7 +1240,7 @@ impl Painter<'_> {
                         bottom: sr.top + 40.0 * s,
                     };
                     draw_text(
-                        "Widgets",
+                        &t("edit.gallery_title"),
                         &o.text.label,
                         title,
                         color(0xFFFFFF, 0.7 * alpha),

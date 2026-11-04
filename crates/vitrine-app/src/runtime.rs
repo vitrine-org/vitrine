@@ -41,6 +41,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::edit::EditMode;
 use crate::grid::Geometry;
+use crate::i18n::t;
 use crate::instance::{Effect, WidgetInstance};
 use crate::shellapi::{self, Item, Tray};
 
@@ -402,6 +403,10 @@ impl Runtime {
 
     /// Re-reads packages and layout from disk and reconciles running widgets.
     fn reload(&mut self) {
+        self.config = Config::load(&paths::config_path()).unwrap_or_default();
+        let before = crate::i18n::language();
+        crate::i18n::init(self.config.language.as_deref());
+        let relaunch = before != crate::i18n::language();
         self.packages = package::scan(&paths::packages_dir());
         if let Some(dir) = DEV_DIR.get() {
             match package::open_dir(dir) {
@@ -410,6 +415,15 @@ impl Runtime {
                     self.packages.push(dev);
                 }
                 Err(e) => log::error!("dev package {}: {e}", dir.display()),
+            }
+        }
+        for p in &mut self.packages {
+            p.manifest.localize(crate::i18n::language());
+        }
+        if relaunch {
+            log::info!("language: {}", crate::i18n::language());
+            for mut live in std::mem::take(&mut self.widgets) {
+                Self::destroy_window(&mut live);
             }
         }
         let first_run = !paths::layout_path().exists();
@@ -421,7 +435,6 @@ impl Runtime {
             self.seed_layout();
             self.save_layout();
         }
-        self.config = Config::load(&paths::config_path()).unwrap_or_default();
         self.place_dev_widgets();
 
         let wanted: Vec<Instance> = self.layout.instances.clone();
@@ -1612,10 +1625,10 @@ fn add_menu(packages: &[InstalledPackage]) -> Item {
     }
     items.pop();
     if items.is_empty() {
-        items.push(Item::disabled("No widget packages installed"));
+        items.push(Item::disabled(t("menu.no_packages")));
     }
     Item::Sub {
-        label: "Quick add".into(),
+        label: t("menu.quick_add"),
         items,
     }
 }
@@ -1640,17 +1653,17 @@ fn tray_items(
     autostart: bool,
 ) -> Vec<Item> {
     vec![
-        Item::action(Runtime::CMD_GALLERY, "Add widgets…"),
+        Item::action(Runtime::CMD_GALLERY, t("menu.add_widgets")),
         add_menu(packages),
-        Item::check(Runtime::CMD_EDIT, "Edit layout", editing),
-        Item::action(Runtime::CMD_PANEL, "Settings…"),
+        Item::check(Runtime::CMD_EDIT, t("menu.edit_layout"), editing),
+        Item::action(Runtime::CMD_PANEL, t("menu.settings")),
         Item::Separator,
-        Item::check(Runtime::CMD_PAUSE, "Pause widgets", user_paused),
-        Item::check(Runtime::CMD_AUTOSTART, "Start with Windows", autostart),
-        Item::action(Runtime::CMD_FOLDER, "Open data folder"),
-        Item::action(Runtime::CMD_SITE, "Get more widgets"),
+        Item::check(Runtime::CMD_PAUSE, t("menu.pause"), user_paused),
+        Item::check(Runtime::CMD_AUTOSTART, t("menu.autostart"), autostart),
+        Item::action(Runtime::CMD_FOLDER, t("menu.data_folder")),
+        Item::action(Runtime::CMD_SITE, t("menu.get_more")),
         Item::Separator,
-        Item::action(Runtime::CMD_QUIT, "Quit Vitrine"),
+        Item::action(Runtime::CMD_QUIT, t("menu.quit")),
     ]
 }
 
@@ -1684,10 +1697,10 @@ fn menu_decor(cmd: u32) -> crate::flyout::Decor {
 
 fn widget_items() -> Vec<Item> {
     vec![
-        Item::action(Runtime::CMD_PANEL, "Widget settings…"),
-        Item::action(Runtime::CMD_EDIT, "Edit layout"),
+        Item::action(Runtime::CMD_PANEL, t("menu.widget_settings")),
+        Item::action(Runtime::CMD_EDIT, t("menu.edit_layout")),
         Item::Separator,
-        Item::action(Runtime::CMD_REMOVE, "Remove widget"),
+        Item::action(Runtime::CMD_REMOVE, t("menu.remove_widget")),
     ]
 }
 
