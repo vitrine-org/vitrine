@@ -47,6 +47,50 @@ pub fn open_package(path: &Path) -> Result<InstalledPackage, String> {
     package::install(path, &tmp).map_err(|e| e.to_string())
 }
 
+/// Settings for gallery previews on a neutral tile: a widget's text shadow
+/// (a boolean `shadow` setting, as the themes have) reads as a dark halo there,
+/// so previews turn it off. `None` when the widget has no such setting.
+pub fn preview_settings(pkg: &InstalledPackage, widget_id: &str) -> Option<String> {
+    let widget = pkg.widget(widget_id)?;
+    let schema = pkg.read_settings_schema(widget).ok()??;
+    let def = schema.get("shadow")?;
+    (def.kind == vitrine_widgets::settings::SettingType::Boolean)
+        .then(|| r#"{"shadow":false}"#.to_string())
+}
+
+/// Whether a preview belongs on a light tile: the widget draws dark text
+/// straight on the wallpaper (a theme with `theme` light, or auto in light
+/// mode, and `background` none). Everything else reads on the dark tile.
+pub fn light_tile(pkg: &InstalledPackage, widget_id: &str, settings: Option<&str>) -> bool {
+    let mut values = pkg
+        .widget(widget_id)
+        .and_then(|w| pkg.read_settings_schema(w).ok().flatten())
+        .map(|s| s.defaults())
+        .unwrap_or_default();
+    if let Some(o) = settings
+        .and_then(|s| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(s).ok())
+    {
+        values.extend(o);
+    }
+    let text = |k: &str| values.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let dark_text = match text("theme") {
+        "light" => true,
+        "auto" | "system" => !vitrine_script::appearance::is_dark(),
+        _ => false,
+    };
+    dark_text && text("background") == "none"
+}
+
+/// Off-screen renders end up as published previews: they never show this PC's
+/// name.
+fn anonymize(snap: &mut serde_json::Value) {
+    if let Some(sys) = snap.get_mut("system").and_then(|s| s.as_object_mut())
+        && sys.contains_key("hostname")
+    {
+        sys.insert("hostname".into(), "DESKTOP".into());
+    }
+}
+
 /// Runs a widget off-screen for `wait_ms` and returns `(width, height, rgba)`.
 /// `settings` overrides the schema defaults. Needs COM on the calling thread.
 #[allow(clippy::too_many_arguments)]
@@ -129,7 +173,8 @@ pub fn render_rgba(
             // CPU and network rates need two samples.
             sampler.sample(&subscribed);
             std::thread::sleep(Duration::from_millis(400));
-            let snap = sampler.sample(&subscribed);
+            let mut snap = sampler.sample(&subscribed);
+            anonymize(&mut snap);
             inst.deliver("system", &snap.to_string());
             primed = true;
             continue;
@@ -221,5 +266,62 @@ mod tests {
         assert_eq!(cells_to_dips(2, 3), (136.0, 208.0));
         // Zero cells is empty, not negative.
         assert_eq!(cells_to_dips(0, 0), (0.0, 0.0));
+    }
+
+    /// An unpacked pack with a theme-like widget (`text`) and a plain one.
+    fn pack(dir: &Path) -> InstalledPackage {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("vitrine.json"),
+            r#"{ "id": "dev.test.tiles", "name": "T", "version": "1.0.0", "widgets": [
+                 { "id": "text", "name": "Text", "entry": "a.js", "settings": "text.json" },
+                 { "id": "plain", "name": "Plain", "entry": "a.js" } ] }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.js"), "").unwrap();
+        std::fs::write(
+            dir.join("text.json"),
+            r#"[ { "title": "Look", "settings": {
+                 "theme": { "type": "string", "default": "dark" },
+                 "background": { "type": "string", "default": "none" },
+                 "shadow": { "type": "boolean", "default": true } } } ]"#,
+        )
+        .unwrap();
+        package::open_dir(dir).unwrap()
+    }
+
+    #[test]
+    fn renders_hide_the_host_name() {
+        let mut snap =
+            serde_json::json!({ "system": { "hostname": "MY-PC", "os": "W" }, "cpu": 1 });
+        anonymize(&mut snap);
+        assert_eq!(snap["system"]["hostname"], "DESKTOP");
+        assert_eq!(snap["system"]["os"], "W");
+        let mut other = serde_json::json!({ "cpu": 1 });
+        anonymize(&mut other);
+        assert_eq!(other, serde_json::json!({ "cpu": 1 }));
+    }
+
+    #[test]
+    fn previews_drop_the_text_shadow_and_pick_the_opposite_tile() {
+        let dir = std::env::temp_dir().join(format!("vitrine-tiles-{}", std::process::id()));
+        let p = pack(&dir);
+        assert_eq!(
+            preview_settings(&p, "text").as_deref(),
+            Some(r#"{"shadow":false}"#)
+        );
+        assert_eq!(preview_settings(&p, "plain"), None);
+
+        // Light text by default: dark tile. Dark text on the wallpaper: light tile.
+        assert!(!light_tile(&p, "text", None));
+        assert!(light_tile(&p, "text", Some(r#"{"theme":"light"}"#)));
+        // On a card the widget brings its own background.
+        assert!(!light_tile(
+            &p,
+            "text",
+            Some(r#"{"theme":"light","background":"acrylic"}"#)
+        ));
+        assert!(!light_tile(&p, "plain", Some(r#"{"theme":"light"}"#)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

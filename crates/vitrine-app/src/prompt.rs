@@ -71,6 +71,14 @@ pub fn run(options: &str, at: Option<(i32, i32)>) -> Result<(), String> {
         ui.window().set_position(slint::PhysicalPosition::new(x, y));
     }
     ui.show().map_err(|e| e.to_string())?;
+    crate::chrome::when_ready(&ui, |ui| {
+        crate::chrome::apply(
+            ui.window(),
+            crate::chrome::Kind::Dialog,
+            ui.get_dark_scheme(),
+            false,
+        );
+    });
     slint::run_event_loop().map_err(|e| e.to_string())?;
     let value = answer.borrow().clone();
     println!("{}", serde_json::json!({ "value": value }));

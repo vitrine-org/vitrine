@@ -33,6 +33,7 @@ export struct GallerySection {
     name: string,
     initial: string,
     tint: color,
+    icon: image,
     favourites: bool,
     // Widgets passing the search, and whether the section shows and is open.
     count: int,
@@ -49,6 +50,7 @@ export struct PackChip {
     name: string,
     initial: string,
     tint: color,
+    icon: image,
     count: int,
 }
 
@@ -62,6 +64,9 @@ export struct StoreRow {
     official: bool,
     state: int,
     preview: image,
+    initial: string,
+    tint: color,
+    icon: image,
     slot: int,
     shown: bool,
 }
@@ -90,6 +95,33 @@ export struct PackageRow {
     id: string,
     name: string,
     detail: string,
+    initial: string,
+    tint: color,
+    icon: image,
+}
+
+// A pack's icon (`icon` in vitrine.json), or its initial on a tinted disc.
+component PackAvatar inherits Rectangle {
+    in property <image> icon;
+    in property <string> initial;
+    in property <color> tint;
+    property <bool> has-icon: root.icon.width > 0;
+    border-radius: root.has-icon ? 0 : root.width / 2;
+    background: root.has-icon ? transparent : root.tint;
+    if root.has-icon: Image {
+        source: root.icon;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+    }
+    if !root.has-icon: Text {
+        text: root.initial;
+        color: #ffffff;
+        font-size: root.width * 0.46;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
 }
 
 // kind: 0 switch, 1 integer, 2 text, 3 choice, 4 decimal
@@ -127,9 +159,9 @@ component NavItem inherits Rectangle {
     callback clicked();
     height: 36px;
     border-radius: 4px;
-    background: selected ? Palette.alternate-background.mix(Palette.foreground, 0.92)
-        : touch.pressed ? Palette.alternate-background.mix(Palette.foreground, 0.97)
-        : touch.has-hover ? Palette.alternate-background.mix(Palette.foreground, 0.95) : transparent;
+    background: selected ? Palette.foreground.with-alpha(0.06)
+        : touch.pressed ? Palette.foreground.with-alpha(0.03)
+        : touch.has-hover ? Palette.foreground.with-alpha(0.05) : transparent;
     animate background { duration: 120ms; }
     touch := TouchArea {
         clicked => { root.clicked(); }
@@ -239,11 +271,13 @@ component Page inherits Rectangle {
 component PreviewWell inherits Rectangle {
     in property <image> source;
     in property <length> inset: 8px;
+    // For a widget with dark text straight on the wallpaper: the opposite, light tile.
+    in property <bool> light;
     property <bool> dark: Palette.foreground == #ffffff;
     border-radius: 6px;
-    background: root.dark ? #1f1f1f : #2b2b2b;
+    background: root.light ? #f3f3f3 : #1f1f1f;
     border-width: 1px;
-    border-color: root.dark ? #ffffff0d : #00000014;
+    border-color: root.light || !root.dark ? #00000014 : #ffffff0d;
     clip: true;
     Image {
         source: root.source;
@@ -481,24 +515,23 @@ component GallerySectionView inherits Rectangle {
                 spacing: 12px;
                 VerticalLayout {
                     alignment: center;
-                    Rectangle {
+                    if root.section.favourites: Rectangle {
                         width: 28px;
                         height: 28px;
                         border-radius: 14px;
-                        background: root.section.favourites ? #ffc83d : root.section.tint;
-                        if root.section.favourites: Glyph {
+                        background: #ffc83d;
+                        Glyph {
                             text: "\u{E735}";
                             font-size: 14px;
                             color: #3d2c00;
                         }
-                        if !root.section.favourites: Text {
-                            text: root.section.initial;
-                            color: #ffffff;
-                            font-size: 13px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+                    }
+                    if !root.section.favourites: PackAvatar {
+                        width: 28px;
+                        height: 28px;
+                        icon: root.section.icon;
+                        initial: root.section.initial;
+                        tint: root.section.tint;
                     }
                 }
                 Text {
@@ -751,19 +784,12 @@ component PackChipView inherits Rectangle {
         spacing: 8px;
         if root.chip.initial != "": VerticalLayout {
             alignment: center;
-            Rectangle {
+            PackAvatar {
                 width: 22px;
                 height: 22px;
-                border-radius: 11px;
-                background: root.chip.tint;
-                Text {
-                    text: root.chip.initial;
-                    color: #ffffff;
-                    font-size: 11px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+                icon: root.chip.icon;
+                initial: root.chip.initial;
+                tint: root.chip.tint;
             }
         }
         Text {
@@ -917,6 +943,17 @@ component StoreCard inherits ResultCard {
             spacing: 2px;
             HorizontalLayout {
                 spacing: 6px;
+                VerticalLayout {
+                    alignment: center;
+                    PackAvatar {
+                        width: 20px;
+                        height: 20px;
+                        icon: root.item.icon;
+                        initial: root.item.initial;
+                        tint: root.item.tint;
+                    }
+                }
+                Rectangle { width: 2px; }
                 Text {
                     text: root.item.name;
                     font-size: 15px;
@@ -976,6 +1013,14 @@ export component PanelWindow inherits Window {
     preferred-height: 680px;
     min-width: 760px;
     min-height: 500px;
+    // Set from Rust before the window shows: Windows 11 22H2+ draws Mica under the title bar and
+    // the transparent client area, so caption and navigation pane are one surface.
+    in-out property <bool> mica;
+    background: root.mica ? transparent : Palette.alternate-background;
+    // The palette in use, for the title bar's light or dark caption.
+    out property <bool> dark-scheme: Palette.foreground == #ffffff;
+    callback scheme-changed(bool);
+    changed dark-scheme => { root.scheme-changed(root.dark-scheme); }
     // Set from Rust: the Windows UI font for CJK languages.
     in property <string> ui-font: "Segoe UI Variable Text";
     default-font-family: root.ui-font;
@@ -1005,6 +1050,7 @@ export component PanelWindow inherits Window {
     in property <string> settings-subtitle;
     in property <image> settings-preview;
     in property <bool> settings-preview-busy;
+    in property <bool> settings-preview-light;
     in property <string> version;
     in property <string> status;
     in-out property <bool> autostart;
@@ -1017,6 +1063,7 @@ export component PanelWindow inherits Window {
 
     in property <LibraryRow> detail;
     in property <image> detail-preview;
+    in property <bool> detail-light;
     in property <bool> detail-busy;
     in property <[string]> detail-sizes;
     in-out property <int> detail-size: 0;
@@ -1150,27 +1197,10 @@ export component PanelWindow inherits Window {
             // Navigation pane.
             Rectangle {
                 width: 264px;
-                background: Palette.alternate-background;
                 VerticalLayout {
                     padding: 8px;
-                    padding-top: 16px;
+                    padding-top: 4px;
                     spacing: 4px;
-                    HorizontalLayout {
-                        padding-left: 12px;
-                        padding-bottom: 18px;
-                        spacing: 10px;
-                        Image {
-                            source: @image-url("../../../assets/icon/png/vitrine-32.png");
-                            width: 24px;
-                            height: 24px;
-                        }
-                        Text {
-                            text: "Vitrine";
-                            font-size: 14px;
-                            font-weight: 600;
-                            vertical-alignment: center;
-                        }
-                    }
                     NavItem {
                         glyph: "\u{E8A9}";
                         label: @tr("My widgets");
@@ -1217,9 +1247,21 @@ export component PanelWindow inherits Window {
                 }
             }
 
-            // Pages, stacked; the active one fades in.
+            // Pages, stacked; the active one fades in. They sit on a content layer with a rounded
+            // top-left corner, as WinUI's NavigationView draws it (LayerFillColorDefault and
+            // CardStrokeColorDefault); its right and bottom edges run past the window.
             Rectangle {
-                background: Palette.background;
+                Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: parent.width + 2px;
+                    height: parent.height + 2px;
+                    border-top-left-radius: 8px;
+                    border-width: 1px;
+                    background: !root.mica ? Palette.background
+                        : root.dark-scheme ? #3a3a3a4c : #ffffff80;
+                    border-color: root.dark-scheme ? #0000001a : #0000000f;
+                }
 
                 Page {
                     active: root.page == 0;
@@ -1460,6 +1502,17 @@ export component PanelWindow inherits Window {
                         HorizontalLayout {
                             padding-left: 16px;
                             padding-right: 12px;
+                            spacing: 14px;
+                            VerticalLayout {
+                                alignment: center;
+                                PackAvatar {
+                                    width: 32px;
+                                    height: 32px;
+                                    icon: item.icon;
+                                    initial: item.initial;
+                                    tint: item.tint;
+                                }
+                            }
                             VerticalLayout {
                                 alignment: center;
                                 Text { text: item.name; font-weight: 600; }
@@ -1605,6 +1658,7 @@ export component PanelWindow inherits Window {
                     PreviewWell {
                         height: 200px;
                         source: root.settings-preview;
+                        light: root.settings-preview-light;
                         opacity: root.settings-preview-busy ? 0.6 : 1;
                         animate opacity { duration: 180ms; }
                     }
@@ -1703,6 +1757,7 @@ export component PanelWindow inherits Window {
                     PreviewWell {
                         height: 300px;
                         source: root.detail-preview;
+                        light: root.detail-light;
                         opacity: root.detail-busy ? 0.55 : 1;
                         animate opacity { duration: 180ms; }
                     }
@@ -1860,6 +1915,17 @@ export component PanelWindow inherits Window {
                             y: 4px;
                             clicked => { root.page = 6; }
                         }
+                        VerticalLayout {
+                            alignment: center;
+                            PackAvatar {
+                                width: 32px;
+                                height: 32px;
+                                icon: root.store-detail.icon;
+                                initial: root.store-detail.initial;
+                                tint: root.store-detail.tint;
+                            }
+                        }
+                        Rectangle { width: 4px; }
                         PageTitle {
                             text: root.store-detail.name;
                             horizontal-stretch: 0;
@@ -2038,6 +2104,7 @@ export component PromptWindow inherits Window {
     callback cancelled();
     title: root.heading;
     always-on-top: true;
+    out property <bool> dark-scheme: Palette.foreground == #ffffff;
     preferred-width: 400px;
     forward-focus: input;
 

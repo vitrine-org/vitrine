@@ -1044,12 +1044,13 @@ impl Runtime {
                     };
                     let (key, pkg, widget, (cw, ch)) = job;
                     let size = crate::headless::cells_to_dips(cw.max(1) as u32, ch.max(1) as u32);
+                    let overrides = crate::headless::preview_settings(&pkg, &widget);
                     let result = crate::headless::render_rgba(
                         &pkg,
                         &widget,
                         size,
                         1.25,
-                        None,
+                        overrides.as_deref(),
                         500,
                         true,
                         &crate::glass::Backdrop::Solid(0x1F1F1F),

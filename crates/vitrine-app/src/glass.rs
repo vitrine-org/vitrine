@@ -90,8 +90,6 @@ pub enum Backdrop {
     Default,
     /// An image file, filling the widget.
     Image(PathBuf),
-    /// The primary monitor's wallpaper (falls back to the default).
-    Wallpaper,
     /// A solid colour (`0xRRGGBB`): the neutral tile of the gallery previews.
     Solid(u32),
 }
@@ -107,12 +105,6 @@ pub fn preview_source(backdrop: &Backdrop, pw: u32, ph: u32, scale: f32) -> Moni
     };
     let image = match backdrop {
         Backdrop::Image(p) => file(p),
-        Backdrop::Wallpaper => {
-            match wallpaper::primary_image(&vitrine_desktop::monitors::monitors()) {
-                Some(p) => file(&p),
-                None => WallpaperImage::Pixels(default_backdrop()),
-            }
-        }
         Backdrop::Default => WallpaperImage::Pixels(default_backdrop()),
         Backdrop::Solid(_) => WallpaperImage::None,
     };

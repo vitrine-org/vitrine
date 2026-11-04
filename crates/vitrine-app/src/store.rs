@@ -60,6 +60,9 @@ pub struct StorePack {
     pub official: bool,
     #[serde(default)]
     pub min_engine: Option<String>,
+    /// `icons/<pack>.png|svg`, when the pack has its own icon.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub stars: u64,
     #[serde(default)]
@@ -245,9 +248,11 @@ pub fn cached_catalogue() -> Option<(Catalogue, Duration)> {
     Some((parse_catalogue(&text).ok()?, age))
 }
 
-/// Where a preview (`previews/<pack>/<widget>.png`) is cached; None for unsafe paths.
+/// Where a preview (`previews/<pack>/<widget>.png`) or a pack icon
+/// (`icons/<pack>.png`) is cached; None for unsafe paths.
 pub fn preview_cache_path(rel: &str) -> Option<PathBuf> {
-    if !rel.starts_with("previews/") || !vitrine_widgets::manifest::is_safe_relative_path(rel) {
+    let known = rel.starts_with("previews/") || rel.starts_with("icons/");
+    if !known || !vitrine_widgets::manifest::is_safe_relative_path(rel) {
         return None;
     }
     let mut p = vitrine_widgets::paths::cache_dir().join("store");
@@ -614,6 +619,9 @@ mod tests {
     fn preview_paths_stay_in_the_cache() {
         let p = preview_cache_path("previews/dev.vitrine.alnitak/date.png").unwrap();
         assert!(p.ends_with("store/previews/dev.vitrine.alnitak/date.png"));
+        let p = preview_cache_path("icons/dev.vitrine.alnitak.png").unwrap();
+        assert!(p.ends_with("store/icons/dev.vitrine.alnitak.png"));
+        assert!(preview_cache_path("other/x.png").is_none());
         assert!(p.starts_with(vitrine_widgets::paths::cache_dir()));
         for bad in [
             "previews/../../x.png",

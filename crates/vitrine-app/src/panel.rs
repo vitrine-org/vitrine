@@ -84,6 +84,8 @@ struct StoreState {
     rows: Rc<VecModel<StoreRow>>,
     /// Preview of each row, as a catalogue path.
     row_previews: Vec<String>,
+    /// Icon path of each Store row (empty when the pack has none).
+    row_icons: Vec<String>,
     tags: Vec<Option<String>>,
     tag_model: Rc<VecModel<PackChip>>,
     /// Pack on the detail page and its widgets' preview paths.
@@ -207,6 +209,20 @@ fn preview_image(
         .unwrap_or_default()
 }
 
+/// Preview tiles (`PreviewWell` in panel.slint).
+const TILE_DARK: u32 = 0x1F1F1F;
+const TILE_LIGHT: u32 = 0xF3F3F3;
+
+/// A pack's own icon (`icon` in vitrine.json), or an empty image for the monogram.
+fn pack_icon(pkg: &InstalledPackage) -> slint::Image {
+    pkg.manifest
+        .icon
+        .as_ref()
+        .filter(|rel| vitrine_widgets::manifest::is_safe_relative_path(rel))
+        .and_then(|rel| slint::Image::load_from_path(&pkg.resolve(rel)).ok())
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy)]
 enum PreviewTarget {
     Detail,
@@ -226,9 +242,19 @@ fn request_preview(
 ) {
     let generation = st.preview_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let latest = st.preview_gen.clone();
+    // Dark text on the wallpaper gets the light tile, everything else the dark one;
+    // the glass backdrop is that same flat colour.
+    let light = crate::headless::light_tile(&pkg, &widget, settings.as_deref());
+    let tile = if light { TILE_LIGHT } else { TILE_DARK };
     match target {
-        PreviewTarget::Detail => ui.set_detail_busy(true),
-        PreviewTarget::Settings => ui.set_settings_preview_busy(true),
+        PreviewTarget::Detail => {
+            ui.set_detail_light(light);
+            ui.set_detail_busy(true);
+        }
+        PreviewTarget::Settings => {
+            ui.set_settings_preview_light(light);
+            ui.set_settings_preview_busy(true);
+        }
     }
     let weak = ui.as_weak();
     let _ = std::thread::Builder::new()
@@ -250,7 +276,7 @@ fn request_preview(
                 settings.as_deref(),
                 700,
                 true,
-                &crate::glass::Backdrop::Wallpaper,
+                &crate::glass::Backdrop::Solid(tile),
             );
             if latest.load(Ordering::SeqCst) != generation {
                 return;
@@ -596,6 +622,13 @@ fn build_sections(ui: &PanelWindow, st: &mut State) {
             .map(|p| p.manifest.name.clone())
             .unwrap_or_else(|| id.to_string())
     };
+    let icon_of = |id: &str| {
+        st.packages
+            .iter()
+            .find(|p| p.manifest.id == id)
+            .map(pack_icon)
+            .unwrap_or_default()
+    };
     let n = parts.len();
     let sections: Vec<GallerySection> = parts
         .iter()
@@ -612,6 +645,11 @@ fn build_sections(ui: &PanelWindow, st: &mut State) {
                 initial: s(initial(&name)),
                 name: s(name),
                 tint: tint(&part.id),
+                icon: if fav {
+                    Default::default()
+                } else {
+                    icon_of(&part.id)
+                },
                 favourites: fav,
                 count: part.members.len() as i32,
                 shown: !part.members.is_empty(),
@@ -640,6 +678,7 @@ fn build_sections(ui: &PanelWindow, st: &mut State) {
         name: s(name_of(id)),
         initial: s(initial(&name_of(id))),
         tint: tint(id),
+        icon: icon_of(id),
         count: 0,
     };
     let chips: Vec<PackChip> = std::iter::once(PackChip {
@@ -802,6 +841,9 @@ fn package_rows(st: &State) -> Vec<PackageRow> {
                 id: s(p.manifest.id.as_str()),
                 name: s(p.manifest.name.as_str()),
                 detail: s(detail),
+                initial: s(initial(&p.manifest.name)),
+                tint: tint(&p.manifest.id),
+                icon: pack_icon(p),
             }
         })
         .collect()
@@ -1153,6 +1195,19 @@ fn store_preview(st: &mut State, rel: &str) -> slint::Image {
                             st.store.rows.set_row_data(i, row);
                         }
                     }
+                    for (i, key) in st.store.row_icons.iter().enumerate() {
+                        if *key == rel
+                            && let Some(mut row) = st.store.rows.row_data(i)
+                        {
+                            row.icon = img.clone();
+                            if st.store.detail.as_deref() == Some(row.id.as_str()) {
+                                let mut detail = ui.get_store_detail();
+                                detail.icon = img.clone();
+                                ui.set_store_detail(detail);
+                            }
+                            st.store.rows.set_row_data(i, row);
+                        }
+                    }
                     let widgets = ui.get_store_detail_widgets();
                     for (i, key) in st.store.detail_previews.iter().enumerate() {
                         if *key == rel
@@ -1183,6 +1238,7 @@ fn rebuild_store(ui: &PanelWindow, st: &mut State) {
     };
     let mut rows = Vec::new();
     let mut previews = Vec::new();
+    let mut icons = Vec::new();
     for pack in &catalogue.packs {
         let rel = pack
             .widgets
@@ -1198,12 +1254,17 @@ fn rebuild_store(ui: &PanelWindow, st: &mut State) {
             official: pack.official,
             state: state_code(pack_state_of(st, pack)),
             preview: store_preview(st, &rel),
+            initial: s(initial(&pack.name)),
+            tint: tint(&pack.id),
+            icon: store_preview(st, pack.icon.as_deref().unwrap_or("")),
             slot: 0,
             shown: true,
         });
         previews.push(rel);
+        icons.push(pack.icon.clone().unwrap_or_default());
     }
     st.store.row_previews = previews;
+    st.store.row_icons = icons;
     st.store.rows = Rc::new(VecModel::from(rows));
     // Tags, most used first.
     let mut tags: Vec<(String, usize)> = Vec::new();
@@ -2017,6 +2078,27 @@ pub fn run(instance: Option<String>, page: Option<String>) -> Result<(), String>
         }),
     );
 
+    // The window turns transparent only once Mica is on, so it never shows
+    // what is behind it.
+    let mica = crate::chrome::mica_supported();
+    ui.on_scheme_changed({
+        let weak = ui.as_weak();
+        move |dark| {
+            if let Some(ui) = weak.upgrade() {
+                crate::chrome::apply(ui.window(), crate::chrome::Kind::Main, dark, ui.get_mica());
+            }
+        }
+    });
+    ui.show().map_err(|e| e.to_string())?;
+    crate::chrome::when_ready(&ui, move |ui| {
+        crate::chrome::apply(
+            ui.window(),
+            crate::chrome::Kind::Main,
+            ui.get_dark_scheme(),
+            mica,
+        );
+        ui.set_mica(mica);
+    });
     ui.run().map_err(|e| e.to_string())
 }
 

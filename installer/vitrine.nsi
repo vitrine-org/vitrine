@@ -1,5 +1,5 @@
 ﻿; Vitrine 2 installer: per-user, no admin rights.
-;   makensis /DVERSION=2.0.2 /DSOURCE_DIR=..\dist\vitrine /DOUTPUT_DIR=..\dist installer\vitrine.nsi
+;   makensis /DVERSION=2.0.3 /DSOURCE_DIR=..\dist\vitrine /DOUTPUT_DIR=..\dist installer\vitrine.nsi
 ; SOURCE_DIR holds vitrine.exe, LICENSE and packs\*.vitrine.
 
 Unicode true
@@ -7,7 +7,7 @@ Unicode true
 !include "FileFunc.nsh"
 
 !ifndef VERSION
-  !define VERSION "2.0.2"
+  !define VERSION "2.0.3"
 !endif
 !ifndef SOURCE_DIR
   !define SOURCE_DIR "..\dist\vitrine"

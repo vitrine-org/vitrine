@@ -2,6 +2,7 @@
 //! Vitrine — desktop widgets for Windows, drawn beneath the desktop icons.
 
 mod bridge;
+mod chrome;
 mod edit;
 mod flyout;
 mod glass;

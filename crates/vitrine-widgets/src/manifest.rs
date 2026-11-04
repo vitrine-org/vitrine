@@ -151,6 +151,11 @@ pub struct PackageManifest {
     pub min_engine: Option<String>,
     #[serde(default)]
     pub fonts: Vec<String>,
+    /// Square PNG or SVG that stands for the pack in the panel and the Store
+    /// (256 x 256 or larger, transparent background). Packs without one get a
+    /// monogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub widgets: Vec<WidgetManifest>,
     /// Localised names and descriptions, by language tag (`"it"`, `"pt-BR"`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -367,6 +372,15 @@ impl PackageManifest {
                 return err(format!("unsafe font path `{f}`"));
             }
         }
+        if let Some(icon) = &self.icon {
+            let lower = icon.to_ascii_lowercase();
+            if !is_safe_relative_path(icon) {
+                return err(format!("unsafe icon path `{icon}`"));
+            }
+            if !(lower.ends_with(".png") || lower.ends_with(".svg")) {
+                return err(format!("icon `{icon}` must be a .png or .svg file"));
+            }
+        }
         if self.widgets.is_empty() {
             return err("package has no widgets");
         }
@@ -419,6 +433,7 @@ impl PackageManifest {
     /// Every file path referenced by the manifest (entry, settings, preview, fonts).
     pub fn referenced_files(&self) -> Vec<&str> {
         let mut v: Vec<&str> = self.fonts.iter().map(String::as_str).collect();
+        v.extend(self.icon.as_deref());
         for w in &self.widgets {
             v.push(&w.entry);
             v.extend(w.settings.as_deref());
@@ -613,6 +628,10 @@ mod tests {
         }
         assert!(with(|m| m.fonts = vec!["../x.ttf".into()]).is_err());
         assert!(with(|m| m.widgets[0].preview = Some("C:\\x.png".into())).is_err());
+        assert!(with(|m| m.icon = Some("assets/icon.png".into())).is_ok());
+        assert!(with(|m| m.icon = Some("assets/Icon.SVG".into())).is_ok());
+        assert!(with(|m| m.icon = Some("../icon.png".into())).is_err());
+        assert!(with(|m| m.icon = Some("icon.ico".into())).is_err());
         assert!(is_safe_relative_path("widgets/clock/index.js"));
     }
 
