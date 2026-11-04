@@ -5,7 +5,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::{LIM_SMALL, LoadIconMetric};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::{PCSTR, PCWSTR, w};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -151,6 +151,34 @@ fn build(items: &[Item]) -> HMENU {
             }
         }
         menu
+    }
+}
+
+/// Makes the process's popup menus follow the light/dark app theme.
+///
+/// Uses the undocumented but stable uxtheme exports that Explorer and the
+/// inbox apps use (`SetPreferredAppMode` #135, `FlushMenuThemes` #136).
+/// Does nothing if they are missing.
+pub fn set_menu_theme(dark: bool) -> bool {
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    unsafe {
+        let Ok(uxtheme) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
+        else {
+            return false;
+        };
+        let Some(set_mode) = GetProcAddress(uxtheme, PCSTR(135 as _)) else {
+            return false;
+        };
+        // PreferredAppMode: 2 = ForceDark, 3 = ForceLight.
+        let set_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+        set_mode(if dark { 2 } else { 3 });
+        if let Some(flush) = GetProcAddress(uxtheme, PCSTR(136 as _)) {
+            let flush: extern "system" fn() = std::mem::transmute(flush);
+            flush();
+        }
+        true
     }
 }
 

@@ -22,26 +22,32 @@ fn dword(key: PCWSTR, value: PCWSTR) -> Option<u32> {
     Some(data)
 }
 
-/// `{"dark": bool, "accent": "#rrggbb"}` for the current user.
-pub fn appearance_json() -> String {
-    let light = dword(
+/// Whether apps should use the dark theme.
+pub fn is_dark() -> bool {
+    dword(
         w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
         w!("AppsUseLightTheme"),
     )
     .unwrap_or(0)
-        != 0;
-    // Stored as 0xAABBGGRR.
+        == 0
+}
+
+/// `#rrggbb` from a DWM colour stored as 0xAABBGGRR.
+pub fn accent_hex(c: u32) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        c & 0xFF,
+        (c >> 8) & 0xFF,
+        (c >> 16) & 0xFF
+    )
+}
+
+/// `{"dark": bool, "accent": "#rrggbb"}` for the current user.
+pub fn appearance_json() -> String {
     let accent = dword(w!(r"Software\Microsoft\Windows\DWM"), w!("AccentColor"))
-        .map(|c| {
-            format!(
-                "#{:02x}{:02x}{:02x}",
-                c & 0xFF,
-                (c >> 8) & 0xFF,
-                (c >> 16) & 0xFF
-            )
-        })
+        .map(accent_hex)
         .unwrap_or_else(|| "#0078d4".into());
-    serde_json::json!({ "dark": !light, "accent": accent }).to_string()
+    serde_json::json!({ "dark": is_dark(), "accent": accent }).to_string()
 }
 
 #[cfg(test)]
@@ -51,5 +57,13 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&super::appearance_json()).unwrap();
         assert!(v["dark"].is_boolean());
         assert_eq!(v["accent"].as_str().unwrap().len(), 7);
+        assert_eq!(v["dark"].as_bool().unwrap(), super::is_dark());
+    }
+
+    #[test]
+    fn accent_is_read_as_abgr() {
+        assert_eq!(super::accent_hex(0xFFD47800), "#0078d4");
+        assert_eq!(super::accent_hex(0x00332211), "#112233");
+        assert_eq!(super::accent_hex(0), "#000000");
     }
 }

@@ -906,6 +906,7 @@ impl Runtime {
             }
             HostMsg::Edit(input) => self.edit_input(input),
             HostMsg::AppearanceChanged => {
+                shellapi::set_menu_theme(vitrine_script::appearance::is_dark());
                 let json = vitrine_script::appearance::appearance_json();
                 for l in &mut self.widgets {
                     l.inst.deliver("appearance", &json);
@@ -1548,6 +1549,7 @@ pub fn run() -> Result<(), String> {
         );
         // The process is a low-priority background app: let Windows schedule it efficiently.
         crate::power::enable_eco_qos();
+        shellapi::set_menu_theme(vitrine_script::appearance::is_dark());
 
         let mut rt = Runtime::new(hinst, host)?;
         rt.install_bundled();
