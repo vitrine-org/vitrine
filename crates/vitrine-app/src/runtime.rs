@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -108,8 +108,21 @@ pub enum HostMsg {
 }
 
 enum Event {
-    Fetch { instance: String, payload: String },
-    Prompt { instance: String, payload: String },
+    Fetch {
+        instance: String,
+        payload: String,
+    },
+    /// A size variant of the edit sheet rendered off-screen (premultiplied BGRA).
+    SheetPreview {
+        key: String,
+        w: u32,
+        h: u32,
+        bgra: Arc<Vec<u8>>,
+    },
+    Prompt {
+        instance: String,
+        payload: String,
+    },
     System(Value),
 }
 
@@ -126,6 +139,13 @@ fn push(msg: HostMsg) {
 pub(crate) fn push_host(msg: HostMsg) {
     push(msg);
 }
+
+/// Size variants waiting to be rendered for the edit sheet: preview key,
+/// package, widget and size in cells.
+type SheetQueue = Arc<(
+    Mutex<VecDeque<(String, InstalledPackage, String, (i32, i32))>>,
+    Condvar,
+)>;
 
 /// A widget instance placed on the desktop.
 struct Live {
@@ -214,6 +234,11 @@ pub struct Runtime {
     edit: Option<EditMode>,
     /// Edit mode fading out, dropped at the deadline.
     edit_closing: Option<(EditMode, Instant)>,
+    /// Rendered size variants of the edit sheet, by preview key (kept across
+    /// sessions of edit mode), the renderer's queue and whether it runs.
+    sheet_previews: HashMap<String, (u32, u32, Arc<Vec<u8>>)>,
+    sheet_queue: SheetQueue,
+    sheet_worker: bool,
     /// The gallery's last package tab (a package id), kept for the session.
     gallery_tab: Option<String>,
     /// Windows minimized for edit mode, restored when it ends.
@@ -291,6 +316,9 @@ impl Runtime {
             user_paused: false,
             edit: None,
             edit_closing: None,
+            sheet_previews: HashMap::new(),
+            sheet_queue: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+            sheet_worker: false,
             gallery_tab: None,
             peek: None,
             dying: Vec::new(),
@@ -747,6 +775,12 @@ impl Runtime {
                         l.inst.deliver("fetch", &payload);
                     }
                 }
+                Event::SheetPreview { key, w, h, bgra } => {
+                    if let Some(edit) = &mut self.edit {
+                        edit.add_preview(key.clone(), w, h, bgra.clone());
+                    }
+                    self.sheet_previews.insert(key, (w, h, bgra));
+                }
                 Event::Prompt { instance, payload } => {
                     if let Some(l) = self.widgets.iter_mut().find(|l| l.entry.id == instance) {
                         l.inst.deliver("prompt", &payload);
@@ -949,8 +983,101 @@ impl Runtime {
             if let Some(edit) = &mut self.edit {
                 timeout = timeout.min(edit.paint(&self.gpu, &self.dc, &items));
             }
+            self.queue_sheet_previews();
         }
         timeout
+    }
+
+    /// Hands the sizes the edit sheet shows to the preview renderer, newest
+    /// first (the selection just changed to them); results come back as
+    /// `Event::SheetPreview` and stay cached for the next sessions.
+    fn queue_sheet_previews(&mut self) {
+        let Some(edit) = &mut self.edit else {
+            return;
+        };
+        let jobs = edit.preview_jobs();
+        if jobs.is_empty() {
+            return;
+        }
+        let jobs: Vec<(String, InstalledPackage, String, (i32, i32))> = jobs
+            .into_iter()
+            .filter_map(|j| {
+                let pkg = self.packages.iter().find(|p| p.manifest.id == j.package)?;
+                Some((j.key, pkg.clone(), j.widget, j.size))
+            })
+            .collect();
+        let queue = self.sheet_queue.clone();
+        {
+            let (lock, cv) = &*queue;
+            let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+            for job in jobs.into_iter().rev() {
+                q.push_front(job);
+            }
+            cv.notify_one();
+        }
+        if self.sheet_worker {
+            return;
+        }
+        self.sheet_worker = true;
+        let tx = self.tx.clone();
+        let host_id = self.host.0 as isize;
+        let _ = std::thread::Builder::new()
+            .name("vitrine-sheet-previews".into())
+            .stack_size(8 << 20)
+            .spawn(move || {
+                unsafe {
+                    let _ = windows::Win32::System::Com::CoInitializeEx(
+                        None,
+                        windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                    );
+                }
+                let (lock, cv) = &*queue;
+                loop {
+                    let job = {
+                        let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(j) = q.pop_front() {
+                                break j;
+                            }
+                            q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let (key, pkg, widget, (cw, ch)) = job;
+                    let size = crate::headless::cells_to_dips(cw.max(1) as u32, ch.max(1) as u32);
+                    let result = crate::headless::render_rgba(
+                        &pkg,
+                        &widget,
+                        size,
+                        1.25,
+                        None,
+                        500,
+                        true,
+                        &crate::glass::Backdrop::Solid(0x1F1F1F),
+                    );
+                    let (w, h, rgba) = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log::warn!("sheet preview {key}: {e}");
+                            continue;
+                        }
+                    };
+                    let mut bgra = Vec::with_capacity(rgba.len());
+                    for px in rgba.as_chunks::<4>().0 {
+                        let a = px[3] as u32;
+                        let m = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+                        bgra.extend_from_slice(&[m(px[2]), m(px[1]), m(px[0]), px[3]]);
+                    }
+                    let ev = Event::SheetPreview {
+                        key,
+                        w,
+                        h,
+                        bgra: Arc::new(bgra),
+                    };
+                    if tx.send(ev).is_ok() {
+                        wake(host_id);
+                    }
+                }
+            });
     }
 
     fn handle(&mut self, msg: HostMsg) {
@@ -1286,14 +1413,16 @@ impl Runtime {
     }
 
     pub(crate) fn add_instance(&mut self, package: &str, widget: &str) {
-        self.add_instance_at(package, widget, None);
+        self.add_instance_at(package, widget, None, None);
     }
 
-    /// Adds a widget at a cell span, or at the first free place on the main monitor.
+    /// Adds a widget at a cell span, or at `size` (its default size when None)
+    /// in the first free place on the main monitor.
     pub(crate) fn add_instance_at(
         &mut self,
         package: &str,
         widget: &str,
+        size: Option<(i32, i32)>,
         at: Option<(String, crate::edit::Cells)>,
     ) {
         let Some(g) = self.primary_geometry() else {
@@ -1302,7 +1431,7 @@ impl Runtime {
         let Some(w) = self.package(package).and_then(|p| p.widget(widget)) else {
             return;
         };
-        let (cw, ch) = (w.size.default[0] as i32, w.size.default[1] as i32);
+        let (cw, ch) = size.unwrap_or((w.size.default[0] as i32, w.size.default[1] as i32));
         let (monitor, (x, y, cw, ch)) = match at {
             Some(spot) => spot,
             None => match self
@@ -1434,16 +1563,29 @@ impl Runtime {
             Action::Add {
                 package,
                 widget,
+                size,
                 at,
-            } => self.add_instance_at(&package, &widget, at),
+            } => self.add_instance_at(&package, &widget, Some(size), at),
             Action::Close => self.close_edit(),
         }
     }
 
+    /// The sheet's widgets: packs in the order arranged in the control panel
+    /// (hidden ones left out), with the favourites starred there.
     fn gallery(&self) -> Vec<crate::edit::GalleryItem> {
-        self.packages
+        let prefs = vitrine_widgets::gallery::Prefs::load(&paths::gallery_path());
+        let installed: Vec<&str> = self
+            .packages
             .iter()
+            .map(|p| p.manifest.id.as_str())
+            .collect();
+        let cells = |a: [u32; 2]| (a[0] as i32, a[1] as i32);
+        prefs
+            .visible(&installed)
+            .iter()
+            .filter_map(|id| self.packages.iter().find(|p| p.manifest.id == *id))
             .flat_map(|p| {
+                let prefs = &prefs;
                 p.manifest
                     .widgets
                     .iter()
@@ -1453,7 +1595,10 @@ impl Runtime {
                         widget: w.id.clone(),
                         name: w.name.clone(),
                         description: w.description.clone(),
-                        size: (w.size.default[0] as i32, w.size.default[1] as i32),
+                        size: cells(w.size.default),
+                        min: cells(w.size.min),
+                        max: cells(w.size.max),
+                        favourite: prefs.is_favourite(&p.manifest.id, &w.id),
                         dir: p.dir.clone(),
                         preview: w.preview.clone(),
                     })
@@ -1487,7 +1632,12 @@ impl Runtime {
             self.peek = Some(crate::peek::Peek::show_desktop());
             let tab = self.gallery_tab.clone();
             match EditMode::open(&self.gpu, self.hinst, geometries, self.gallery(), tab) {
-                Ok(e) => self.edit = Some(e),
+                Ok(mut e) => {
+                    for (key, (w, h, bgra)) in &self.sheet_previews {
+                        e.add_preview(key.clone(), *w, *h, bgra.clone());
+                    }
+                    self.edit = Some(e);
+                }
                 Err(e) => {
                     log::error!("edit mode: {e}");
                     if let Some(peek) = self.peek.take() {

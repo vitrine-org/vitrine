@@ -31,6 +31,12 @@ the 2.1.0 theme releases deleted. Don't add widgets to the themes without asking
 - Panel: "Add widgets" search + package/size/interactive/network filters; edit-mode gallery search + package tabs; Store page (install/update with SHA-256 check, update badge); tray "Get more widgets" opens the Store page.
 - Tray icon re-added after Explorer restarts; dependencies optimised in dev builds (debug QuickJS tripped the 250 ms script slice).
 - New app icon "Lastre" (by the user, `assets/icon/src/lastre.py`); org avatars in `Downloads\vitrine-org-avatar-{dark,light}.png`; site favicons regenerated.
+- Gallery redesign: panel "Add widgets" in collapsible pack sections (favourites first, reorder/hide
+  from the header menu, collapse/expand all, grid or list view; `gallery.json` via
+  `vitrine_widgets::gallery::Prefs`); every preview on one neutral dark tile. Edit mode's "Add widget"
+  is a centred sheet (`edit.rs` + `sheet.rs`): sidebar (search, All, Favourites, packs), each widget in
+  its min/default/max sizes rendered off-screen at true proportions (worker in `runtime.rs`, cached
+  per session), drag or "+" to add, Tab/arrows/Enter/Esc.
 - 145+ tests (app 94+, store builder, locales).
 
 ## Next steps (in order)

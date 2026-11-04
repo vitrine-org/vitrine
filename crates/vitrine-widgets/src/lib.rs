@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 mod fsutil;
+pub mod gallery;
 pub mod layout;
 pub mod locale;
 pub mod manifest;

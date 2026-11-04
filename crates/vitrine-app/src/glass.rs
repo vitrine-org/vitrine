@@ -92,6 +92,8 @@ pub enum Backdrop {
     Image(PathBuf),
     /// The primary monitor's wallpaper (falls back to the default).
     Wallpaper,
+    /// A solid colour (`0xRRGGBB`): the neutral tile of the gallery previews.
+    Solid(u32),
 }
 
 /// Monitor key used off-screen.
@@ -112,6 +114,11 @@ pub fn preview_source(backdrop: &Backdrop, pw: u32, ph: u32, scale: f32) -> Moni
             }
         }
         Backdrop::Default => WallpaperImage::Pixels(default_backdrop()),
+        Backdrop::Solid(_) => WallpaperImage::None,
+    };
+    let background = match backdrop {
+        Backdrop::Solid(rgb) => color(*rgb),
+        _ => Color::rgba(0.16, 0.18, 0.24, 1.0),
     };
     let area = RectF {
         x: 0.0,
@@ -126,7 +133,7 @@ pub fn preview_source(backdrop: &Backdrop, pw: u32, ph: u32, scale: f32) -> Moni
         scale,
         image,
         position: Position::Fill,
-        background: Color::rgba(0.16, 0.18, 0.24, 1.0),
+        background,
     }
 }
 

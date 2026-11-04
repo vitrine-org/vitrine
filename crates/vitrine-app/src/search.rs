@@ -69,6 +69,7 @@ impl SizeClass {
 pub struct Facts {
     /// Searchable text: localised and original names, descriptions, pack name.
     pub text: Vec<String>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub pack: String,
     pub size: (i32, i32),
     pub interactive: bool,
@@ -96,6 +97,7 @@ impl Filter {
             && matches(&self.query, &text)
     }
 
+    #[cfg(test)]
     pub fn accepts(&self, f: &Facts) -> bool {
         self.pack.as_ref().is_none_or(|p| *p == f.pack) && self.accepts_any_pack(f)
     }

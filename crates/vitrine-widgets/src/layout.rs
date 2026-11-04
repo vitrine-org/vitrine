@@ -165,6 +165,23 @@ mod tests {
     }
 
     #[test]
+    fn free_spot_depends_on_the_size_asked_for() {
+        // Row 0 has a 2-wide hole at x 2..4; row 1 is free from x 2.
+        let l = Layout {
+            instances: vec![
+                inst("a", "primary", 0, 0, 2, 2),
+                inst("b", "primary", 4, 0, 4, 1),
+            ],
+            ..Layout::default()
+        };
+        assert_eq!(l.find_free_spot("primary", 8, 4, 2, 1), Some((2, 0)));
+        assert_eq!(l.find_free_spot("primary", 8, 4, 2, 2), Some((2, 0)));
+        assert_eq!(l.find_free_spot("primary", 8, 4, 4, 2), Some((2, 1)));
+        assert_eq!(l.find_free_spot("primary", 8, 4, 8, 2), Some((0, 2)));
+        assert_eq!(l.find_free_spot("primary", 8, 4, 8, 3), None);
+    }
+
+    #[test]
     fn round_trip_and_missing() {
         let dir = std::env::temp_dir().join(format!("vitrine-layout-{}", std::process::id()));
         let p = dir.join("layout.json");

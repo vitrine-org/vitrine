@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use serde_json::{Map, Value};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use vitrine_widgets::config::Config;
+use vitrine_widgets::gallery::{self, FAVOURITES, Prefs};
 use vitrine_widgets::layout::{Instance, Layout};
 use vitrine_widgets::package::{self, InstalledPackage};
 use vitrine_widgets::paths;
@@ -49,17 +50,29 @@ struct State {
     store: StoreState,
 }
 
-/// The gallery's results: one card per widget, filtered in place so cards
-/// can animate between positions.
+/// The gallery: favourites, then one collapsible section per pack. Cards
+/// are filtered in place so they can animate between positions.
 #[derive(Default)]
 struct Gallery {
-    model: Rc<VecModel<LibraryRow>>,
+    /// One per installed widget, in package order: its card and what the filters look at.
+    rows: Vec<LibraryRow>,
     facts: Vec<Facts>,
+    sections: Rc<VecModel<GallerySection>>,
+    /// Parallel to `sections`: favourites first, then the visible packs.
+    parts: Vec<Part>,
     /// Package of each chip (None for "All packages").
     chips: Vec<Option<String>>,
     chip_model: Rc<VecModel<PackChip>>,
     /// Packages and versions the model was built from.
     signature: String,
+    prefs: Prefs,
+}
+
+/// A section's cards, and the widget (index into `Gallery::rows`) behind each.
+struct Part {
+    id: String,
+    model: Rc<VecModel<LibraryRow>>,
+    members: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -320,6 +333,7 @@ fn open_detail(ui: &PanelWindow, st: &mut State, package: &str, widget: &str) {
         preview: preview_image(&pkg, &w),
         slot: 0,
         shown: true,
+        ..Default::default()
     });
     ui.set_detail_preview(preview_image(&pkg, &w));
     ui.set_detail_sizes(ModelRc::new(VecModel::from(
@@ -408,7 +422,33 @@ fn instance_rows(st: &State) -> Vec<InstanceRow> {
         .collect()
 }
 
+/// Columns and rows of the main monitor's grid (size variants must fit it).
+fn grid_limit(st: &State) -> (i32, i32) {
+    let monitors = vitrine_desktop::monitors::monitors();
+    monitors
+        .iter()
+        .find(|m| m.primary)
+        .or(monitors.first())
+        .map(|m| {
+            let g = Geometry::for_monitor(&st.layout.grid, m);
+            (g.cols, g.rows)
+        })
+        .unwrap_or((26, 14))
+}
+
+/// "2×1 · 4×2": the sizes a widget comes in.
+fn variants_text(w: &vitrine_widgets::manifest::WidgetManifest, grid: (i32, i32)) -> String {
+    let c = |a: [u32; 2]| (a[0] as i32, a[1] as i32);
+    gallery::size_variants(c(w.size.min), c(w.size.default), c(w.size.max), grid)
+        .iter()
+        .map(|(w, h)| format!("{w}×{h}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 fn library_rows(st: &State) -> Vec<LibraryRow> {
+    let grid = grid_limit(st);
+    let prefs = &st.gallery.prefs;
     st.packages
         .iter()
         .flat_map(|p| {
@@ -422,6 +462,8 @@ fn library_rows(st: &State) -> Vec<LibraryRow> {
                 preview: preview_image(p, w),
                 slot: 0,
                 shown: true,
+                sizes: s(variants_text(w, grid)),
+                favourite: prefs.is_favourite(&p.manifest.id, &w.id),
             })
         })
         .collect()
@@ -464,13 +506,7 @@ fn library_facts(packages: &[InstalledPackage], originals: &[InstalledPackage]) 
 
 /// Avatar colour of a package chip, stable for its id.
 fn tint(id: &str) -> slint::Color {
-    const TINTS: [u32; 8] = [
-        0x0067C0, 0x8764B8, 0x00838F, 0xC239B3, 0x2D7D9A, 0xCA5010, 0x498205, 0x5D5A58,
-    ];
-    let h = id.bytes().fold(0x811C_9DC5u32, |h, b| {
-        (h ^ b as u32).wrapping_mul(0x0100_0193)
-    });
-    let c = TINTS[h as usize % TINTS.len()];
+    let c = gallery::tint(id);
     slint::Color::from_rgb_u8((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
@@ -494,7 +530,7 @@ fn assign_slots(shown: &[bool], old_slots: &mut [i32]) -> usize {
     next as usize
 }
 
-/// Rebuilds the gallery model when the installed packages changed.
+/// Rebuilds the gallery when the installed packages changed.
 fn rebuild_gallery(ui: &PanelWindow, st: &mut State) {
     let signature: String = st
         .packages
@@ -502,43 +538,166 @@ fn rebuild_gallery(ui: &PanelWindow, st: &mut State) {
         .map(|p| format!("{}@{};", p.manifest.id, p.manifest.version))
         .chain(std::iter::once(i18n::language().to_string()))
         .collect();
-    if signature == st.gallery.signature && st.gallery.model.row_count() > 0 {
+    if signature == st.gallery.signature && !st.gallery.rows.is_empty() {
         return;
     }
     st.gallery.signature = signature;
-    st.gallery.model = Rc::new(VecModel::from(library_rows(st)));
+    st.gallery.prefs = Prefs::load(&paths::gallery_path());
+    st.gallery.rows = library_rows(st);
     st.gallery.facts = library_facts(&st.packages, &st.originals);
-    let selected = st
-        .gallery
+    build_sections(ui, st);
+}
+
+fn save_prefs(st: &State) {
+    if let Err(e) = st.gallery.prefs.save(&paths::gallery_path()) {
+        log::warn!("gallery.json: {e}");
+    }
+}
+
+/// Builds the sections (favourites, then the visible packs in the user's
+/// order), the package chips and the hidden-packs menu.
+fn build_sections(ui: &PanelWindow, st: &mut State) {
+    let installed: Vec<&str> = st.packages.iter().map(|p| p.manifest.id.as_str()).collect();
+    let g = &mut st.gallery;
+    let visible = g.prefs.visible(&installed);
+    let in_view = |i: &usize| visible.iter().any(|v| *v == g.rows[*i].package.as_str());
+    let favourites: Vec<usize> = g
+        .prefs
+        .favourites
+        .iter()
+        .filter_map(|k| {
+            g.rows
+                .iter()
+                .position(|r| gallery::key(&r.package, &r.widget) == *k)
+        })
+        .filter(in_view)
+        .collect();
+    let part = |id: &str, members: Vec<usize>| Part {
+        id: id.to_string(),
+        model: Rc::new(VecModel::from(
+            members
+                .iter()
+                .map(|&i| g.rows[i].clone())
+                .collect::<Vec<_>>(),
+        )),
+        members,
+    };
+    let mut parts = vec![part(FAVOURITES, favourites)];
+    for id in &visible {
+        let members = (0..g.rows.len())
+            .filter(|&i| g.rows[i].package.as_str() == id)
+            .collect();
+        parts.push(part(id, members));
+    }
+    let name_of = |id: &str| {
+        st.packages
+            .iter()
+            .find(|p| p.manifest.id == id)
+            .map(|p| p.manifest.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let n = parts.len();
+    let sections: Vec<GallerySection> = parts
+        .iter()
+        .enumerate()
+        .map(|(k, part)| {
+            let fav = part.id == FAVOURITES;
+            let name = if fav {
+                t("gallery.favourites")
+            } else {
+                name_of(&part.id)
+            };
+            GallerySection {
+                id: s(part.id.as_str()),
+                initial: s(initial(&name)),
+                name: s(name),
+                tint: tint(&part.id),
+                favourites: fav,
+                count: part.members.len() as i32,
+                shown: !part.members.is_empty(),
+                expanded: !g.prefs.is_collapsed(&part.id),
+                first: k <= 1,
+                last: k + 1 == n,
+                items: ModelRc::from(part.model.clone()),
+            }
+        })
+        .collect();
+    let total = parts.iter().skip(1).map(|p| p.members.len()).sum::<usize>();
+    g.parts = parts;
+    g.sections = Rc::new(VecModel::from(sections));
+
+    let selected = g
         .chips
         .get(ui.get_pack_index().max(0) as usize)
         .cloned()
-        .flatten();
-    st.gallery.chips = std::iter::once(None)
-        .chain(st.packages.iter().map(|p| Some(p.manifest.id.clone())))
+        .flatten()
+        .filter(|id| visible.contains(id));
+    g.chips = std::iter::once(None)
+        .chain(visible.iter().map(|id| Some(id.clone())))
         .collect();
+    let chip = |id: &str| PackChip {
+        id: s(id),
+        name: s(name_of(id)),
+        initial: s(initial(&name_of(id))),
+        tint: tint(id),
+        count: 0,
+    };
     let chips: Vec<PackChip> = std::iter::once(PackChip {
         name: s(t("gallery.all_packs")),
         ..Default::default()
     })
-    .chain(st.packages.iter().map(|p| PackChip {
-        id: s(p.manifest.id.as_str()),
-        name: s(p.manifest.name.as_str()),
-        initial: s(initial(&p.manifest.name)),
-        tint: tint(&p.manifest.id),
-        count: 0,
-    }))
+    .chain(visible.iter().map(|id| chip(id)))
     .collect();
-    st.gallery.chip_model = Rc::new(VecModel::from(chips));
-    ui.set_pack_index(
-        st.gallery
-            .chips
-            .iter()
-            .position(|c| *c == selected)
-            .unwrap_or(0) as i32,
-    );
-    ui.set_library(ModelRc::from(st.gallery.model.clone()));
-    ui.set_pack_chips(ModelRc::from(st.gallery.chip_model.clone()));
+    g.chip_model = Rc::new(VecModel::from(chips));
+    let hidden: Vec<PackChip> = installed
+        .iter()
+        .filter(|id| g.prefs.is_hidden(id))
+        .map(|id| chip(id))
+        .collect();
+    ui.set_pack_index(g.chips.iter().position(|c| *c == selected).unwrap_or(0) as i32);
+    ui.set_sections(ModelRc::from(g.sections.clone()));
+    ui.set_pack_chips(ModelRc::from(g.chip_model.clone()));
+    ui.set_hidden_packs(ModelRc::new(VecModel::from(hidden)));
+    ui.set_library_total(total as i32);
+    ui.set_list_view(g.prefs.list);
+    apply_gallery_filter(ui, st);
+}
+
+/// Stars or unstars a widget: its cards update in place and the favourites
+/// section gains or loses a card.
+fn toggle_favourite(ui: &PanelWindow, st: &mut State, package: &str, widget: &str) {
+    let g = &mut st.gallery;
+    let on = g.prefs.toggle_favourite(package, widget);
+    let Some(i) = g
+        .rows
+        .iter()
+        .position(|r| r.package == package && r.widget == widget)
+    else {
+        return;
+    };
+    g.rows[i].favourite = on;
+    for part in &g.parts {
+        for (j, _) in part.members.iter().enumerate().filter(|(_, m)| **m == i) {
+            if let Some(mut row) = part.model.row_data(j) {
+                row.favourite = on;
+                part.model.set_row_data(j, row);
+            }
+        }
+    }
+    let in_view = g.parts.iter().skip(1).any(|p| p.members.contains(&i));
+    if let Some(fav) = g.parts.first_mut() {
+        if on && in_view {
+            fav.members.push(i);
+            fav.model.push(LibraryRow {
+                slot: fav.members.len() as i32 - 1,
+                ..g.rows[i].clone()
+            });
+        } else if let Some(j) = fav.members.iter().position(|&m| m == i) {
+            fav.members.remove(j);
+            fav.model.remove(j);
+        }
+    }
+    save_prefs(st);
     apply_gallery_filter(ui, st);
 }
 
@@ -562,29 +721,58 @@ fn gallery_filter(ui: &PanelWindow, st: &State) -> Filter {
     }
 }
 
-/// Shows the widgets that match the search and filters, and updates the counts.
+/// Shows the widgets that match the search and filters, opens the sections
+/// with matches and hides the others, and updates the counts.
 fn apply_gallery_filter(ui: &PanelWindow, st: &State) {
     let filter = gallery_filter(ui, st);
+    let filtering = !filter.query.trim().is_empty()
+        || filter.size.is_some()
+        || filter.interactive
+        || filter.online;
     let g = &st.gallery;
-    let shown: Vec<bool> = g.facts.iter().map(|f| filter.accepts(f)).collect();
-    let mut slots: Vec<i32> = (0..g.model.row_count())
-        .map(|i| g.model.row_data(i).map_or(0, |r| r.slot))
-        .collect();
-    let count = assign_slots(&shown, &mut slots);
-    for (i, (&on, &slot)) in shown.iter().zip(&slots).enumerate() {
-        if let Some(mut row) = g.model.row_data(i)
-            && (row.shown != on || row.slot != slot)
+    let mut count = 0;
+    let mut any_expanded = false;
+    for (k, part) in g.parts.iter().enumerate() {
+        let shown: Vec<bool> = part
+            .members
+            .iter()
+            .map(|&i| filter.accepts_any_pack(&g.facts[i]))
+            .collect();
+        let mut slots: Vec<i32> = (0..part.model.row_count())
+            .map(|i| part.model.row_data(i).map_or(0, |r| r.slot))
+            .collect();
+        let n = assign_slots(&shown, &mut slots);
+        for (i, (&on, &slot)) in shown.iter().zip(&slots).enumerate() {
+            if let Some(mut row) = part.model.row_data(i)
+                && (row.shown != on || row.slot != slot)
+            {
+                row.shown = on;
+                row.slot = slot;
+                part.model.set_row_data(i, row);
+            }
+        }
+        let view = gallery::section_view(&g.prefs, &part.id, n, filtering, filter.pack.as_deref());
+        if view.shown && part.id != FAVOURITES {
+            count += n;
+        }
+        any_expanded |= view.shown && !g.prefs.is_collapsed(&part.id);
+        if let Some(mut sec) = g.sections.row_data(k)
+            && (sec.count != n as i32 || sec.shown != view.shown || sec.expanded != view.expanded)
         {
-            row.shown = on;
-            row.slot = slot;
-            g.model.set_row_data(i, row);
+            sec.count = n as i32;
+            sec.shown = view.shown;
+            sec.expanded = view.expanded;
+            g.sections.set_row_data(k, sec);
         }
     }
     for (i, pack) in g.chips.iter().enumerate() {
         let n = g
-            .facts
+            .parts
             .iter()
-            .filter(|f| pack.as_ref().is_none_or(|p| *p == f.pack) && filter.accepts_any_pack(f))
+            .skip(1)
+            .filter(|p| pack.as_ref().is_none_or(|id| *id == p.id))
+            .flat_map(|p| &p.members)
+            .filter(|&&m| filter.accepts_any_pack(&g.facts[m]))
             .count() as i32;
         if let Some(mut chip) = g.chip_model.row_data(i)
             && chip.count != n
@@ -593,6 +781,7 @@ fn apply_gallery_filter(ui: &PanelWindow, st: &State) {
             g.chip_model.set_row_data(i, chip);
         }
     }
+    ui.set_any_expanded(any_expanded);
     ui.set_result_count(count as i32);
     ui.set_result_text(s(tn("row.widgets", count as u64)));
 }
@@ -1745,6 +1934,46 @@ pub fn run(instance: Option<String>, page: Option<String>) -> Result<(), String>
     }));
     ui.on_open_folder(|| shellapi::open(&paths::data_dir().to_string_lossy()));
     ui.on_filter_changed(with!(|ui, st| { apply_gallery_filter(&ui, st) }));
+    ui.on_toggle_section(with!(|ui, st, id: SharedString| {
+        st.gallery.prefs.toggle_collapsed(&id);
+        save_prefs(st);
+        apply_gallery_filter(&ui, st);
+    }));
+    ui.on_set_all_expanded(with!(|ui, st, expand: bool| {
+        let ids: Vec<String> = st.gallery.parts.iter().map(|p| p.id.clone()).collect();
+        for id in ids {
+            st.gallery.prefs.set_collapsed(&id, !expand);
+        }
+        save_prefs(st);
+        apply_gallery_filter(&ui, st);
+    }));
+    ui.on_toggle_favourite(with!(
+        |ui, st, package: SharedString, widget: SharedString| {
+            toggle_favourite(&ui, st, &package, &widget)
+        }
+    ));
+    ui.on_move_section(with!(|ui, st, id: SharedString, delta: i32| {
+        let installed: Vec<String> = st.packages.iter().map(|p| p.manifest.id.clone()).collect();
+        let installed: Vec<&str> = installed.iter().map(String::as_str).collect();
+        if st.gallery.prefs.move_pack(&installed, &id, delta) {
+            save_prefs(st);
+            build_sections(&ui, st);
+        }
+    }));
+    ui.on_hide_section(with!(|ui, st, id: SharedString| {
+        st.gallery.prefs.set_hidden(&id, true);
+        save_prefs(st);
+        build_sections(&ui, st);
+    }));
+    ui.on_show_section(with!(|ui, st, id: SharedString| {
+        st.gallery.prefs.set_hidden(&id, false);
+        save_prefs(st);
+        build_sections(&ui, st);
+    }));
+    ui.on_set_list_view(with!(|_ui, st, list: bool| {
+        st.gallery.prefs.list = list;
+        save_prefs(st);
+    }));
     ui.on_store_open(with!(|ui, st| { open_store(&ui, st) }));
     ui.on_store_retry(with!(|ui, st| {
         st.store.fresh = false;

@@ -17,6 +17,7 @@ mod power;
 mod prompt;
 mod runtime;
 mod search;
+mod sheet;
 mod shellapi;
 mod store;
 

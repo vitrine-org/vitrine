@@ -27,6 +27,11 @@ pub fn config_path() -> PathBuf {
     data_dir().join("settings.json")
 }
 
+/// How the widget gallery is arranged (favourites, section order).
+pub fn gallery_path() -> PathBuf {
+    data_dir().join("gallery.json")
+}
+
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }

@@ -1,9 +1,10 @@
 //! Edit mode: open windows step aside, and a translucent overlay per monitor
 //! shows the grid. Widgets follow the pointer while dragged and settle into
 //! their cell with an animation; the corner handle resizes them live; hover
-//! controls remove a widget or open its settings; the gallery sheet lets you
-//! search and filter the installed widgets by package and drag new ones onto
-//! the desktop.
+//! controls remove a widget or open its settings. "Add widget" opens a
+//! centred sheet: a sidebar (search, All, Favourites, each pack) and the
+//! selection's widgets in every size they come in, previewed at their true
+//! proportions; drag a size onto the desktop or press its "+" to add it.
 //!
 //! [`EditMode`] owns the overlay and the interaction state. It never touches
 //! the layout itself: it turns pointer input into [`Action`]s for the runtime.
@@ -17,8 +18,8 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_END,
-    VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Interface, PCWSTR, Result, w};
@@ -27,10 +28,14 @@ use windows_numerics::{Matrix3x2, Vector2};
 use crate::grid::Geometry;
 use crate::i18n::t;
 use crate::runtime::HostMsg;
+use crate::sheet::{self, Focus, Group, Move, Selection};
 use vitrine_render::compose::WindowVisual;
 use vitrine_render::gpu::Gpu;
 use vitrine_render::image::{DirAssets, ImageCache};
 use windows::Win32::Graphics::Imaging::IWICBitmap;
+
+use std::collections::HashSet;
+use std::sync::Arc;
 
 const CLASS: PCWSTR = w!("VitrineEditOverlay");
 
@@ -59,9 +64,23 @@ pub struct GalleryItem {
     /// Localized widget name and description (both searched).
     pub name: String,
     pub description: String,
+    /// Default, minimum and maximum size in cells.
     pub size: (i32, i32),
+    pub min: (i32, i32),
+    pub max: (i32, i32),
+    /// Starred in the control panel.
+    pub favourite: bool,
     pub dir: std::path::PathBuf,
     pub preview: Option<String>,
+}
+
+/// A size variant the sheet wants rendered (see [`EditMode::preview_jobs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewJob {
+    pub key: String,
+    pub package: String,
+    pub widget: String,
+    pub size: (i32, i32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,10 +224,11 @@ pub enum Action {
     Settings {
         id: String,
     },
-    /// Add a widget, at a cell span or (None) the first free spot.
+    /// Add a widget, at a cell span or (None) at `size` in the first free spot.
     Add {
         package: String,
         widget: String,
+        size: (i32, i32),
         at: Option<(String, Cells)>,
     },
     Close,
@@ -223,14 +243,15 @@ enum Hot {
     Handle(String),
     Add,
     Done,
-    /// A gallery card, by gallery index.
-    Card(usize),
     Sheet,
     /// The search field, and its clear button.
     Search,
     Clear,
-    /// A package tab: 0 is "All", then the packages in gallery order.
-    Tab(usize),
+    /// A sidebar entry: All, Favourites, then the packs.
+    Side(usize),
+    /// A size variant of the sheet (group, variant), and its "+" button.
+    Tile(usize, usize),
+    Plus(usize, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -245,8 +266,12 @@ enum DragKind {
         min: (i32, i32),
         max: (i32, i32),
     },
+    /// A size variant dragged out of the sheet: gallery index, size, and
+    /// where it sits in the sheet (group, variant).
     New {
-        card: usize,
+        item: usize,
+        size: (i32, i32),
+        at: (usize, usize),
     },
 }
 
@@ -275,30 +300,60 @@ struct Fonts {
     button: IDWriteTextFormat,
     caption: IDWriteTextFormat,
     icon: IDWriteTextFormat,
-    /// Package tabs.
+    /// Count badges.
     chip: IDWriteTextFormat,
     /// Search field text (left-aligned, never trimmed).
     field: IDWriteTextFormat,
     /// Clear button glyph, and the empty-state glyph.
     icon_small: IDWriteTextFormat,
     icon_large: IDWriteTextFormat,
+    /// The sheet: selection title, widget names and descriptions, sidebar
+    /// labels and size captions.
+    title: IDWriteTextFormat,
+    name: IDWriteTextFormat,
+    desc: IDWriteTextFormat,
+    side: IDWriteTextFormat,
+    tiny: IDWriteTextFormat,
 }
 
-/// Where the gallery sheet's parts are, in screen pixels.
+/// Where the sheet's parts are, in screen pixels (at rest: the open/close
+/// spring scales the whole sheet around its centre when painting).
 #[derive(Clone, Debug, Default)]
 struct SheetLayout {
     sheet: RECT,
+    /// The sidebar pane, the search field and its clear button.
+    side: RECT,
     field: RECT,
     clear: RECT,
-    /// The visible tab strip (empty when there is a single package).
-    strip: RECT,
-    /// Tabs, scrolled.
-    tabs: Vec<RECT>,
-    /// The row the cards scroll in.
+    /// Sidebar rows: All, Favourites, then the packs.
+    entries: Vec<RECT>,
+    /// The selection's title row, and the scrolling area of the widgets.
+    title: RECT,
     area: RECT,
-    /// Cards by gallery index, at their animated positions.
-    cards: Vec<RECT>,
+    /// Widgets of the selection, scrolled.
+    groups: Vec<GroupLayout>,
+    /// Height of all the groups (for the scroll limit).
+    content: i32,
 }
+
+/// One widget in the sheet: its size variants side by side, the size under
+/// each, then its name and description.
+#[derive(Clone, Debug, Default)]
+struct GroupLayout {
+    tiles: Vec<RECT>,
+    labels: Vec<RECT>,
+    name: RECT,
+    desc: RECT,
+    bounds: RECT,
+}
+
+/// Tallest preview tile in the sheet, DIPs.
+const TILE_H: f32 = 128.0;
+/// Previews are at most this fraction of the widget's real size.
+const TILE_MAX_SCALE: f32 = 0.8;
+const SIDEBAR_W: f32 = 240.0;
+/// How long a "+" shows its check mark after adding.
+const ADDED_SECS: f32 = 1.4;
 
 /// Caret blink half-period, as in Windows' default.
 const BLINK_MS: u32 = 530;
@@ -310,21 +365,40 @@ pub struct EditMode {
     gallery: Vec<GalleryItem>,
     /// Packages in gallery order: (id, localized name).
     packs: Vec<(String, String)>,
-    /// Selected package tab (None: all).
-    tab: Option<String>,
-    tab_scroll: f32,
+    /// Columns and rows of the main monitor's grid (size variants fit it).
+    grid: (i32, i32),
+    /// The sidebar's selection.
+    selection: Selection,
     search: TextField,
     /// Blink phase starts here (reset by every edit so the caret shows while typing).
     caret_epoch: Instant,
     caret_on: bool,
-    /// By gallery index: passes the search and the tab.
-    matched: Vec<bool>,
-    /// By gallery index: animated x in the card row (unscrolled) and visibility 0..1.
-    card_x: Vec<f32>,
-    card_v: Vec<f32>,
-    /// Animated left and right edges of the selected-tab pill, in strip coordinates.
+    /// Widgets of the selection that pass the search, with their sizes.
+    groups: Vec<Group>,
+    /// Keyboard: which half of the sheet has it, the grid cursor (group,
+    /// variant), and whether focus rings show (after a key, not a click).
+    focus: Focus,
+    cursor: (usize, usize),
+    keyboard: bool,
+    /// Sheet open/close spring: position (0 hidden, 1 open) and velocity.
+    spring: (f32, f32),
+    /// The sidebar's accent indicator: animated top and bottom, relative to the sheet top.
     pill: (f32, f32),
+    /// Vertical scroll of the widgets, and where it is heading.
+    scroll: f32,
+    scroll_to: f32,
+    /// A new widget was dragged out of the sheet, which steps aside until the drop.
+    away: bool,
+    /// Static previews (`preview` of the manifest) by gallery index.
     previews: HashMap<usize, Option<ID2D1Bitmap>>,
+    /// Rendered previews by [`sheet::preview_key`]: premultiplied BGRA pixels
+    /// as they arrive, and their bitmaps.
+    pixels: HashMap<String, (u32, u32, Arc<Vec<u8>>)>,
+    renders: HashMap<String, Option<ID2D1Bitmap>>,
+    /// Keys already handed to the runtime for rendering.
+    requested: HashSet<String>,
+    /// Variants just added with their "+" (check mark feedback), by preview key.
+    added: HashMap<String, Instant>,
     images: ImageCache,
     dwrite: IDWriteFactory5,
     hot: Hot,
@@ -332,7 +406,6 @@ pub struct EditMode {
     drag: Option<Drag>,
     pointer: POINT,
     gallery_open: bool,
-    scroll: f32,
     /// Smoothed 0..1 values for hover/press/sheet transitions.
     anim: HashMap<String, f32>,
     last_frame: Instant,
@@ -451,6 +524,16 @@ impl Fonts {
             field,
             icon_small: make(icons, 10.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
             icon_large: make(icons, 28.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
+            title: make(
+                w!("Segoe UI Variable Display"),
+                20.0,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                false,
+            )?,
+            name: make(text, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?,
+            desc: make(text, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?,
+            side: make(text, 14.0, DWRITE_FONT_WEIGHT_NORMAL, false)?,
+            tiny: make(text, 11.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
         })
     }
 }
@@ -525,24 +608,38 @@ impl EditMode {
                 packs.push((g.package.clone(), g.pack_name.clone()));
             }
         }
-        // A package that is gone (or a single one, which has no tabs) means "All".
-        let tab = tab.filter(|t| packs.len() > 1 && packs.iter().any(|(id, _)| id == t));
-        let n = gallery.len();
+        // A package that is gone means "All".
+        let selection = match Selection::from_key(tab.as_deref()) {
+            Selection::Pack(p) if !packs.iter().any(|(id, _)| *id == p) => Selection::All,
+            s => s,
+        };
+        let grid = overlays
+            .first()
+            .map_or((26, 14), |o| (o.geo.cols, o.geo.rows));
         let mut edit = EditMode {
             overlays,
             visuals,
             gallery,
             packs,
-            tab,
-            tab_scroll: 0.0,
+            grid,
+            selection,
             search: TextField::default(),
             caret_epoch: Instant::now(),
             caret_on: true,
-            matched: vec![true; n],
-            card_x: vec![0.0; n],
-            card_v: vec![1.0; n],
+            groups: Vec::new(),
+            focus: Focus::Side,
+            cursor: (0, 0),
+            keyboard: false,
+            spring: (0.0, 0.0),
             pill: (0.0, 0.0),
+            scroll: 0.0,
+            scroll_to: 0.0,
+            away: false,
             previews: HashMap::new(),
+            pixels: HashMap::new(),
+            renders: HashMap::new(),
+            requested: HashSet::new(),
+            added: HashMap::new(),
             images,
             dwrite,
             hot: Hot::None,
@@ -550,21 +647,19 @@ impl EditMode {
             drag: None,
             pointer: POINT::default(),
             gallery_open: false,
-            scroll: 0.0,
             anim: HashMap::new(),
             last_frame: Instant::now(),
             dirty: true,
             closing: false,
         };
         edit.refilter();
-        edit.reveal_tab();
         edit.snap();
         edit
     }
 
-    /// The selected package tab, for the runtime to remember across sessions of edit mode.
+    /// The sidebar selection, for the runtime to remember across sessions of edit mode.
     pub fn tab(&self) -> Option<String> {
-        self.tab.clone()
+        self.selection.key()
     }
 
     /// Fades the overlays out; the runtime drops the edit mode shortly after.
@@ -575,144 +670,239 @@ impl EditMode {
         }
     }
 
-    /// Shows the gallery with a fresh search (the package tab is kept).
+    /// Shows the sheet with a fresh search and the keyboard in the sidebar
+    /// (the selection is kept).
     pub fn open_gallery(&mut self) {
         if !self.gallery_open {
             self.gallery_open = true;
+            self.away = false;
             self.search.clear();
+            self.focus = Focus::Side;
+            self.keyboard = false;
             self.refilter();
             self.caret_epoch = Instant::now();
         }
         self.dirty = true;
     }
 
-    // ── search and package tabs ───────────────────────────────────────
+    /// Size variants the sheet shows and has not asked for yet, in the order
+    /// they appear; the runtime renders them off-screen and hands them back
+    /// with [`EditMode::add_preview`].
+    pub fn preview_jobs(&mut self) -> Vec<PreviewJob> {
+        if !self.gallery_open {
+            return Vec::new();
+        }
+        let mut jobs = Vec::new();
+        for g in &self.groups {
+            let item = &self.gallery[g.item];
+            for &size in &g.variants {
+                let key = sheet::preview_key(item, size);
+                if self.pixels.contains_key(&key) || !self.requested.insert(key.clone()) {
+                    continue;
+                }
+                jobs.push(PreviewJob {
+                    key,
+                    package: item.package.clone(),
+                    widget: item.widget.clone(),
+                    size,
+                });
+            }
+        }
+        jobs
+    }
 
-    /// Recomputes which cards pass the search and the tab; the row scrolls
-    /// back to the start, and the cards reflow from where they are on screen.
-    fn refilter(&mut self) {
-        let tab = self.tab.as_deref();
-        let query = self.search.text.as_str();
-        let matched: Vec<bool> = self
-            .gallery
-            .iter()
-            .map(|g| {
-                tab.is_none_or(|t| t == g.package)
-                    && crate::search::matches(query, &[&g.name, &g.description, &g.pack_name])
-            })
-            .collect();
-        if matched == self.matched {
-            return;
-        }
-        self.matched = matched;
-        let scrolled = std::mem::take(&mut self.scroll);
-        for x in &mut self.card_x {
-            *x -= scrolled;
-        }
-        if !self.gallery_open && self.a("sheet") < 0.001 {
-            self.snap();
-        }
+    /// A rendered preview: premultiplied BGRA, `w` × `h` pixels.
+    pub fn add_preview(&mut self, key: String, w: u32, h: u32, bgra: Arc<Vec<u8>>) {
+        self.renders.remove(&key);
+        self.pixels.insert(key, (w, h, bgra));
         self.dirty = true;
     }
 
-    /// Settles every sheet transition at its target (used while the sheet is hidden).
-    fn snap(&mut self) {
-        for (i, x) in self.card_targets().into_iter().enumerate() {
-            if let Some(x) = x {
-                self.card_x[i] = x;
-            }
-            self.card_v[i] = if self.matched[i] { 1.0 } else { 0.0 };
-        }
-        self.pill = self.pill_target();
+    // ── sidebar, search and the widgets of the selection ──────────────
+
+    fn entries(&self) -> Vec<Selection> {
+        sheet::entries(&self.packs)
     }
 
-    /// Target x of each matched card in the row (unscrolled); None for the others.
-    fn card_targets(&self) -> Vec<Option<f32>> {
-        let s = self.scale();
-        let pitch = (176.0 * s).round() + (12.0 * s).round();
-        let mut rank = 0.0;
-        self.matched
+    fn entry_index(&self) -> usize {
+        self.entries()
             .iter()
-            .map(|&m| {
-                m.then(|| {
-                    rank += 1.0;
-                    (rank - 1.0) * pitch
-                })
-            })
-            .collect()
+            .position(|e| *e == self.selection)
+            .unwrap_or(0)
     }
 
-    fn tab_label(&self, i: usize) -> String {
-        match i {
-            0 => t("edit.all_packs"),
-            i => self.packs[i - 1].1.clone(),
+    fn entry_label(&self, e: &Selection) -> String {
+        match e {
+            Selection::All => t("edit.all_packs"),
+            Selection::Favourites => t("gallery.favourites"),
+            Selection::Pack(id) => self
+                .packs
+                .iter()
+                .find(|(p, _)| p == id)
+                .map_or_else(|| id.clone(), |(_, name)| name.clone()),
         }
     }
 
-    fn tab_index(&self) -> usize {
-        self.tab
-            .as_ref()
-            .and_then(|t| self.packs.iter().position(|(id, _)| id == t))
-            .map_or(0, |i| i + 1)
+    /// Widgets of a sidebar entry that pass the search.
+    fn entry_count(&self, e: &Selection) -> usize {
+        self.gallery
+            .iter()
+            .filter(|g| e.includes(g) && sheet::matches(g, &self.search.text))
+            .count()
     }
 
-    /// Tab extents in the strip (unscrolled pixels); empty with a single package.
-    fn tab_spans(&self) -> Vec<(i32, i32)> {
-        let Some(o) = self.primary() else {
-            return Vec::new();
-        };
-        if self.packs.len() < 2 {
-            return Vec::new();
+    /// Recomputes the widgets for the selection and the search. When they
+    /// change, the list scrolls back to the top and fades in anew.
+    fn refilter(&mut self) {
+        let groups = sheet::groups(&self.gallery, &self.selection, &self.search.text, self.grid);
+        if groups == self.groups {
+            return;
         }
-        let px = |v: f32| (v * o.geo.scale).round() as i32;
-        let mut x = 0;
-        (0..=self.packs.len())
-            .map(|i| {
-                let label = self.text_width(&self.tab_label(i), &o.text.chip).ceil() as i32;
-                let w = (label + px(28.0)).max(px(56.0));
-                let span = (x, x + w);
-                x += w + px(4.0);
-                span
-            })
-            .collect()
+        self.groups = groups;
+        self.scroll = 0.0;
+        self.scroll_to = 0.0;
+        self.cursor = (0, 0);
+        self.anim.insert("content".into(), 0.0);
+        self.dirty = true;
     }
 
+    fn select(&mut self, i: usize) {
+        if let Some(e) = self.entries().get(i).cloned() {
+            self.selection = e;
+            self.refilter();
+        }
+    }
+
+    /// Settles the sheet's transitions at their targets (while it is hidden).
+    fn snap(&mut self) {
+        self.pill = self.pill_target();
+        self.scroll = self.scroll_to;
+    }
+
+    /// Where the sidebar's accent indicator goes: centred on the selected row.
     fn pill_target(&self) -> (f32, f32) {
-        self.tab_spans()
-            .get(self.tab_index())
-            .map_or((0.0, 0.0), |&(l, r)| (l as f32, r as f32))
-    }
-
-    fn tab_scroll_max(&self, spans: &[(i32, i32)]) -> f32 {
         let l = self.sheet_layout();
-        let total = spans.last().map_or(0, |s| s.1);
-        (total - (l.strip.right - l.strip.left)).max(0) as f32
+        let half = 8.0 * self.scale();
+        l.entries.get(self.entry_index()).map_or((0.0, 0.0), |r| {
+            let mid = (r.top + r.bottom) as f32 / 2.0 - l.sheet.top as f32;
+            (mid - half, mid + half)
+        })
     }
 
-    /// Scrolls the tab strip so the selected tab is in view.
-    fn reveal_tab(&mut self) {
-        let spans = self.tab_spans();
-        let Some(&(l, r)) = spans.get(self.tab_index()) else {
+    /// The grid cursor, when the grid has the keyboard.
+    fn focused(&self) -> Option<(usize, usize)> {
+        if self.focus != Focus::Grid || self.groups.is_empty() {
+            return None;
+        }
+        let g = self.cursor.0.min(self.groups.len() - 1);
+        Some((
+            g,
+            self.cursor.1.min(self.groups[g].variants.len().max(1) - 1),
+        ))
+    }
+
+    /// Adds a size variant at its first free spot ("+", a click, or Enter).
+    fn add_variant(&mut self, g: usize, v: usize) -> Option<Action> {
+        let group = self.groups.get(g)?;
+        let size = *group.variants.get(v)?;
+        let item = &self.gallery[group.item];
+        self.added
+            .insert(sheet::preview_key(item, size), Instant::now());
+        Some(Action::Add {
+            package: item.package.clone(),
+            widget: item.widget.clone(),
+            size,
+            at: None,
+        })
+    }
+
+    fn max_scroll(&self, l: &SheetLayout) -> f32 {
+        (l.content - (l.area.bottom - l.area.top)).max(0) as f32
+    }
+
+    /// Scrolls so the widget under the keyboard cursor is in view.
+    fn reveal(&mut self) {
+        let Some((g, _)) = self.focused() else {
             return;
         };
-        let lay = self.sheet_layout();
-        let width = (lay.strip.right - lay.strip.left) as f32;
-        let margin = 24.0 * self.scale();
-        if (l as f32) < self.tab_scroll + margin {
-            self.tab_scroll = l as f32 - margin;
-        } else if r as f32 > self.tab_scroll + width - margin {
-            self.tab_scroll = r as f32 - width + margin;
+        let l = self.sheet_layout();
+        let Some(b) = l.groups.get(g).map(|g| g.bounds) else {
+            return;
+        };
+        let pad = 16.0 * self.scale();
+        let shift = self.scroll.round();
+        let (top, bottom) = (b.top as f32 + shift, b.bottom as f32 + shift);
+        let (view_top, view_bottom) = (l.area.top as f32, l.area.bottom as f32);
+        if top - self.scroll_to < view_top + pad {
+            self.scroll_to = top - view_top - pad;
+        } else if bottom - self.scroll_to > view_bottom - pad {
+            self.scroll_to = bottom - view_bottom + pad;
         }
-        self.tab_scroll = self.tab_scroll.clamp(0.0, self.tab_scroll_max(&spans));
+        self.scroll_to = self.scroll_to.clamp(0.0, self.max_scroll(&l));
     }
 
-    fn select_tab(&mut self, i: usize) {
-        self.tab = match i {
-            0 => None,
-            i => self.packs.get(i - 1).map(|(id, _)| id.clone()),
+    /// Keys while the sheet is open. Tab switches between the sidebar and the
+    /// grid; in the sidebar, up and down change the selection and the other
+    /// keys edit the search; in the grid, arrows (and Home, End) move between
+    /// the sizes and Enter adds the one under the cursor.
+    fn sheet_key(&mut self, vk: u16, ctrl: bool) -> Vec<Action> {
+        let grid = self.focused().is_some();
+        let movement = match vk {
+            v if v == VK_LEFT.0 => Some(Move::Left),
+            v if v == VK_RIGHT.0 => Some(Move::Right),
+            v if v == VK_UP.0 => Some(Move::Up),
+            v if v == VK_DOWN.0 => Some(Move::Down),
+            v if v == VK_HOME.0 => Some(Move::Home),
+            v if v == VK_END.0 => Some(Move::End),
+            _ => None,
         };
-        self.refilter();
-        self.reveal_tab();
+        match (vk, movement) {
+            (v, _) if v == VK_TAB.0 => {
+                self.keyboard = true;
+                self.focus = match self.focus {
+                    Focus::Side if !self.groups.is_empty() => Focus::Grid,
+                    _ => Focus::Side,
+                };
+                if let Some(c) = self.focused() {
+                    self.cursor = c;
+                }
+                self.reveal();
+            }
+            (v, _) if v == VK_RETURN.0 => {
+                self.keyboard = true;
+                if let Some((g, v)) = self.focused() {
+                    return self.add_variant(g, v).into_iter().collect();
+                }
+                if !self.groups.is_empty() {
+                    self.focus = Focus::Grid;
+                    self.cursor = (0, 0);
+                    self.reveal();
+                }
+            }
+            (_, Some(m)) if grid => {
+                self.keyboard = true;
+                self.cursor = sheet::step(&self.groups, self.cursor, m);
+                self.reveal();
+            }
+            (_, Some(m @ (Move::Up | Move::Down))) => {
+                self.keyboard = true;
+                let last = self.entries().len() - 1;
+                let i = self.entry_index();
+                let next = if m == Move::Up {
+                    i.saturating_sub(1)
+                } else {
+                    (i + 1).min(last)
+                };
+                self.select(next);
+            }
+            _ => {
+                if self.edit_search(vk, ctrl) {
+                    self.focus = Focus::Side;
+                    self.refilter();
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Applies a key to the search field. True when the text changed.
@@ -841,117 +1031,200 @@ impl EditMode {
         (bar, add, done)
     }
 
-    fn sheet_t(&self) -> f32 {
-        ease(*self.anim.get("sheet").unwrap_or(&0.0))
+    /// Sheet opacity: it follows the spring in, and fades while a widget
+    /// dragged out of it is placed.
+    fn sheet_alpha(&self) -> f32 {
+        (self.spring.0 * 1.6).clamp(0.0, 1.0) * (1.0 - self.a("away"))
     }
 
-    /// Gallery sheet and its cards by gallery index (slides up from the bottom
-    /// of the primary monitor).
-    fn sheet(&self) -> (RECT, Vec<RECT>) {
-        let l = self.sheet_layout();
-        (l.sheet, l.cards)
+    /// The sheet answers the pointer while open and not stepped aside.
+    fn sheet_live(&self) -> bool {
+        self.gallery_open && !self.away
     }
 
-    /// The sheet: a header with the title and the search field, the package
-    /// tabs, then the row of cards. Its width depends on the whole gallery, not
-    /// on the search results, so it holds still while filtering.
+    fn sheet(&self) -> RECT {
+        self.sheet_layout().sheet
+    }
+
+    /// The sheet, centred in the space under the toolbar of the primary
+    /// monitor: the sidebar on the left (search field, then the entries with
+    /// a divider before the packs), the selection's title and its widgets on
+    /// the right.
     fn sheet_layout(&self) -> SheetLayout {
         let Some(o) = self.primary() else {
             return Default::default();
         };
         let s = o.geo.scale;
         let px = |v: f32| (v * s).round() as i32;
-        let (card_w, card_h, gap, pad) = (px(176.0), px(150.0), px(12.0), px(16.0));
-        let (field_h, tab_h) = (px(32.0), px(28.0));
-        let spans = self.tab_spans();
-        let n = self.gallery.len().max(1) as i32;
-        let content = n * card_w + (n - 1) * gap + 2 * pad;
-        let title_w = self
-            .text_width(&t("edit.gallery_title"), &o.text.label)
-            .ceil() as i32;
-        let header = 2 * pad + title_w + px(24.0) + px(280.0);
-        let tabs = spans.last().map_or(0, |s| s.1 + 2 * pad);
-        let max_w = (o.rect.right - o.rect.left) - px(48.0);
-        let width = content.max(header).max(tabs).min(max_w);
-        let tabs_row = if spans.is_empty() {
-            0
-        } else {
-            px(10.0) + tab_h
-        };
-        let height = pad + field_h + tabs_row + px(14.0) + card_h + pad;
-        let hidden = height + px(40.0);
-        let slide = ((1.0 - self.sheet_t()) * hidden as f32).round() as i32;
-        let left = (o.rect.left + o.rect.right) / 2 - width / 2;
+        let (bar, _, _) = self.toolbar();
+        let top_limit = bar.bottom + px(44.0);
         let grid_bottom =
             o.geo.origin.1 as i32 + (o.geo.rows as f32 * (o.geo.cell + o.geo.gap) * s) as i32;
-        let bottom = grid_bottom.min(o.rect.bottom - px(24.0)) + slide;
+        let bottom_limit = grid_bottom.min(o.rect.bottom - px(24.0));
+        let width = px(980.0).min(o.rect.right - o.rect.left - px(96.0));
+        let height = px(640.0).min(bottom_limit - top_limit).max(px(320.0));
+        let left = (o.rect.left + o.rect.right) / 2 - width / 2;
+        let top = top_limit + ((bottom_limit - top_limit - height) / 2).max(0);
         let sheet = RECT {
             left,
-            top: bottom - height,
+            top,
             right: left + width,
-            bottom,
+            bottom: top + height,
         };
-        let field_w = px(280.0)
-            .min(width - 2 * pad - title_w - px(16.0))
-            .max(px(120.0));
+        let side = RECT {
+            right: left + px(SIDEBAR_W),
+            ..sheet
+        };
         let field = RECT {
-            left: sheet.right - pad - field_w,
-            top: sheet.top + pad,
-            right: sheet.right - pad,
-            bottom: sheet.top + pad + field_h,
+            left: side.left + px(12.0),
+            top: top + px(14.0),
+            right: side.right - px(12.0),
+            bottom: top + px(46.0),
         };
-        let b = field_h - px(8.0);
+        let b = field.bottom - field.top - px(8.0);
         let clear = RECT {
             left: field.right - px(4.0) - b,
             top: field.top + px(4.0),
             right: field.right - px(4.0),
             bottom: field.top + px(4.0) + b,
         };
-        let strip = RECT {
-            left: sheet.left + pad,
-            top: field.bottom + px(10.0),
-            right: sheet.right - pad,
-            bottom: field.bottom + tabs_row,
-        };
-        let tab_scroll = self.tab_scroll.round() as i32;
-        let tabs = spans
-            .iter()
-            .map(|&(l, r)| RECT {
-                left: strip.left + l - tab_scroll,
-                top: strip.top,
-                right: strip.left + r - tab_scroll,
-                bottom: strip.bottom,
+        let mut y = field.bottom + px(14.0);
+        let entries = (0..self.packs.len() + 2)
+            .map(|i| {
+                if i == 2 {
+                    y += px(13.0);
+                }
+                let r = RECT {
+                    left: side.left + px(8.0),
+                    top: y,
+                    right: side.right - px(8.0),
+                    bottom: y + px(36.0),
+                };
+                y += px(38.0);
+                r
             })
             .collect();
-        let top = field.bottom + tabs_row + px(14.0);
-        let area = RECT {
-            left: sheet.left + pad,
-            top,
-            right: sheet.right - pad,
-            bottom: top + card_h,
+        let title = RECT {
+            left: side.right + px(28.0),
+            top: top + px(14.0),
+            right: sheet.right - px(28.0),
+            bottom: top + px(46.0),
         };
-        let scroll = self.scroll.round() as i32;
-        let cards = self
-            .card_x
+        let area = RECT {
+            left: side.right + px(16.0),
+            top: title.bottom + px(8.0),
+            right: sheet.right - px(16.0),
+            bottom: sheet.bottom - px(1.0),
+        };
+        let (groups, content) = self.group_layout(area, s);
+        SheetLayout {
+            sheet,
+            side,
+            field,
+            clear,
+            entries,
+            title,
+            area,
+            groups,
+            content,
+        }
+    }
+
+    /// The widgets in `area`, scrolled: each one's sizes side by side at their
+    /// true proportions (one scale per widget, so the sizes compare), aligned
+    /// at the bottom with the size underneath, then the name and description.
+    fn group_layout(&self, area: RECT, s: f32) -> (Vec<GroupLayout>, i32) {
+        let px = |v: f32| (v * s).round() as i32;
+        let pad = px(12.0);
+        let left = area.left + pad;
+        let room = (area.right - area.left - 2 * pad) as f32 / s;
+        let start = area.top + pad - self.scroll.round() as i32;
+        let mut y = start;
+        let groups = self
+            .groups
             .iter()
-            .map(|&x| {
-                let x = area.left + x.round() as i32 - scroll;
-                RECT {
-                    left: x,
-                    top: area.top,
-                    right: x + card_w,
-                    bottom: area.bottom,
+            .map(|g| {
+                let dims: Vec<(f32, f32)> = g
+                    .variants
+                    .iter()
+                    .map(|&(w, h)| crate::headless::cells_to_dips(w as u32, h as u32))
+                    .collect();
+                let gap = 20.0;
+                let sum_w: f32 = dims.iter().map(|d| d.0).sum();
+                let max_h = dims.iter().map(|d| d.1).fold(1.0, f32::max);
+                let fit = room - gap * (dims.len() as f32 - 1.0).max(0.0);
+                let k = (TILE_H / max_h)
+                    .min(fit / sum_w.max(1.0))
+                    .min(TILE_MAX_SCALE);
+                let row = px(max_h * k);
+                let mut x = left;
+                let (mut tiles, mut labels) = (Vec::new(), Vec::new());
+                for (w, h) in dims {
+                    let (tw, th) = (px(w * k).max(px(8.0)), px(h * k).max(px(8.0)));
+                    tiles.push(RECT {
+                        left: x,
+                        top: y + row - th,
+                        right: x + tw,
+                        bottom: y + row,
+                    });
+                    labels.push(RECT {
+                        left: x - px(10.0),
+                        top: y + row + px(6.0),
+                        right: x + tw + px(10.0),
+                        bottom: y + row + px(22.0),
+                    });
+                    x += tw + px(gap);
+                }
+                let name = RECT {
+                    left,
+                    top: y + row + px(28.0),
+                    right: area.right - pad,
+                    bottom: y + row + px(48.0),
+                };
+                let desc = RECT {
+                    top: name.bottom,
+                    bottom: name.bottom + px(18.0),
+                    ..name
+                };
+                let bounds = RECT {
+                    left,
+                    top: y,
+                    right: name.right,
+                    bottom: desc.bottom,
+                };
+                y = desc.bottom + px(30.0);
+                GroupLayout {
+                    tiles,
+                    labels,
+                    name,
+                    desc,
+                    bounds,
                 }
             })
             .collect();
-        SheetLayout {
-            sheet,
-            field,
-            clear,
-            strip,
-            tabs,
-            area,
-            cards,
+        let content = if self.groups.is_empty() {
+            0
+        } else {
+            y - px(30.0) - start + 2 * pad
+        };
+        (groups, content)
+    }
+
+    /// The "+" of a tile: a disc on its top-left corner.
+    fn plus_rect(&self, tile: RECT) -> RECT {
+        let s = self.scale();
+        let (c, r) = (
+            POINT {
+                x: tile.left + (4.0 * s).round() as i32,
+                y: tile.top + (4.0 * s).round() as i32,
+            },
+            (13.0 * s).round() as i32,
+        );
+        RECT {
+            left: c.x - r,
+            top: c.y - r,
+            right: c.x + r,
+            bottom: c.y + r,
         }
     }
 
@@ -1036,7 +1309,7 @@ impl EditMode {
         if contains(&bar, pt) {
             return Hot::None;
         }
-        if self.gallery_open {
+        if self.sheet_live() {
             let l = self.sheet_layout();
             if contains(&l.sheet, pt) {
                 if !self.search.is_empty() && contains(&l.clear, pt) {
@@ -1045,21 +1318,22 @@ impl EditMode {
                 if contains(&l.field, pt) {
                     return Hot::Search;
                 }
-                if contains(&l.strip, pt) {
-                    return l
-                        .tabs
-                        .iter()
-                        .position(|r| contains(r, pt))
-                        .map(Hot::Tab)
-                        .unwrap_or(Hot::Sheet);
+                if let Some(i) = l.entries.iter().position(|r| contains(r, pt)) {
+                    return Hot::Side(i);
                 }
-                return l
-                    .cards
-                    .iter()
-                    .enumerate()
-                    .position(|(i, c)| self.matched[i] && contains(c, pt))
-                    .map(Hot::Card)
-                    .unwrap_or(Hot::Sheet);
+                if contains(&l.area, pt) {
+                    for (g, gl) in l.groups.iter().enumerate() {
+                        for (v, tile) in gl.tiles.iter().enumerate() {
+                            if contains(&self.plus_rect(*tile), pt) {
+                                return Hot::Plus(g, v);
+                            }
+                            if contains(tile, pt) {
+                                return Hot::Tile(g, v);
+                            }
+                        }
+                    }
+                }
+                return Hot::Sheet;
             }
         }
         // The floating pill of the hovered widget sits above other frames.
@@ -1105,10 +1379,9 @@ impl EditMode {
         self.dirty = true;
         let mut actions = Vec::new();
         match input {
+            // The first Esc closes the sheet, the next one leaves edit mode.
             Input::Escape => {
-                if self.gallery_open && !self.search.is_empty() {
-                    self.clear_search();
-                } else if self.gallery_open {
+                if self.gallery_open {
                     self.gallery_open = false;
                 } else {
                     actions.push(Action::Close);
@@ -1119,40 +1392,34 @@ impl EditMode {
                 if self.gallery_open && !c.is_control() {
                     self.search.insert(c.encode_utf8(&mut [0; 4]));
                     self.caret_epoch = Instant::now();
+                    self.focus = Focus::Side;
                     self.refilter();
                 }
             }
             Input::Key { vk, ctrl } => {
                 if ctrl && vk == u16::from(b'F') {
                     self.open_gallery();
-                } else if self.gallery_open && self.edit_search(vk, ctrl) {
-                    self.refilter();
+                    self.focus = Focus::Side;
+                } else if self.gallery_open {
+                    actions.extend(self.sheet_key(vk, ctrl));
                 }
             }
             Input::Wheel(delta) => {
                 let l = self.sheet_layout();
-                if self.gallery_open && contains(&l.sheet, self.pointer) {
-                    let s = self.scale();
-                    let step = delta as f32 / 120.0 * 96.0 * s;
-                    if contains(&l.strip, self.pointer) {
-                        let max = self.tab_scroll_max(&self.tab_spans());
-                        self.tab_scroll = (self.tab_scroll - step / 2.0).clamp(0.0, max);
-                    } else {
-                        let n = self.matched.iter().filter(|&&m| m).count() as i32;
-                        let (card_w, gap) = ((176.0 * s).round() as i32, (12.0 * s).round() as i32);
-                        let content = (n * (card_w + gap) - gap).max(0);
-                        let max = (content - (l.area.right - l.area.left)).max(0) as f32;
-                        self.scroll = (self.scroll - step).clamp(0.0, max);
-                    }
+                if self.sheet_live() && contains(&l.area, self.pointer) {
+                    let step = delta as f32 / 120.0 * 96.0 * self.scale();
+                    self.scroll_to = (self.scroll_to - step).clamp(0.0, self.max_scroll(&l));
                 }
             }
             Input::Down(pt) => {
                 self.pointer = pt;
                 let hot = self.hit(items, pt);
                 self.pressed = hot.clone();
+                self.keyboard = false;
                 if hot == Hot::Search {
                     self.search.caret = self.caret_at(pt.x);
                     self.caret_epoch = Instant::now();
+                    self.focus = Focus::Side;
                 }
                 let found = |id: &str| {
                     items
@@ -1187,10 +1454,17 @@ impl EditMode {
                         valid: true,
                         moved: false,
                     }),
-                    Hot::Card(i) => {
-                        let r = self.sheet().1[*i];
+                    &Hot::Tile(g, v) | &Hot::Plus(g, v) => {
+                        self.focus = Focus::Grid;
+                        self.cursor = (g, v);
+                        let l = self.sheet_layout();
+                        let r = l.groups[g].tiles[v];
                         Some(Drag {
-                            kind: DragKind::New { card: *i },
+                            kind: DragKind::New {
+                                item: self.groups[g].item,
+                                size: self.groups[g].variants[v],
+                                at: (g, v),
+                            },
                             start: pt,
                             from: r,
                             cur: r,
@@ -1218,9 +1492,10 @@ impl EditMode {
                         | Hot::Done
                         | Hot::Remove(_)
                         | Hot::Settings(_)
-                        | Hot::Card(_)
+                        | Hot::Tile(..)
+                        | Hot::Plus(..)
                         | Hot::Clear
-                        | Hot::Tab(_) => IDC_HAND,
+                        | Hot::Side(_) => IDC_HAND,
                         _ => IDC_ARROW,
                     };
                     unsafe {
@@ -1238,14 +1513,9 @@ impl EditMode {
                         self.hot = self.hit(items, pt);
                         return actions;
                     }
-                    if let DragKind::New { card } = drag.kind {
-                        // A click on a card: first free place.
-                        let g = &self.gallery[card];
-                        actions.push(Action::Add {
-                            package: g.package.clone(),
-                            widget: g.widget.clone(),
-                            at: None,
-                        });
+                    if let DragKind::New { at: (g, v), .. } = drag.kind {
+                        // A click on a size (or its "+"): the first free place.
+                        actions.extend(self.add_variant(g, v));
                         return actions;
                     }
                 }
@@ -1255,7 +1525,10 @@ impl EditMode {
                         Hot::Add if self.gallery_open => self.gallery_open = false,
                         Hot::Add => self.open_gallery(),
                         Hot::Clear => self.clear_search(),
-                        Hot::Tab(i) => self.select_tab(i),
+                        Hot::Side(i) => {
+                            self.focus = Focus::Side;
+                            self.select(i);
+                        }
                         Hot::Remove(id) => actions.push(Action::Remove { id }),
                         Hot::Settings(id) => actions.push(Action::Settings { id }),
                         _ => {}
@@ -1336,15 +1609,22 @@ impl EditMode {
                     rect: drag.cur,
                 })
             }
-            DragKind::New { card } => {
-                let item = &self.gallery[*card];
-                let (sheet, _) = self.sheet();
-                let over_sheet = self.gallery_open && contains(&sheet, pt);
-                match self.monitor_at(pt).filter(|_| !over_sheet) {
+            DragKind::New { size, .. } => {
+                // Inside the sheet the tile just follows the pointer; once it
+                // leaves, the sheet steps aside and the widget snaps to the grid.
+                let sheet = self.sheet();
+                if self.gallery_open && !contains(&sheet, pt) {
+                    self.away = true;
+                }
+                let size = *size;
+                match self
+                    .monitor_at(pt)
+                    .filter(|_| self.away || !self.gallery_open)
+                {
                     Some((monitor, g)) => {
-                        // The ghost is the widget at its default size, centred on the pointer.
-                        let size = g.rect(0, 0, item.size.0, item.size.1);
-                        let (w, h) = (size.right - size.left, size.bottom - size.top);
+                        // The ghost is the widget at the chosen size, centred on the pointer.
+                        let r = g.rect(0, 0, size.0, size.1);
+                        let (w, h) = (r.right - r.left, r.bottom - r.top);
                         drag.cur = RECT {
                             left: pt.x - w / 2,
                             top: pt.y - h / 2,
@@ -1352,7 +1632,7 @@ impl EditMode {
                             bottom: pt.y + h / 2,
                         };
                         let (x, y) = g.snap(drag.cur.left as f32, drag.cur.top as f32);
-                        let target = g.clamp(x, y, item.size.0, item.size.1);
+                        let target = g.clamp(x, y, size.0, size.1);
                         drag.valid = !Self::collides(items, &monitor, target, None);
                         drag.target = Some((monitor, target));
                     }
@@ -1380,17 +1660,23 @@ impl EditMode {
                 }],
                 _ => vec![Action::Cancel { id, from: drag.cur }],
             },
-            DragKind::New { card } => match drag.target {
+            DragKind::New { item, size, .. } => match drag.target {
+                // Dropped in place: the sheet closes (it stays out of the way
+                // while it does). Anywhere else it comes back.
                 Some((monitor, cells)) if drag.valid => {
-                    let g = &self.gallery[card];
+                    let g = &self.gallery[item];
                     self.gallery_open = false;
                     vec![Action::Add {
                         package: g.package.clone(),
                         widget: g.widget.clone(),
+                        size,
                         at: Some((monitor, cells)),
                     }]
                 }
-                _ => Vec::new(),
+                _ => {
+                    self.away = false;
+                    Vec::new()
+                }
             },
         }
     }
@@ -1403,20 +1689,15 @@ impl EditMode {
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
         let dragging = self.drag.as_ref().is_some_and(|d| d.moved);
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
         let mut wanted: HashMap<String, f32> = HashMap::new();
         for k in self.anim.keys() {
             wanted.insert(k.clone(), 0.0);
         }
-        wanted.insert("sheet".into(), if self.gallery_open { 1.0 } else { 0.0 });
-        wanted.insert("drag".into(), if dragging { 1.0 } else { 0.0 });
-        wanted.insert(
-            "hot:add".into(),
-            if self.hot == Hot::Add { 1.0 } else { 0.0 },
-        );
-        wanted.insert(
-            "hot:done".into(),
-            if self.hot == Hot::Done { 1.0 } else { 0.0 },
-        );
+        wanted.insert("drag".into(), flag(dragging));
+        wanted.insert("away".into(), flag(self.away));
+        wanted.insert("hot:add".into(), flag(self.hot == Hot::Add));
+        wanted.insert("hot:done".into(), flag(self.hot == Hot::Done));
         match &self.hot {
             Hot::Frame(id) | Hot::Handle(id) if !dragging => {
                 wanted.insert(format!("frame:{id}"), 1.0);
@@ -1429,29 +1710,44 @@ impl EditMode {
                 wanted.insert(format!("frame:{id}"), 1.0);
                 wanted.insert(format!("btn:settings:{id}"), 1.0);
             }
-            Hot::Card(i) => {
-                wanted.insert(format!("card:{i}"), 1.0);
+            Hot::Tile(g, v) if !dragging => {
+                wanted.insert(format!("tile:{g}:{v}"), 1.0);
             }
-            Hot::Tab(i) => {
-                wanted.insert(format!("tab:{i}"), 1.0);
+            Hot::Plus(g, v) if !dragging => {
+                wanted.insert(format!("tile:{g}:{v}"), 1.0);
+                wanted.insert(format!("plus:{g}:{v}"), 1.0);
+            }
+            Hot::Side(i) => {
+                wanted.insert(format!("side:{i}"), 1.0);
             }
             _ => {}
         }
-        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        if self.keyboard
+            && let Some((g, v)) = self.focused()
+        {
+            wanted.insert(format!("ring:{g}:{v}"), 1.0);
+        }
         let open = self.gallery_open;
-        wanted.insert("focus".into(), flag(open));
+        wanted.insert("focus".into(), flag(open && self.focus == Focus::Side));
         wanted.insert("clear".into(), flag(!self.search.is_empty()));
         wanted.insert("hot:search".into(), flag(self.hot == Hot::Search));
         wanted.insert("hot:clear".into(), flag(self.hot == Hot::Clear));
-        wanted.insert("empty".into(), flag(open && !self.matched.contains(&true)));
+        wanted.insert("empty".into(), flag(open && self.groups.is_empty()));
+        wanted.insert("content".into(), 1.0);
         let mut moving = false;
         let rate = 1.0 - (-dt * 16.0).exp();
         for (k, target) in wanted {
             let v = self.anim.entry(k.clone()).or_insert(0.0);
-            let next = *v + (target - *v) * rate;
+            // The content fades in a little slower than hovers.
+            let r = if k == "content" {
+                1.0 - (-dt * 11.0).exp()
+            } else {
+                rate
+            };
+            let next = *v + (target - *v) * r;
             if (next - target).abs() < 0.004 {
                 *v = target;
-                let transient = ["frame:", "card:", "btn:", "tab:"]
+                let transient = ["frame:", "btn:", "tile:", "plus:", "side:", "ring:"]
                     .iter()
                     .any(|p| k.starts_with(p));
                 if target == 0.0 && transient {
@@ -1462,16 +1758,34 @@ impl EditMode {
                 moving = true;
             }
         }
-        moving |= self.step_sheet(dt, rate);
+        self.added
+            .retain(|_, at| at.elapsed().as_secs_f32() < ADDED_SECS);
+        moving |= !self.added.is_empty();
+        moving |= self.step_sheet(dt);
         moving
     }
 
-    /// Card reflow and the tab pill. Positions are in pixels, so they settle
-    /// within half a pixel rather than the 0..1 threshold.
-    fn step_sheet(&mut self, dt: f32, rate: f32) -> bool {
-        if !self.gallery_open && self.a("sheet") < 0.001 {
+    /// The open/close spring, the sidebar indicator and the scroll.
+    fn step_sheet(&mut self, dt: f32) -> bool {
+        // An underdamped spring: the sheet pops open with a slight overshoot.
+        let target = if self.gallery_open { 1.0 } else { 0.0 };
+        let (stiffness, damping) = (420.0, 2.0 * 420.0f32.sqrt() * 0.72);
+        let mut moving = false;
+        if (self.spring.0 - target).abs() > 0.0005 || self.spring.1.abs() > 0.005 {
+            let n = (dt / (1.0 / 240.0)).ceil().max(1.0) as usize;
+            let h = dt / n as f32;
+            for _ in 0..n {
+                let a = stiffness * (target - self.spring.0) - damping * self.spring.1;
+                self.spring.1 += a * h;
+                self.spring.0 += self.spring.1 * h;
+            }
+            moving = true;
+        } else {
+            self.spring = (target, 0.0);
+        }
+        if !self.gallery_open && self.spring.0 <= 0.0005 {
             self.snap();
-            return false;
+            return moving;
         }
         let approach = |v: &mut f32, target: f32, rate: f32, eps: f32| {
             let next = *v + (target - *v) * rate;
@@ -1483,26 +1797,15 @@ impl EditMode {
                 true
             }
         };
-        let mut moving = false;
-        for (i, x) in self.card_targets().into_iter().enumerate() {
-            if let Some(x) = x {
-                // A card coming back appears in its new place; the others glide there.
-                if self.card_v[i] < 0.02 {
-                    self.card_x[i] = x;
-                } else {
-                    moving |= approach(&mut self.card_x[i], x, rate, 0.5);
-                }
-            }
-            let v = if self.matched[i] { 1.0 } else { 0.0 };
-            moving |= approach(&mut self.card_v[i], v, rate, 0.004);
-        }
-        // The pill stretches towards the new tab: its leading edge runs ahead.
-        let (tl, tr) = self.pill_target();
+        // The indicator stretches towards the new row: its leading edge runs ahead.
+        let (tt, tb) = self.pill_target();
         let (fast, slow) = (1.0 - (-dt * 24.0).exp(), 1.0 - (-dt * 11.0).exp());
-        let right = tr > self.pill.1;
-        let (lr, rr) = if right { (slow, fast) } else { (fast, slow) };
-        moving |= approach(&mut self.pill.0, tl, lr, 0.5);
-        moving |= approach(&mut self.pill.1, tr, rr, 0.5);
+        let down = tb > self.pill.1;
+        let (rt, rb) = if down { (slow, fast) } else { (fast, slow) };
+        moving |= approach(&mut self.pill.0, tt, rt, 0.5);
+        moving |= approach(&mut self.pill.1, tb, rb, 0.5);
+        let to = self.scroll_to;
+        moving |= approach(&mut self.scroll, to, 1.0 - (-dt * 18.0).exp(), 0.5);
         moving
     }
 
@@ -1510,7 +1813,15 @@ impl EditMode {
         *self.anim.get(key).unwrap_or(&0.0)
     }
 
-    /// The decoded preview of gallery card `i`. Cached per (package, widget):
+    /// How fresh the check mark of a just-added variant is: 1 right after, 0 when gone.
+    fn added_t(&self, key: &str) -> f32 {
+        self.added
+            .get(key)
+            .map_or(0.0, |at| 1.0 - at.elapsed().as_secs_f32() / ADDED_SECS)
+            .max(0.0)
+    }
+
+    /// The decoded preview of gallery item `i`. Cached per (package, widget):
     /// packs reuse paths like `src/weather/preview.png`, and keying by that path
     /// alone showed one pack's preview on every pack's card.
     fn preview_image(&mut self, i: usize) -> Option<IWICBitmap> {
@@ -1534,11 +1845,54 @@ impl EditMode {
         bmp
     }
 
+    /// Turns rendered previews that arrived into bitmaps.
+    fn upload_renders(&mut self, dc: &ID2D1DeviceContext) {
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
+                format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode:
+                    windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        for (key, (w, h, bgra)) in &self.pixels {
+            if self.renders.contains_key(key) {
+                continue;
+            }
+            let bmp = unsafe {
+                dc.CreateBitmap(
+                    windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U {
+                        width: *w,
+                        height: *h,
+                    },
+                    Some(bgra.as_ptr() as *const _),
+                    w * 4,
+                    &props,
+                )
+            }
+            .ok()
+            .and_then(|b| b.cast().ok());
+            self.renders.insert(key.clone(), bmp);
+        }
+    }
+
+    /// The best preview of a variant: its rendering, else the manifest's picture.
+    fn variant_bitmap(&self, item: usize, size: (i32, i32)) -> (Option<&ID2D1Bitmap>, bool) {
+        let key = sheet::preview_key(&self.gallery[item], size);
+        match self.renders.get(&key).and_then(Option::as_ref) {
+            Some(b) => (Some(b), true),
+            None => (self.previews.get(&item).and_then(Option::as_ref), false),
+        }
+    }
+
     /// Repaints when needed. Returns how soon the loop should call again.
     pub fn paint(&mut self, gpu: &Gpu, dc: &ID2D1DeviceContext, items: &[Item]) -> u32 {
         let moving = self.step();
         // The caret blinks while the search field has focus (the sheet is open).
-        let blink = (self.gallery_open && !self.closing).then(|| {
+        let blink = (self.gallery_open && !self.closing && self.focus == Focus::Side).then(|| {
             let ms = self.caret_epoch.elapsed().as_millis();
             let on = (ms / BLINK_MS as u128).is_multiple_of(2);
             if on != self.caret_on {
@@ -1552,9 +1906,10 @@ impl EditMode {
             return idle;
         }
         self.dirty = false;
-        let previews: Vec<Option<ID2D1Bitmap>> = (0..self.gallery.len())
-            .map(|i| self.preview_bitmap(dc, i))
-            .collect();
+        for i in 0..self.gallery.len() {
+            self.preview_bitmap(dc, i);
+        }
+        self.upload_renders(dc);
         let mut visuals = std::mem::take(&mut self.visuals);
         for (i, visual) in visuals.iter_mut().enumerate() {
             let rect = self.overlays[i].rect;
@@ -1566,7 +1921,6 @@ impl EditMode {
                 edit: self,
                 index: i,
                 items,
-                previews: &previews,
             };
             let result = visual.draw(gpu, dc, w, h, |dc, origin| {
                 let [_, _, _, _, ox, oy] = origin.0;
@@ -1590,7 +1944,6 @@ struct Painter<'a> {
     edit: &'a EditMode,
     index: usize,
     items: &'a [Item],
-    previews: &'a [Option<ID2D1Bitmap>],
 }
 
 impl Painter<'_> {
@@ -1839,32 +2192,62 @@ impl Painter<'_> {
                 draw_text(hint, &o.text.caption, shadow_r, color(0x000000, 0.5));
                 draw_text(hint, &o.text.caption, hr, color(0xFFFFFF, 0.9));
 
-                // Gallery sheet.
-                let alpha = e.sheet_t();
+                // The "Add widget" sheet.
+                let alpha = e.sheet_alpha();
                 if alpha > 0.001 {
                     let l = e.sheet_layout();
+                    // The desktop dims a little more behind it; the grid still shows.
+                    brush.SetColor(&color(0x000000, 0.22 * alpha));
+                    dc.FillRectangle(&full, &brush);
                     let sr = rf(l.sheet);
-                    shadow(sr, 16.0, 0.14 * alpha);
-                    fill(rr(sr, 16.0), color(0x202020, 0.96 * alpha));
-                    stroke(rr(sr, 16.0), color(0xFFFFFF, 0.10 * alpha), 1.0);
-                    let fr = rf(l.field);
-                    let title = D2D_RECT_F {
-                        left: sr.left + 18.0 * s,
-                        right: fr.left - 12.0 * s,
-                        ..fr
-                    };
-                    draw_text(
-                        &t("edit.gallery_title"),
-                        &o.text.label,
-                        title,
-                        color(0xFFFFFF, 0.7 * alpha),
+                    // Spring scale around the centre (it shrinks a little when it steps aside).
+                    let k = (0.92 + 0.08 * e.spring.0) * (1.0 - 0.03 * e.a("away"));
+                    let base = Matrix3x2::scale_around(
+                        k,
+                        k,
+                        Vector2 {
+                            X: (sr.left + sr.right) / 2.0,
+                            Y: (sr.top + sr.bottom) / 2.0,
+                        },
                     );
+                    dc.SetTransform(&base);
+                    // A soft, wide shadow, heavier below.
+                    for i in 1..=10 {
+                        let g = i as f32 * 3.2 * s;
+                        let r = D2D_RECT_F {
+                            left: sr.left - g,
+                            top: sr.top - g * 0.6,
+                            right: sr.right + g,
+                            bottom: sr.bottom + g * 1.4,
+                        };
+                        fill(
+                            rr(r, 12.0 + i as f32 * 3.2),
+                            color(0x000000, 0.045 * alpha * (1.0 - i as f32 / 11.0)),
+                        );
+                    }
+                    fill(rr(sr, 12.0), color(0x2B2B2B, 0.98 * alpha));
+                    // Sidebar pane: a shade darker, behind the same rounded corners.
+                    let side = rf(l.side);
+                    dc.PushAxisAlignedClip(&side, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    fill(rr(sr, 12.0), color(0x202020, 0.98 * alpha));
+                    dc.PopAxisAlignedClip();
+                    brush.SetColor(&color(0xFFFFFF, 0.06 * alpha));
+                    dc.FillRectangle(
+                        &D2D_RECT_F {
+                            left: side.right - s.round().max(1.0),
+                            right: side.right,
+                            ..side
+                        },
+                        &brush,
+                    );
+                    stroke(rr(sr, 12.0), color(0xFFFFFF, 0.10 * alpha), 1.0);
 
                     // Search field (Fluent text box: subtle fill, accent underline on focus).
+                    let fr = rf(l.field);
                     let focus = e.a("focus");
                     let hover = e.a("hot:search").max(e.a("hot:clear"));
                     let rest = color(0xFFFFFF, 0.06 + 0.025 * hover);
-                    let fill_c = mix(rest, color(0x1E1E1E, 0.70), focus);
+                    let fill_c = mix(rest, color(0x1A1A1A, 0.85), focus);
                     fill(
                         rr(fr, 4.0),
                         D2D1_COLOR_F {
@@ -1969,93 +2352,343 @@ impl Painter<'_> {
                         );
                     }
 
-                    // Package tabs: an accent pill slides (and stretches) between them.
-                    if !l.tabs.is_empty() {
-                        let st = rf(l.strip);
-                        dc.PushAxisAlignedClip(&st, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                        let x0 = st.left - e.tab_scroll.round();
-                        let pill = D2D_RECT_F {
-                            left: x0 + e.pill.0,
-                            right: x0 + e.pill.1,
-                            ..st
+                    // Sidebar entries: hover and selection fills, then the
+                    // accent indicator that slides (and stretches) between rows.
+                    let entries = e.entries();
+                    let selected = e.entry_index();
+                    for (i, r) in l.entries.iter().enumerate() {
+                        let h = e.a(&format!("side:{i}"));
+                        let a = if i == selected {
+                            0.075 + 0.02 * h
+                        } else {
+                            0.045 * h
                         };
-                        let radius = (st.bottom - st.top) / 2.0 / s;
-                        for (i, tab) in l.tabs.iter().enumerate() {
-                            let h = e.a(&format!("tab:{i}"));
-                            if h > 0.01 {
-                                fill(rr(rf(*tab), radius), color(0xFFFFFF, 0.07 * h * alpha));
-                            }
+                        if a > 0.001 {
+                            fill(rr(rf(*r), 5.0), color(0xFFFFFF, a * alpha));
                         }
-                        if pill.right - pill.left > 1.0 {
-                            fill(rr(pill, radius), color(ACCENT, alpha));
-                        }
-                        for (i, tab) in l.tabs.iter().enumerate() {
-                            let r = rf(*tab);
-                            // Text turns dark as the pill covers the tab.
-                            let covered = (pill.right.min(r.right) - pill.left.max(r.left))
-                                .max(0.0)
-                                / (r.right - r.left).max(1.0);
-                            let h = e.a(&format!("tab:{i}"));
-                            let c = mix(
-                                color(0xFFFFFF, (0.75 + 0.2 * h) * alpha),
-                                color(0x000000, 0.9 * alpha),
-                                covered.clamp(0.0, 1.0),
-                            );
-                            draw_text(&e.tab_label(i), &o.text.chip, r, c);
-                        }
-                        // Overflowing strips fade out at the scrolled edges.
-                        let max = e.tab_scroll_max(&e.tab_spans());
-                        for (edge, show) in [
-                            (st.left, e.tab_scroll > 0.5),
-                            (st.right, e.tab_scroll < max - 0.5),
-                        ] {
-                            if !show {
-                                continue;
-                            }
-                            for k in 0..8 {
-                                let w = 3.0 * s;
-                                let x = if edge == st.left {
-                                    edge + k as f32 * w
-                                } else {
-                                    edge - (k + 1) as f32 * w
-                                };
-                                brush.SetColor(&color(
-                                    0x202020,
-                                    0.96 * alpha * (1.0 - k as f32 / 8.0),
-                                ));
-                                dc.FillRectangle(
-                                    &D2D_RECT_F {
+                    }
+                    if let Some(first) = l.entries.first() {
+                        let x = rf(*first).left;
+                        let (top, bottom) = (sr.top + e.pill.0, sr.top + e.pill.1);
+                        if bottom - top > 1.0 {
+                            fill(
+                                rr(
+                                    D2D_RECT_F {
                                         left: x,
-                                        right: x + w,
-                                        ..st
+                                        top,
+                                        right: x + 3.0 * s,
+                                        bottom,
                                     },
-                                    &brush,
+                                    1.5,
+                                ),
+                                color(ACCENT, alpha),
+                            );
+                        }
+                    }
+                    if let Some(r) = l.entries.get(2) {
+                        let y = rf(*r).top - 7.0 * s;
+                        brush.SetColor(&color(0xFFFFFF, 0.08 * alpha));
+                        dc.FillRectangle(
+                            &D2D_RECT_F {
+                                left: side.left + 16.0 * s,
+                                top: y,
+                                right: side.right - 16.0 * s,
+                                bottom: y + s.round().max(1.0),
+                            },
+                            &brush,
+                        );
+                    }
+                    for (i, (entry, r)) in entries.iter().zip(&l.entries).enumerate() {
+                        let r = rf(*r);
+                        let count = e.entry_count(entry);
+                        let dim = if count == 0 { 0.45 } else { 1.0 };
+                        let icon = D2D_RECT_F {
+                            left: r.left + 10.0 * s,
+                            right: r.left + 32.0 * s,
+                            ..r
+                        };
+                        let c = Vector2 {
+                            X: (icon.left + icon.right) / 2.0,
+                            Y: (icon.top + icon.bottom) / 2.0,
+                        };
+                        match entry {
+                            Selection::All => draw_text(
+                                "\u{E71D}",
+                                &o.text.icon,
+                                icon,
+                                color(0xFFFFFF, 0.85 * alpha * dim),
+                            ),
+                            Selection::Favourites => draw_text(
+                                "\u{E735}",
+                                &o.text.icon,
+                                icon,
+                                color(0xFFC83D, alpha * dim),
+                            ),
+                            Selection::Pack(id) => {
+                                circle(
+                                    c,
+                                    10.0 * s,
+                                    color(vitrine_widgets::gallery::tint(id), alpha * dim),
+                                );
+                                let initial: String = e
+                                    .entry_label(entry)
+                                    .chars()
+                                    .find(|c| c.is_alphanumeric())
+                                    .map(|c| c.to_uppercase().collect())
+                                    .unwrap_or_default();
+                                draw_text(
+                                    &initial,
+                                    &o.text.chip,
+                                    icon,
+                                    color(0xFFFFFF, alpha * dim),
                                 );
                             }
                         }
-                        dc.PopAxisAlignedClip();
+                        let n = count.to_string();
+                        let badge_w = e.text_width(&n, &o.text.chip).ceil() + 14.0 * s;
+                        let badge = D2D_RECT_F {
+                            left: r.right - 8.0 * s - badge_w,
+                            top: (r.top + r.bottom) / 2.0 - 10.0 * s,
+                            right: r.right - 8.0 * s,
+                            bottom: (r.top + r.bottom) / 2.0 + 10.0 * s,
+                        };
+                        fill(rr(badge, 10.0), color(0xFFFFFF, 0.07 * alpha * dim));
+                        draw_text(&n, &o.text.chip, badge, color(0xFFFFFF, 0.7 * alpha * dim));
+                        let strong = if i == selected { 1.0 } else { 0.86 };
+                        draw_text(
+                            &e.entry_label(entry),
+                            &o.text.side,
+                            D2D_RECT_F {
+                                left: r.left + 42.0 * s,
+                                right: badge.left - 6.0 * s,
+                                ..r
+                            },
+                            color(0xFFFFFF, strong * alpha * dim),
+                        );
                     }
 
-                    // Nothing matches: say so, in the middle of the card row.
+                    // The selection's title and how many widgets it shows.
+                    let title_r = rf(l.title);
+                    let title = e.entry_label(&e.selection);
+                    draw_text(
+                        &title,
+                        &o.text.title,
+                        title_r,
+                        color(0xFFFFFF, 0.96 * alpha),
+                    );
+                    let tw = e.text_width(&title, &o.text.title);
+                    draw_text(
+                        &crate::i18n::tn("row.widgets", e.groups.len() as u64),
+                        &o.text.desc,
+                        D2D_RECT_F {
+                            left: title_r.left + tw + 12.0 * s,
+                            top: title_r.top + 3.0 * s,
+                            ..title_r
+                        },
+                        color(0xFFFFFF, 0.55 * alpha),
+                    );
+
+                    // The widgets: each size on the neutral tile, at its true
+                    // proportions. Hover lifts a tile and pops its "+".
+                    let area = rf(l.area);
+                    dc.PushAxisAlignedClip(&area, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    let content = ease(e.a("content"));
+                    let rise = (1.0 - content) * 10.0 * s;
+                    let lift = |r: RECT| {
+                        let f = rf(r);
+                        D2D_RECT_F {
+                            top: f.top + rise,
+                            bottom: f.bottom + rise,
+                            ..f
+                        }
+                    };
+                    let dragged = drag.and_then(|d| match d.kind {
+                        DragKind::New { at, .. } => Some(at),
+                        _ => None,
+                    });
+                    let ga = alpha * content;
+                    let show_pack = !matches!(e.selection, Selection::Pack(_));
+                    for (gi, (g, gl)) in e.groups.iter().zip(&l.groups).enumerate() {
+                        if gl.bounds.bottom < l.area.top - 40 || gl.bounds.top > l.area.bottom + 40
+                        {
+                            continue;
+                        }
+                        let item = &e.gallery[g.item];
+                        for (vi, (&size, (tile, label))) in g
+                            .variants
+                            .iter()
+                            .zip(gl.tiles.iter().zip(&gl.labels))
+                            .enumerate()
+                        {
+                            let hover = e.a(&format!("tile:{gi}:{vi}"));
+                            let ring = e.a(&format!("ring:{gi}:{vi}"));
+                            let faded = if dragged == Some((gi, vi)) { 0.4 } else { 1.0 };
+                            let tr = lift(*tile);
+                            let k = 1.0 + 0.03 * hover;
+                            dc.SetTransform(
+                                &(Matrix3x2::scale_around(
+                                    k,
+                                    k,
+                                    Vector2 {
+                                        X: (tr.left + tr.right) / 2.0,
+                                        Y: (tr.top + tr.bottom) / 2.0,
+                                    },
+                                ) * base),
+                            );
+                            if hover > 0.01 {
+                                shadow(tr, 8.0, 0.10 * hover * ga);
+                            }
+                            fill(rr(tr, 8.0), color(0x1F1F1F, ga * faded));
+                            let (bmp, rendered) = e.variant_bitmap(g.item, size);
+                            if let Some(bmp) = bmp {
+                                if rendered {
+                                    dc.DrawBitmap(
+                                        bmp,
+                                        Some(&tr),
+                                        ga * faded,
+                                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                                        None,
+                                        None,
+                                    );
+                                } else {
+                                    let inset = 6.0 * s;
+                                    let inner = D2D_RECT_F {
+                                        left: tr.left + inset,
+                                        top: tr.top + inset,
+                                        right: tr.right - inset,
+                                        bottom: tr.bottom - inset,
+                                    };
+                                    draw_contained(dc, bmp, inner, 0.85 * ga * faded);
+                                }
+                            }
+                            stroke(
+                                rr(tr, 8.0),
+                                mix(color(0xFFFFFF, 0.07 * ga), color(ACCENT, 0.95 * ga), hover),
+                                1.0 + 0.5 * hover,
+                            );
+                            // Keyboard focus: the Fluent double ring.
+                            if ring > 0.01 {
+                                let grow = |r: D2D_RECT_F, d: f32| D2D_RECT_F {
+                                    left: r.left - d,
+                                    top: r.top - d,
+                                    right: r.right + d,
+                                    bottom: r.bottom + d,
+                                };
+                                stroke(
+                                    rr(grow(tr, 3.0 * s), 11.0),
+                                    color(0xFFFFFF, ring * ga),
+                                    2.0,
+                                );
+                                stroke(
+                                    rr(grow(tr, 1.5 * s), 9.5),
+                                    color(0x000000, 0.7 * ring * ga),
+                                    1.0,
+                                );
+                            }
+                            // "+" pops in on hover (with a little overshoot);
+                            // after adding it shows a check mark for a moment.
+                            let key = sheet::preview_key(item, size);
+                            let done = e.added_t(&key);
+                            let show = hover.max(ring).max(if done > 0.0 { 1.0 } else { 0.0 });
+                            if show > 0.01 {
+                                let p = rf(e.plus_rect(*tile));
+                                let c = Vector2 {
+                                    X: (p.left + p.right) / 2.0,
+                                    Y: (p.top + p.bottom) / 2.0 + rise,
+                                };
+                                let t = show.clamp(0.0, 1.0);
+                                let back = 1.0 + 2.7 * (t - 1.0).powi(3) + 1.7 * (t - 1.0).powi(2);
+                                let radius = 13.0 * s * back.max(0.0);
+                                let ph = e.a(&format!("plus:{gi}:{vi}"));
+                                circle(c, radius + 2.0 * s, color(0x2B2B2B, ga * t));
+                                circle(
+                                    c,
+                                    radius,
+                                    D2D1_COLOR_F {
+                                        a: ga * t,
+                                        ..mix(color(ACCENT, 1.0), color(0xB8E6FF, 1.0), ph * 0.6)
+                                    },
+                                );
+                                let glyph = if done > 0.0 { "\u{E73E}" } else { "\u{E710}" };
+                                draw_text(
+                                    glyph,
+                                    &o.text.icon,
+                                    D2D_RECT_F {
+                                        left: c.X - radius,
+                                        top: c.Y - radius,
+                                        right: c.X + radius,
+                                        bottom: c.Y + radius,
+                                    },
+                                    color(0x000000, 0.9 * ga * t),
+                                );
+                            }
+                            dc.SetTransform(&base);
+                            draw_text(
+                                &format!("{} × {}", size.0, size.1),
+                                &o.text.tiny,
+                                lift(*label),
+                                color(0xFFFFFF, (0.5 + 0.4 * hover.max(ring)) * ga),
+                            );
+                        }
+                        draw_text(
+                            &item.name,
+                            &o.text.name,
+                            lift(gl.name),
+                            color(0xFFFFFF, 0.95 * ga),
+                        );
+                        let desc = match (show_pack, item.description.is_empty()) {
+                            (true, false) => format!("{} · {}", item.pack_name, item.description),
+                            (true, true) => item.pack_name.clone(),
+                            (false, _) => item.description.clone(),
+                        };
+                        draw_text(
+                            &desc,
+                            &o.text.desc,
+                            lift(gl.desc),
+                            color(0xFFFFFF, 0.6 * ga),
+                        );
+                    }
+                    // Scrolled content fades under the title row.
+                    if e.scroll > 0.5 {
+                        for i in 0..8 {
+                            let h = 2.0 * s;
+                            let y = area.top + i as f32 * h;
+                            brush.SetColor(&color(0x2B2B2B, 0.98 * alpha * (1.0 - i as f32 / 8.0)));
+                            dc.FillRectangle(
+                                &D2D_RECT_F {
+                                    top: y,
+                                    bottom: y + h,
+                                    ..area
+                                },
+                                &brush,
+                            );
+                        }
+                    }
+                    dc.PopAxisAlignedClip();
+
+                    // Nothing to show: say why, in the middle of the area.
                     let empty = e.a("empty");
                     if empty > 0.01 {
-                        let ar = rf(l.area);
                         let rise = (1.0 - empty) * 6.0 * s;
-                        let mid = (ar.top + ar.bottom) / 2.0 + rise;
+                        let mid = (area.top + area.bottom) / 2.0 - 20.0 * s + rise;
                         draw_text(
                             "\u{E721}",
                             &o.text.icon_large,
                             D2D_RECT_F {
                                 top: mid - 44.0 * s,
                                 bottom: mid - 4.0 * s,
-                                ..ar
+                                ..area
                             },
                             color(0xFFFFFF, 0.35 * empty * alpha),
                         );
                         let text = if e.gallery.is_empty() {
                             t("edit.no_widgets")
-                        } else {
+                        } else if !e.search.text.trim().is_empty() {
                             crate::i18n::tf("edit.no_results", &[("query", e.search.text.trim())])
+                        } else if e.selection == Selection::Favourites {
+                            t("edit.no_favourites")
+                        } else {
+                            t("edit.no_widgets")
                         };
                         draw_text(
                             &text,
@@ -2063,104 +2696,46 @@ impl Painter<'_> {
                             D2D_RECT_F {
                                 top: mid + 2.0 * s,
                                 bottom: mid + 26.0 * s,
-                                ..ar
+                                ..area
                             },
                             color(0xFFFFFF, 0.7 * empty * alpha),
                         );
                     }
-
-                    let clip = D2D_RECT_F {
-                        left: sr.left + 1.0,
-                        top: rf(l.area).top - 8.0 * s,
-                        right: sr.right - 1.0,
-                        bottom: sr.bottom - 1.0,
-                    };
-                    dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                    let new_drag = drag.and_then(|d| match d.kind {
-                        DragKind::New { card } => Some(card),
-                        _ => None,
-                    });
-                    for (i, c) in l.cards.iter().enumerate() {
-                        let shown = e.card_v[i];
-                        if shown < 0.002 {
-                            continue;
-                        }
-                        let hover = e.a(&format!("card:{i}"));
-                        let lift = 3.0 * s * hover;
-                        let base = rf(*c);
-                        let cr = D2D_RECT_F {
-                            top: base.top - lift,
-                            bottom: base.bottom - lift,
-                            ..base
-                        };
-                        // Filtered cards shrink a little as they fade.
-                        let k = 0.92 + 0.08 * shown;
-                        dc.SetTransform(&Matrix3x2::scale_around(
-                            k,
-                            k,
-                            Vector2 {
-                                X: (cr.left + cr.right) / 2.0,
-                                Y: (cr.top + cr.bottom) / 2.0,
-                            },
-                        ));
-                        let alpha = alpha * shown;
-                        let faded = if new_drag == Some(i) { 0.4 } else { 1.0 };
-                        fill(rr(cr, 10.0), color(0x2B2B2B, alpha * faded));
-                        stroke(
-                            rr(cr, 10.0),
-                            mix(
-                                color(0xFFFFFF, 0.08 * alpha),
-                                color(ACCENT, 0.9 * alpha),
-                                hover,
-                            ),
-                            1.0,
-                        );
-                        let img = D2D_RECT_F {
-                            left: cr.left + 8.0 * s,
-                            top: cr.top + 8.0 * s,
-                            right: cr.right - 8.0 * s,
-                            bottom: cr.bottom - 36.0 * s,
-                        };
-                        fill(rr(img, 6.0), color(0x161616, alpha * faded));
-                        if let Some(bmp) = &self.previews[i] {
-                            draw_contained(dc, bmp, img, alpha * faded);
-                        }
-                        let label = D2D_RECT_F {
-                            left: cr.left + 10.0 * s,
-                            top: cr.bottom - 32.0 * s,
-                            right: cr.right - 10.0 * s,
-                            bottom: cr.bottom - 8.0 * s,
-                        };
-                        draw_text(
-                            &e.gallery[i].name,
-                            &o.text.label,
-                            label,
-                            color(0xFFFFFF, 0.92 * alpha * faded),
-                        );
-                    }
                     dc.SetTransform(&Matrix3x2::identity());
-                    dc.PopAxisAlignedClip();
                 }
             }
 
-            // Ghost of a widget being dragged out of the gallery.
+            // Ghost of a widget being dragged out of the sheet: the chosen
+            // size, snapping to the grid once the sheet has stepped aside.
             if let Some(d) = drag
-                && let DragKind::New { card } = d.kind
+                && let DragKind::New { item, size, .. } = d.kind
                 && contains(&o.rect, e.pointer)
             {
                 let r = rf(d.cur);
                 shadow(r, 10.0, 0.12);
-                fill(rr(r, 10.0), color(0x202020, 0.85));
-                stroke(rr(r, 10.0), color(ACCENT, 0.9), 2.0);
-                if let Some(bmp) = &self.previews[card] {
-                    let inner = D2D_RECT_F {
-                        left: r.left + 6.0 * s,
-                        top: r.top + 6.0 * s,
-                        right: r.right - 6.0 * s,
-                        bottom: r.bottom - 6.0 * s,
-                    };
-                    draw_contained(dc, bmp, inner, 0.95);
+                fill(rr(r, 10.0), color(0x1F1F1F, 0.9));
+                let (bmp, rendered) = e.variant_bitmap(item, size);
+                if let Some(bmp) = bmp {
+                    if rendered {
+                        dc.DrawBitmap(
+                            bmp,
+                            Some(&r),
+                            0.95,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                            None,
+                            None,
+                        );
+                    } else {
+                        let inner = D2D_RECT_F {
+                            left: r.left + 6.0 * s,
+                            top: r.top + 6.0 * s,
+                            right: r.right - 6.0 * s,
+                            bottom: r.bottom - 6.0 * s,
+                        };
+                        draw_contained(dc, bmp, inner, 0.95);
+                    }
                 }
+                stroke(rr(r, 10.0), color(ACCENT, 0.9), 2.0);
             }
         }
         Ok(())
@@ -2367,6 +2942,9 @@ mod tests {
                 name: format!("Widget {i}"),
                 description: String::new(),
                 size: (2, 2),
+                min: (2, 2),
+                max: (4, 2),
+                favourite: false,
                 dir: std::path::PathBuf::new(),
                 preview: None,
             })
@@ -2840,66 +3418,157 @@ mod tests {
 
     fn open_sheet(m: &mut EditMode) {
         m.open_gallery();
-        m.anim.insert("sheet".into(), 1.0);
+        m.spring = (1.0, 0.0);
+        m.snap();
+    }
+
+    /// Centre of the tile of size variant `v` of the `g`-th widget shown.
+    fn tile(m: &EditMode, g: usize, v: usize) -> POINT {
+        center(m.sheet_layout().groups[g].tiles[v])
+    }
+
+    /// Gallery indices of the widgets the sheet shows.
+    fn shown(m: &EditMode) -> Vec<usize> {
+        m.groups.iter().map(|g| g.item).collect()
     }
 
     #[test]
-    fn sheet_slides_up_and_holds_cards() {
+    fn sheet_is_centred_with_a_sidebar_and_the_sizes() {
         let mut m = mode();
-        let (hidden, _) = m.sheet();
         open_sheet(&mut m);
-        let (sheet, cards) = m.sheet();
-        assert!(hidden.top > sheet.top);
-        assert_eq!(cards.len(), 2);
-        assert!(cards.iter().all(|c| contains(&sheet, center(*c))));
-        assert_eq!(m.hit(&[], center(cards[1])), Hot::Card(1));
-        assert_eq!(m.hit(&[], pt(sheet.left + 3, sheet.top + 3)), Hot::Sheet);
-        // The sheet is only hit while the gallery is open.
+        let l = m.sheet_layout();
+        let (bar, _, _) = m.toolbar();
+        assert!(l.sheet.top > bar.bottom);
+        assert!(((l.sheet.left + l.sheet.right) / 2 - 960).abs() <= 1);
+        assert!(l.side.right < l.area.left && l.field.bottom < l.entries[0].top);
+        // All, Favourites, one pack.
+        assert_eq!(l.entries.len(), 3);
+        // Two widgets, each in its two sizes, side by side and bottom-aligned.
+        assert_eq!(shown(&m), [0, 1]);
+        assert_eq!(m.groups[0].variants, [(2, 2), (4, 2)]);
+        let g = &l.groups[0];
+        assert!(g.tiles[0].right < g.tiles[1].left);
+        assert_eq!(g.tiles[0].bottom, g.tiles[1].bottom);
+        // True proportions: 4×2 is twice as wide as 2×2 (plus a gap), as tall.
+        let w = |r: RECT| r.right - r.left;
+        let h = |r: RECT| r.bottom - r.top;
+        assert_eq!(h(g.tiles[0]), h(g.tiles[1]));
+        assert!((w(g.tiles[1]) as f32 / w(g.tiles[0]) as f32 - 280.0 / 136.0).abs() < 0.05);
+        assert!(l.groups[1].bounds.top > g.bounds.bottom);
+        assert_eq!(m.hit(&[], tile(&m, 1, 1)), Hot::Tile(1, 1));
+        assert_eq!(m.hit(&[], center(l.entries[2])), Hot::Side(2));
+        assert_eq!(
+            m.hit(&[], pt(l.sheet.right - 3, l.sheet.bottom - 3)),
+            Hot::Sheet
+        );
+        // The sheet is only hit while it is open.
         m.gallery_open = false;
-        assert_ne!(m.hit(&[], center(cards[1])), Hot::Card(1));
+        assert_ne!(m.hit(&[], tile(&m, 1, 1)), Hot::Tile(1, 1));
     }
 
     #[test]
-    fn click_on_a_card_adds_at_first_free_spot() {
+    fn the_sheet_springs_open_and_closed() {
+        let mut m = mode();
+        m.open_gallery();
+        let mut peak: f32 = 0.0;
+        for _ in 0..120 {
+            m.last_frame = Instant::now() - std::time::Duration::from_millis(16);
+            m.step();
+            peak = peak.max(m.spring.0);
+        }
+        assert!(peak > 1.0 && peak < 1.08, "a slight overshoot: {peak}");
+        assert_eq!(m.spring, (1.0, 0.0));
+        assert_eq!(m.sheet_alpha(), 1.0);
+        m.input(Input::Escape, &[]);
+        settle(&mut m);
+        assert_eq!(m.spring.0, 0.0);
+        assert_eq!(m.sheet_alpha(), 0.0);
+    }
+
+    #[test]
+    fn click_or_plus_adds_that_size_at_the_first_free_spot() {
         let mut m = mode();
         open_sheet(&mut m);
-        let card = m.sheet().1[1];
-        match click(&mut m, &[], center(card)).as_slice() {
+        let add = |actions: Vec<Action>| match actions.as_slice() {
             [
                 Action::Add {
                     package,
                     widget,
+                    size,
                     at: None,
                 },
-            ] => {
-                assert_eq!(package, "dev.pack");
-                assert_eq!(widget, "w1");
-            }
+            ] => (package.clone(), widget.clone(), *size),
             other => panic!("{other:?}"),
-        }
+        };
+        let at = tile(&m, 1, 1);
+        assert_eq!(
+            add(click(&mut m, &[], at)),
+            ("dev.pack".into(), "w1".into(), (4, 2))
+        );
+        // The "+" sits on the tile's top-left corner.
+        let plus = center(m.plus_rect(m.sheet_layout().groups[0].tiles[0]));
+        assert_eq!(m.hit(&[], plus), Hot::Plus(0, 0));
+        assert_eq!(
+            add(click(&mut m, &[], plus)),
+            ("dev.pack".into(), "w0".into(), (2, 2))
+        );
+        // It shows a check mark for a moment, and the sheet stays open.
+        assert!(m.added_t(&sheet::preview_key(&m.gallery[0], (2, 2))) > 0.9);
+        assert!(m.gallery_open);
     }
 
     #[test]
-    fn drag_a_card_onto_the_desktop() {
+    fn hover_reveals_the_plus() {
+        let mut m = mode();
+        open_sheet(&mut m);
+        m.input(Input::Move(tile(&m, 0, 1)), &[]);
+        assert_eq!(m.hot, Hot::Tile(0, 1));
+        settle(&mut m);
+        assert_eq!(m.a("tile:0:1"), 1.0);
+        assert_eq!(m.a("plus:0:1"), 0.0);
+        let plus = center(m.plus_rect(m.sheet_layout().groups[0].tiles[1]));
+        m.input(Input::Move(plus), &[]);
+        settle(&mut m);
+        assert_eq!((m.a("tile:0:1"), m.a("plus:0:1")), (1.0, 1.0));
+    }
+
+    #[test]
+    fn drag_a_size_onto_the_desktop() {
         let mut m = mode();
         open_sheet(&mut m);
         let items = items();
-        let card = m.sheet().1[0];
         let g = m.geometry(PRIMARY).unwrap();
-        // Centre of a free 2x2 span at (16, 2).
-        let target = center(g.rect(16, 2, 2, 2));
-        let actions = drag(&mut m, &items, center(card), target);
-        match actions.as_slice() {
+        // A free 4x2 span left of the sheet.
+        let target = center(g.rect(1, 9, 4, 2));
+        let from = tile(&m, 0, 1);
+        assert!(m.input(Input::Down(from), &items).is_empty());
+        m.input(Input::Move(pt(from.x + 30, from.y)), &items);
+        assert!(!m.away, "still over the sheet");
+        m.input(Input::Move(target), &items);
+        assert!(m.away, "the sheet steps aside once the widget leaves it");
+        assert_eq!(
+            m.hit(&items, from),
+            Hot::None,
+            "and no longer takes the pointer"
+        );
+        let d = m.drag.clone().unwrap();
+        assert_eq!(d.target, Some((PRIMARY.to_string(), (1, 9, 4, 2))));
+        assert!(d.valid);
+        // The ghost is the widget at the size dragged.
+        let r = g.rect(0, 0, 4, 2);
+        assert!(((d.cur.right - d.cur.left) - (r.right - r.left)).abs() <= 1);
+        match m.input(Input::Up(target), &items).as_slice() {
             [
                 Action::Add {
                     package,
                     widget,
+                    size,
                     at: Some((monitor, cells)),
                 },
             ] => {
                 assert_eq!((package.as_str(), widget.as_str()), ("dev.pack", "w0"));
-                assert_eq!(monitor, PRIMARY);
-                assert_eq!(*cells, (16, 2, 2, 2));
+                assert_eq!(*size, (4, 2));
+                assert_eq!((monitor.as_str(), *cells), (PRIMARY, (1, 9, 4, 2)));
             }
             other => panic!("{other:?}"),
         }
@@ -2907,54 +3576,61 @@ mod tests {
     }
 
     #[test]
-    fn card_dropped_on_a_widget_or_the_sheet_is_dropped() {
+    fn a_drop_on_a_widget_or_back_on_the_sheet_adds_nothing() {
         let items = items();
         let mut m = mode();
         open_sheet(&mut m);
-        let card = m.sheet().1[0];
         let onto = center(m.frame_px(&items[0]).unwrap());
-        assert!(drag(&mut m, &items, center(card), onto).is_empty());
-        assert!(m.gallery_open);
+        let from = tile(&m, 0, 0);
+        assert!(drag(&mut m, &items, from, onto).is_empty());
+        assert!(m.gallery_open && !m.away, "the sheet comes back");
 
         let mut m = mode();
         open_sheet(&mut m);
-        let (sheet, cards) = m.sheet();
-        let back = pt(sheet.right - 5, sheet.top + 5);
-        assert!(drag(&mut m, &items, center(cards[0]), back).is_empty());
+        let sheet = m.sheet();
+        let back = pt(sheet.right - 5, sheet.bottom - 5);
+        let from = tile(&m, 0, 0);
+        assert!(drag(&mut m, &items, from, back).is_empty());
+        assert!(m.gallery_open);
     }
 
     #[test]
-    fn wheel_scrolls_a_long_gallery() {
+    fn wheel_scrolls_a_long_list() {
         let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery(20));
         open_sheet(&mut m);
-        let (sheet, _) = m.sheet();
-        m.pointer = pt(sheet.left + 30, sheet.bottom - 30);
+        let l = m.sheet_layout();
+        m.pointer = center(l.area);
         m.input(Input::Wheel(-120), &[]);
+        assert_eq!(m.scroll_to, 96.0);
+        settle(&mut m);
         assert_eq!(m.scroll, 96.0);
-        // Scrolling back past the start clamps at 0.
+        assert_eq!(
+            m.sheet_layout().groups[0].bounds.top,
+            l.groups[0].bounds.top - 96
+        );
         m.input(Input::Wheel(600), &[]);
-        assert_eq!(m.scroll, 0.0);
-        // And past the end clamps at the content width.
+        assert_eq!(m.scroll_to, 0.0);
         for _ in 0..100 {
             m.input(Input::Wheel(-120), &[]);
         }
-        let (sheet, cards) = m.sheet();
-        let last = cards.last().unwrap();
-        assert!(last.right <= sheet.right && last.right > sheet.right - 64);
-        // Off the sheet the wheel does nothing.
-        let before = m.scroll;
-        m.pointer = pt(5, 500);
+        settle(&mut m);
+        let l = m.sheet_layout();
+        let last = l.groups.last().unwrap().bounds;
+        assert!(last.bottom <= l.area.bottom && last.bottom > l.area.bottom - 40);
+        // Over the sidebar the wheel does nothing.
+        let before = m.scroll_to;
+        m.pointer = center(l.entries[0]);
         m.input(Input::Wheel(120), &[]);
-        assert_eq!(m.scroll, before);
+        assert_eq!(m.scroll_to, before);
     }
 
     #[test]
-    fn short_gallery_does_not_scroll() {
+    fn short_list_does_not_scroll() {
         let mut m = mode();
         open_sheet(&mut m);
-        m.pointer = center(m.sheet().1[0]);
+        m.pointer = tile(&m, 0, 0);
         m.input(Input::Wheel(-120), &[]);
-        assert_eq!(m.scroll, 0.0);
+        assert_eq!(m.scroll_to, 0.0);
     }
 
     // ── transitions ──
@@ -3117,6 +3793,9 @@ mod tests {
                 name: "Weather".into(),
                 description: String::new(),
                 size: (2, 2),
+                min: (2, 2),
+                max: (2, 2),
+                favourite: false,
                 dir,
                 preview: Some("src/weather/preview.bmp".into()),
             }
@@ -3136,17 +3815,24 @@ mod tests {
     }
 
     fn packs_gallery() -> Vec<GalleryItem> {
-        let mk =
-            |package: &str, pack: &str, widget: &str, name: &str, description: &str| GalleryItem {
-                package: package.into(),
-                pack_name: pack.into(),
-                widget: widget.into(),
-                name: name.into(),
-                description: description.into(),
-                size: (2, 2),
-                dir: std::path::PathBuf::new(),
-                preview: None,
-            };
+        let mk = |package: &str,
+                  pack: &str,
+                  widget: &str,
+                  name: &str,
+                  description: &str,
+                  favourite: bool| GalleryItem {
+            package: package.into(),
+            pack_name: pack.into(),
+            widget: widget.into(),
+            name: name.into(),
+            description: description.into(),
+            size: (2, 2),
+            min: (2, 1),
+            max: (4, 2),
+            favourite,
+            dir: std::path::PathBuf::new(),
+            preview: None,
+        };
         vec![
             mk(
                 "dev.clocks",
@@ -3154,6 +3840,7 @@ mod tests {
                 "analog",
                 "Analog clock",
                 "Hands and a dial",
+                true,
             ),
             mk(
                 "dev.clocks",
@@ -3161,6 +3848,7 @@ mod tests {
                 "word",
                 "Word clock",
                 "The time in words",
+                false,
             ),
             mk(
                 "dev.weather",
@@ -3168,6 +3856,7 @@ mod tests {
                 "now",
                 "Météo",
                 "Current conditions",
+                false,
             ),
             mk(
                 "dev.weather",
@@ -3175,6 +3864,7 @@ mod tests {
                 "week",
                 "Forecast",
                 "The next seven days",
+                true,
             ),
         ]
     }
@@ -3191,17 +3881,17 @@ mod tests {
         assert!(m.search.is_empty());
         open_sheet(&mut m);
         for (query, want) in [
-            ("clock", [true, true, false, false]),
-            ("words", [false, true, false, false]),
-            ("WEATHER", [false, false, true, true]),
-            ("meteo", [false, false, true, false]),
-            ("seven weather", [false, false, false, true]),
-            ("", [true, true, true, true]),
+            ("clock", &[0, 1][..]),
+            ("words", &[1]),
+            ("WEATHER", &[2, 3]),
+            ("meteo", &[2]),
+            ("seven weather", &[3]),
+            ("", &[0, 1, 2, 3]),
         ] {
             m.search = TextField::default();
             type_text(&mut m, query);
             m.refilter();
-            assert_eq!(m.matched, want, "{query:?}");
+            assert_eq!(shown(&m), want, "{query:?}");
         }
     }
 
@@ -3210,7 +3900,7 @@ mod tests {
         let mut m = packs_mode();
         open_sheet(&mut m);
         type_text(&mut m, "word clock");
-        assert_eq!(m.matched, [false, true, false, false]);
+        assert_eq!(shown(&m), [1]);
         key(&mut m, VK_BACK.0, true);
         assert_eq!(m.search.text, "word ");
         key(&mut m, VK_BACK.0, false);
@@ -3223,11 +3913,7 @@ mod tests {
         type_text(&mut m, "s");
         key(&mut m, VK_LEFT.0, false);
         assert_eq!(m.search, field("words", 4));
-        assert_eq!(
-            m.matched,
-            [false, true, false, false],
-            "found in the description"
-        );
+        assert_eq!(shown(&m), [1], "found in the description");
     }
 
     #[test]
@@ -3242,20 +3928,16 @@ mod tests {
         key(&mut m, b'F' as u16, false);
         assert_eq!(m.search.text, "météo");
         m.input(Input::Escape, &[]);
-        m.input(Input::Escape, &[]);
         assert!(!m.gallery_open);
         m.open_gallery();
-        assert!(m.search.is_empty() && m.matched.iter().all(|&v| v));
+        assert!(m.search.is_empty() && shown(&m) == [0, 1, 2, 3]);
     }
 
     #[test]
-    fn escape_clears_the_query_then_closes_the_sheet_then_edit_mode() {
+    fn escape_closes_the_sheet_then_edit_mode() {
         let mut m = packs_mode();
         open_sheet(&mut m);
         type_text(&mut m, "zzz");
-        assert!(m.input(Input::Escape, &[]).is_empty());
-        assert!(m.search.is_empty() && m.gallery_open);
-        assert_eq!(m.matched, [true; 4]);
         assert!(m.input(Input::Escape, &[]).is_empty());
         assert!(!m.gallery_open);
         assert!(matches!(
@@ -3294,205 +3976,181 @@ mod tests {
         assert!(m.caret_epoch.elapsed().as_millis() < BLINK_MS as u128);
     }
 
-    // ── package tabs ──
+    // ── sidebar ──
 
     #[test]
-    fn single_package_has_no_tabs() {
-        let mut m = mode();
-        open_sheet(&mut m);
-        assert!(m.sheet_layout().tabs.is_empty());
-        let m = mode_full(
-            &[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)],
-            gallery(2),
-            Some("dev.pack".into()),
-        );
-        assert_eq!(m.tab(), None);
-    }
-
-    #[test]
-    fn tabs_filter_by_package() {
+    fn sidebar_selects_all_favourites_or_a_pack() {
         let mut m = packs_mode();
         open_sheet(&mut m);
         let l = m.sheet_layout();
-        assert_eq!(l.tabs.len(), 3);
-        assert!(l.tabs.windows(2).all(|w| w[0].right < w[1].left));
-        assert!(l.tabs.iter().all(|t| contains(&l.sheet, center(*t))));
-        assert!(l.strip.bottom <= l.area.top && l.field.bottom <= l.strip.top);
-        assert_eq!(m.hit(&[], center(l.tabs[0])), Hot::Tab(0));
-        assert_eq!(m.hit(&[], center(l.tabs[2])), Hot::Tab(2));
-        assert_eq!(m.tab_label(1), "Clocks");
+        assert_eq!(l.entries.len(), 4);
+        assert!(l.entries.windows(2).all(|w| w[0].bottom <= w[1].top));
+        // A divider separates All and Favourites from the packs.
+        assert!(l.entries[2].top - l.entries[1].bottom > l.entries[1].top - l.entries[0].bottom);
+        assert_eq!(
+            m.entry_label(&Selection::Pack("dev.weather".into())),
+            "Weather"
+        );
+        assert_eq!(m.entry_count(&Selection::Favourites), 2);
 
-        assert!(click(&mut m, &[], center(l.tabs[2])).is_empty());
+        assert!(click(&mut m, &[], center(l.entries[1])).is_empty());
+        assert_eq!(m.selection, Selection::Favourites);
+        assert_eq!(shown(&m), [0, 3]);
+        click(&mut m, &[], center(l.entries[3]));
         assert_eq!(m.tab().as_deref(), Some("dev.weather"));
-        assert_eq!(m.matched, [false, false, true, true]);
-        // The tab and the search combine.
+        assert_eq!(shown(&m), [2, 3]);
+        // The selection and the search combine.
         type_text(&mut m, "seven");
-        assert_eq!(m.matched, [false, false, false, true]);
+        assert_eq!(shown(&m), [3]);
         type_text(&mut m, " clock");
-        assert!(!m.matched.contains(&true));
+        assert!(shown(&m).is_empty());
         settle(&mut m);
         assert_eq!(m.a("empty"), 1.0);
         assert_eq!(m.hit(&[], center(m.sheet_layout().area)), Hot::Sheet);
-
         m.clear_search();
-        click(&mut m, &[], center(l.tabs[0]));
+        click(&mut m, &[], center(l.entries[0]));
         assert_eq!(m.tab(), None);
-        assert_eq!(m.matched, [true; 4]);
+        assert_eq!(shown(&m), [0, 1, 2, 3]);
     }
 
     #[test]
-    fn the_pill_slides_to_the_selected_tab() {
+    fn the_indicator_slides_to_the_selected_entry() {
         let mut m = packs_mode();
         open_sheet(&mut m);
-        let spans = m.tab_spans();
-        assert_eq!(m.pill, (spans[0].0 as f32, spans[0].1 as f32));
-        m.select_tab(1);
+        let start = m.pill;
+        assert_eq!(start, m.pill_target());
+        m.select(3);
+        let end = m.pill_target();
         m.last_frame = Instant::now() - std::time::Duration::from_millis(16);
         assert!(m.step());
-        // Moving right, the leading (right) edge runs ahead of the trailing one.
-        let (l, r) = m.pill;
-        let l_done = (l - spans[0].0 as f32) / (spans[1].0 - spans[0].0) as f32;
-        let r_done = (r - spans[0].1 as f32) / (spans[1].1 - spans[0].1) as f32;
-        assert!(r_done > l_done, "{l_done} {r_done}");
+        // Moving down, the leading (bottom) edge runs ahead of the top one.
+        let top = (m.pill.0 - start.0) / (end.0 - start.0);
+        let bottom = (m.pill.1 - start.1) / (end.1 - start.1);
+        assert!(bottom > top, "{top} {bottom}");
         settle(&mut m);
-        assert_eq!(m.pill, (spans[1].0 as f32, spans[1].1 as f32));
+        assert_eq!(m.pill, end);
     }
 
     #[test]
-    fn the_last_tab_is_remembered() {
+    fn the_last_selection_is_remembered() {
         let monitors = [(PRIMARY, rect(0, 0, 1920, 1080), 1.0)];
         let m = mode_full(&monitors, packs_gallery(), Some("dev.weather".into()));
         assert_eq!(m.tab().as_deref(), Some("dev.weather"));
-        assert_eq!(m.matched, [false, false, true, true]);
-        // Already settled: the first weather card sits in the first slot.
-        assert_eq!(m.card_x[2], 0.0);
-        assert_eq!(m.pill_target(), m.pill);
+        assert_eq!(shown(&m), [2, 3]);
+        let m = mode_full(
+            &monitors,
+            packs_gallery(),
+            Some(vitrine_widgets::gallery::FAVOURITES.into()),
+        );
+        assert_eq!(m.selection, Selection::Favourites);
         // A package that is no longer installed falls back to all.
         let m = mode_full(&monitors, packs_gallery(), Some("dev.gone".into()));
         assert_eq!(m.tab(), None);
-        assert_eq!(m.matched, [true; 4]);
+        assert_eq!(shown(&m), [0, 1, 2, 3]);
     }
 
     #[test]
-    fn many_tabs_scroll_with_the_wheel() {
-        let gallery: Vec<GalleryItem> = (0..40)
-            .map(|i| GalleryItem {
-                package: format!("dev.pack{i}"),
-                pack_name: format!("A rather long package name {i}"),
-                ..gallery(1).remove(0)
-            })
-            .collect();
-        let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery);
-        open_sheet(&mut m);
-        let l = m.sheet_layout();
-        assert!(l.sheet.right - l.sheet.left <= 1920 - 48);
-        let max = m.tab_scroll_max(&m.tab_spans());
-        assert!(max > 0.0);
-        m.pointer = center(l.tabs[1]);
-        m.input(Input::Wheel(-120), &[]);
-        assert!(m.tab_scroll > 0.0);
-        for _ in 0..200 {
-            m.input(Input::Wheel(-120), &[]);
-        }
-        assert_eq!(m.tab_scroll, max);
-        // Selecting a tab brings it into view.
-        m.select_tab(0);
-        assert_eq!(m.tab_scroll, 0.0);
-        m.select_tab(40);
-        assert_eq!(m.tab_scroll, max);
-    }
-
-    // ── filtered results ──
-
-    #[test]
-    fn filtered_cards_reflow_and_fade() {
-        let mut m = packs_mode();
-        open_sheet(&mut m);
-        let before = m.sheet();
-        type_text(&mut m, "forecast");
-        assert_eq!(m.matched, [false, false, false, true]);
-        // The sheet holds its width while the results change.
-        assert_eq!(m.sheet().0, before.0);
-        // Cards glide: nothing jumps on the first frame.
-        assert_eq!(m.sheet().1[3], before.1[3]);
-        m.last_frame = Instant::now() - std::time::Duration::from_millis(16);
-        assert!(m.step());
-        let mid = m.sheet().1[3];
-        assert!(mid.left < before.1[3].left && mid.left > before.1[0].left);
-        assert!(m.card_v[0] < 1.0 && m.card_v[0] > 0.0);
-        settle(&mut m);
-        assert_eq!(m.sheet().1[3].left, before.1[0].left);
-        assert_eq!(m.card_v, [0.0, 0.0, 0.0, 1.0]);
-        // Only the matching card is hit, even where a faded one was.
-        assert_eq!(m.hit(&[], center(m.sheet().1[3])), Hot::Card(3));
-        assert_eq!(m.hit(&[], center(before.1[1])), Hot::Sheet);
-    }
-
-    #[test]
-    fn filtering_resets_the_scroll() {
+    fn filtering_resets_the_scroll_and_fades_the_list_in() {
         let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery(20));
         open_sheet(&mut m);
-        let l = m.sheet_layout();
-        m.pointer = pt(l.area.left + 30, l.area.bottom - 30);
+        settle(&mut m);
+        assert_eq!(m.a("content"), 1.0);
+        m.pointer = center(m.sheet_layout().area);
         m.input(Input::Wheel(-360), &[]);
+        settle(&mut m);
         assert!(m.scroll > 0.0);
-        let on_screen = m.sheet().1[19];
         type_text(&mut m, "19");
-        assert_eq!(m.scroll, 0.0);
-        // The card stays where it was on screen, then glides to the first slot.
-        assert_eq!(m.sheet().1[19], on_screen);
+        assert_eq!(shown(&m), [19]);
+        assert_eq!((m.scroll, m.scroll_to), (0.0, 0.0));
+        assert_eq!(m.a("content"), 0.0);
         settle(&mut m);
-        assert_eq!(m.sheet().1[19].left, l.area.left);
+        assert_eq!(m.a("content"), 1.0);
     }
 
+    // ── keyboard ──
+
     #[test]
-    fn click_on_a_filtered_card_adds_that_widget() {
+    fn tab_arrows_and_enter_add_from_the_keyboard() {
         let mut m = packs_mode();
         open_sheet(&mut m);
-        type_text(&mut m, "forecast");
+        assert_eq!(m.focus, Focus::Side);
+        // In the sidebar, up and down change the selection.
+        key(&mut m, VK_DOWN.0, false);
+        assert_eq!(m.selection, Selection::Favourites);
+        key(&mut m, VK_UP.0, false);
+        key(&mut m, VK_UP.0, false);
+        assert_eq!(m.selection, Selection::All);
+        // Tab moves to the grid, where arrows walk the sizes.
+        key(&mut m, VK_TAB.0, false);
+        assert_eq!((m.focus, m.focused()), (Focus::Grid, Some((0, 0))));
+        assert!(m.keyboard);
+        key(&mut m, VK_RIGHT.0, false);
+        key(&mut m, VK_RIGHT.0, false);
+        assert_eq!(m.focused(), Some((0, 2)));
+        key(&mut m, VK_DOWN.0, false);
+        assert_eq!(m.focused(), Some((1, 2)));
         settle(&mut m);
-        let card = m.sheet().1[3];
-        match click(&mut m, &[], center(card)).as_slice() {
+        assert_eq!(m.a("ring:1:2"), 1.0);
+        // Enter adds the size under the cursor (2×1, 2×2, 4×2).
+        match key(&mut m, VK_RETURN.0, false).as_slice() {
             [
                 Action::Add {
-                    package,
                     widget,
+                    size,
                     at: None,
+                    ..
                 },
-            ] => {
-                assert_eq!((package.as_str(), widget.as_str()), ("dev.weather", "week"));
-            }
+            ] => assert_eq!((widget.as_str(), *size), ("word", (4, 2))),
             other => panic!("{other:?}"),
         }
+        // Tab goes back to the sidebar; typing searches from anywhere.
+        key(&mut m, VK_TAB.0, false);
+        assert_eq!((m.focus, m.focused()), (Focus::Side, None));
+        key(&mut m, VK_TAB.0, false);
+        type_text(&mut m, "fore");
+        assert_eq!(m.focus, Focus::Side);
+        assert_eq!(shown(&m), [3]);
+        // Enter in the sidebar jumps into the grid.
+        key(&mut m, VK_RETURN.0, false);
+        assert_eq!(m.focused(), Some((0, 0)));
+        // A click hides the focus rings.
+        m.input(Input::Down(pt(2, 2)), &[]);
+        assert!(!m.keyboard);
     }
 
     #[test]
-    fn drag_a_filtered_card_onto_the_desktop() {
-        let mut m = packs_mode();
+    fn keyboard_scrolls_the_focused_widget_into_view() {
+        let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery(20));
         open_sheet(&mut m);
-        let l = m.sheet_layout();
-        click(&mut m, &[], center(l.tabs[1]));
-        type_text(&mut m, "word");
+        key(&mut m, VK_TAB.0, false);
+        key(&mut m, VK_END.0, false);
+        assert_eq!(m.focused(), Some((19, 1)));
         settle(&mut m);
-        let card = m.sheet().1[1];
-        assert_eq!(card.left, l.area.left);
-        let items = items();
-        let g = m.geometry(PRIMARY).unwrap();
-        let target = center(g.rect(16, 2, 2, 2));
-        match drag(&mut m, &items, center(card), target).as_slice() {
-            [
-                Action::Add {
-                    package,
-                    widget,
-                    at: Some((monitor, cells)),
-                },
-            ] => {
-                assert_eq!((package.as_str(), widget.as_str()), ("dev.clocks", "word"));
-                assert_eq!((monitor.as_str(), *cells), (PRIMARY, (16, 2, 2, 2)));
-            }
-            other => panic!("{other:?}"),
-        }
-        // The tab outlives the sheet.
-        assert_eq!(m.tab().as_deref(), Some("dev.clocks"));
+        let l = m.sheet_layout();
+        let b = l.groups[19].bounds;
+        assert!(b.bottom <= l.area.bottom && b.top >= l.area.top, "{b:?}");
+        key(&mut m, VK_HOME.0, false);
+        settle(&mut m);
+        assert_eq!(m.scroll, 0.0);
+    }
+
+    #[test]
+    fn preview_jobs_cover_the_selection_once() {
+        let mut m = packs_mode();
+        assert!(
+            m.preview_jobs().is_empty(),
+            "nothing while the sheet is closed"
+        );
+        open_sheet(&mut m);
+        m.select(3);
+        let jobs = m.preview_jobs();
+        // Two weather widgets, three sizes each.
+        assert_eq!(jobs.len(), 6);
+        assert_eq!((jobs[0].widget.as_str(), jobs[0].size), ("now", (2, 1)));
+        assert!(m.preview_jobs().is_empty(), "asked only once");
+        m.add_preview(jobs[0].key.clone(), 2, 1, Arc::new(vec![0; 8]));
+        assert!(m.pixels.contains_key(&jobs[0].key));
+        m.select(0);
+        assert_eq!(m.preview_jobs().len(), 6, "the clocks' sizes follow");
     }
 }
