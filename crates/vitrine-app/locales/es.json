@@ -31,6 +31,7 @@
   "status.place_hint": "Arrastra el widget desde la galería hasta el escritorio",
   "status.installed": "Se instaló {name} {version}",
   "status.could_not_install": "No se pudo instalar: {error}",
+  "status.needs_engine": "{name} requiere Vitrine {required} o posterior; esta es la {running}.",
   "status.uninstalled": "Paquete desinstalado",
   "status.could_not_uninstall": "No se pudo desinstalar: {error}",
   "status.settings_reset": "Configuración restablecida",
@@ -85,6 +86,7 @@
   "perm.drives": "Lee el espacio libre de tus unidades",
   "perm.processes": "Lee la lista de aplicaciones abiertas",
   "perm.network": "Lee la actividad de red",
+  "perm.info": "Lee el nombre del equipo, la versión de Windows y el tiempo de actividad",
   "perm.net": "Se conecta a {host}",
   "perm.used_by": "Usado por {widgets}",
 

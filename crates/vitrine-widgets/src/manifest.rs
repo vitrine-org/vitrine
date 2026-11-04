@@ -1,5 +1,6 @@
 //! `vitrine.json` package manifest.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
@@ -13,14 +14,35 @@ use crate::{Error, Result};
 /// Name of the manifest file at the package root.
 pub const MANIFEST_FILE: &str = "vitrine.json";
 
-/// System metrics a widget may request.
-pub const SYSTEM_METRICS: &[&str] = &["cpu", "memory", "battery", "drives", "processes", "network"];
+/// The `system.<name>` permissions. Each grants the metric of the same name,
+/// except `system.info`, which grants the `system` metric (host name, OS
+/// version, uptime): see [`metric_permission`].
+pub const SYSTEM_METRICS: &[&str] = &[
+    "cpu",
+    "memory",
+    "battery",
+    "drives",
+    "processes",
+    "network",
+    "info",
+];
+
+/// The `system.<name>` permission that grants a metric `useSystem()` asks
+/// for (`None` for a name that is not a metric).
+pub fn metric_permission(metric: &str) -> Option<&str> {
+    match metric {
+        "system" => Some("info"),
+        "info" => None,
+        m => Some(m),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Permission {
     /// `system.<metric>`
     System(String),
-    /// `net:<host>`
+    /// `net:<host>`, or `net:*.<host>` for any subdomain of `<host>` (not
+    /// `<host>` itself).
     Net(String),
 }
 
@@ -33,9 +55,16 @@ impl Permission {
             return Err(format!("unknown permission `{s}`"));
         }
         if let Some(h) = s.strip_prefix("net:") {
-            let ok = !h.is_empty()
+            // A wildcard is only allowed as the whole first label, before at
+            // least two labels (`*.com` would match every `.com` site).
+            let (host, wildcard) = match h.strip_prefix("*.") {
+                Some(rest) => (rest, true),
+                None => (h, false),
+            };
+            let ok = !host.is_empty()
                 && h.len() <= 253
-                && h.split('.').all(|l| {
+                && (!wildcard || host.contains('.'))
+                && host.split('.').all(|l| {
                     !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
                 });
             if ok {
@@ -234,6 +263,59 @@ pub fn is_safe_relative_path(p: &str) -> bool {
     })
 }
 
+/// The running engine's version (the workspace version, shared by every crate).
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Version core and pre-release identifiers.
+pub type Version<'a> = ([u64; 3], Vec<&'a str>);
+
+/// `MAJOR.MINOR.PATCH[-pre][+build]`, with an optional leading `v`.
+pub fn parse_version(v: &str) -> Option<Version<'_>> {
+    let v = v.trim().trim_start_matches('v');
+    let v = v.split('+').next()?;
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, p.split('.').collect()),
+        None => (v, Vec::new()),
+    };
+    let mut nums = [0u64; 3];
+    let mut parts = core.split('.');
+    for n in &mut nums {
+        *n = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((nums, pre))
+}
+
+/// Semantic-version order; unparsable versions sort first.
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    let (Some((an, ap)), Some((bn, bp))) = (parse_version(a), parse_version(b)) else {
+        return parse_version(a).is_some().cmp(&parse_version(b).is_some());
+    };
+    an.cmp(&bn)
+        .then_with(|| match (ap.is_empty(), bp.is_empty()) {
+            (true, true) => Ordering::Equal,
+            // A pre-release comes before its release.
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                for (x, y) in ap.iter().zip(&bp) {
+                    let o = match (x.parse::<u64>(), y.parse::<u64>()) {
+                        (Ok(x), Ok(y)) => x.cmp(&y),
+                        (Ok(_), Err(_)) => Ordering::Less,
+                        (Err(_), Ok(_)) => Ordering::Greater,
+                        (Err(_), Err(_)) => x.cmp(y),
+                    };
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                ap.len().cmp(&bp.len())
+            }
+        })
+}
+
 fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Manifest(msg.into()))
 }
@@ -249,6 +331,20 @@ impl PackageManifest {
         let m = Self::parse(json)?;
         m.validate()?;
         Ok(m)
+    }
+
+    /// Refuses a package whose `minEngine` is newer than `engine`.
+    pub fn check_engine(&self, engine: &str) -> Result<()> {
+        match &self.min_engine {
+            Some(min) if compare_versions(engine, min) == Ordering::Less => {
+                Err(Error::EngineTooOld {
+                    name: self.name.clone(),
+                    required: min.clone(),
+                    running: engine.to_string(),
+                })
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -521,12 +617,56 @@ mod tests {
     }
 
     #[test]
+    fn engine_requirement() {
+        let with = |me: Option<&str>| {
+            let mut m = PackageManifest::parse(VALID).unwrap();
+            m.min_engine = me.map(String::from);
+            m
+        };
+        assert!(with(None).check_engine("2.0.0").is_ok());
+        assert!(with(Some("2.0.0")).check_engine("2.0.0").is_ok());
+        assert!(with(Some("1.9.9")).check_engine("2.0.0").is_ok());
+        assert!(with(Some("2.0.0-rc.1")).check_engine("2.0.0").is_ok());
+        assert!(with(Some("2.0.0")).check_engine("2.0.0-rc.1").is_err());
+        let e = with(Some("2.10.0")).check_engine("2.9.3").unwrap_err();
+        assert!(
+            matches!(&e, Error::EngineTooOld { required, running, .. }
+                if required == "2.10.0" && running == "2.9.3"),
+            "{e}"
+        );
+        assert!(with(Some("99.0.0")).check_engine(ENGINE_VERSION).is_err());
+    }
+
+    #[test]
     fn permissions() {
         assert!(Permission::parse("system.cpu").is_ok());
         assert!(Permission::parse("system.gpu").is_err());
+        assert!(Permission::parse("system.info").is_ok());
+        assert!(Permission::parse("system.system").is_err());
+        assert_eq!(metric_permission("system"), Some("info"));
+        assert_eq!(metric_permission("cpu"), Some("cpu"));
+        assert_eq!(metric_permission("info"), None);
         assert!(Permission::parse("fs.read").is_err());
         assert!(Permission::parse("net:").is_err());
         assert!(Permission::parse("net:a/b").is_err());
+        assert_eq!(
+            Permission::parse("net:*.Open-Meteo.com"),
+            Ok(Permission::Net("*.open-meteo.com".into()))
+        );
+        for bad in [
+            "net:*",
+            "net:*.",
+            "net:*.com",
+            "net:**.a.com",
+            "net:a.*.com",
+            "net:*a.com",
+            "net:a*.com",
+            "net:api.*",
+            "net:*.*.a.com",
+            "net:.a.com",
+        ] {
+            assert!(Permission::parse(bad).is_err(), "{bad}");
+        }
         let bad = VALID.replace("system.cpu", "system.webcam");
         assert!(PackageManifest::parse(&bad).is_err());
     }

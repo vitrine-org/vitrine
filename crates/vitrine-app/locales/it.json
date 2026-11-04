@@ -31,6 +31,7 @@
   "status.place_hint": "Trascina il widget dalla raccolta sul desktop",
   "status.installed": "Installato: {name} {version}",
   "status.could_not_install": "Impossibile installare: {error}",
+  "status.needs_engine": "{name} richiede Vitrine {required} o successivo; questa è la {running}.",
   "status.uninstalled": "Pacchetto disinstallato",
   "status.could_not_uninstall": "Impossibile disinstallare: {error}",
   "status.settings_reset": "Impostazioni ripristinate",
@@ -85,6 +86,7 @@
   "perm.drives": "Legge lo spazio libero sulle unità",
   "perm.processes": "Legge l'elenco delle app in esecuzione",
   "perm.network": "Legge l'attività di rete",
+  "perm.info": "Legge il nome del computer, la versione di Windows e il tempo di attività",
   "perm.net": "Si connette a {host}",
   "perm.used_by": "Usato da {widgets}",
 

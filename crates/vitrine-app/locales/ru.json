@@ -31,6 +31,7 @@
   "status.place_hint": "Перетащите мини-приложение из коллекции на рабочий стол",
   "status.installed": "Установлено: {name} {version}",
   "status.could_not_install": "Не удалось установить: {error}",
+  "status.needs_engine": "Для {name} требуется Vitrine {required} или новее (установлена {running}).",
   "status.uninstalled": "Пакет удалён",
   "status.could_not_uninstall": "Не удалось удалить: {error}",
   "status.settings_reset": "Параметры сброшены",
@@ -85,6 +86,7 @@
   "perm.drives": "Читает свободное место на дисках",
   "perm.processes": "Читает список запущенных приложений",
   "perm.network": "Читает сетевую активность",
+  "perm.info": "Читает имя компьютера, версию Windows и время работы",
   "perm.net": "Подключается к {host}",
   "perm.used_by": "Используется: {widgets}",
 

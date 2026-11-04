@@ -1216,6 +1216,7 @@ fn permission_rows(pack: &StorePack) -> Vec<PermissionRow> {
                 "battery" => "\u{E83F}",
                 "drives" => "\u{EDA2}",
                 "network" => "\u{E839}",
+                "info" => "\u{E770}",
                 _ => "\u{E9D9}",
             };
             let key = format!("perm.{metric}");
@@ -1606,7 +1607,7 @@ pub fn run(instance: Option<String>, page: Option<String>) -> Result<(), String>
             }
             Err(e) => ui.set_status(s(tf(
                 "status.could_not_install",
-                &[("error", &e.to_string())],
+                &[("error", &i18n::package_error(&e))],
             ))),
         }
         refresh(&ui, st);

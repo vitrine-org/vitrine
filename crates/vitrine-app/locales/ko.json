@@ -31,6 +31,7 @@
   "status.place_hint": "갤러리에서 바탕 화면으로 위젯을 끌어 놓으세요",
   "status.installed": "{name} {version} 설치됨",
   "status.could_not_install": "설치할 수 없습니다: {error}",
+  "status.needs_engine": "{name}에는 Vitrine {required} 이상이 필요합니다(현재 {running}).",
   "status.uninstalled": "패키지가 제거됨",
   "status.could_not_uninstall": "제거할 수 없습니다: {error}",
   "status.settings_reset": "설정이 초기화됨",
@@ -85,6 +86,7 @@
   "perm.drives": "드라이브 여유 공간을 읽습니다",
   "perm.processes": "실행 중인 앱 목록을 읽습니다",
   "perm.network": "네트워크 활동을 읽습니다",
+  "perm.info": "컴퓨터 이름, Windows 버전, 가동 시간을 읽습니다",
   "perm.net": "{host}에 연결합니다",
   "perm.used_by": "사용 위젯: {widgets}",
 

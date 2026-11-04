@@ -175,6 +175,21 @@ pub fn tn(key: &str, n: u64) -> String {
     fill(form.to_string(), &[("n", &n.to_string())])
 }
 
+/// The text of a package error, localised where the user can act on it.
+pub fn package_error(e: &vitrine_widgets::Error) -> String {
+    match e {
+        vitrine_widgets::Error::EngineTooOld {
+            name,
+            required,
+            running,
+        } => tf(
+            "status.needs_engine",
+            &[("name", name), ("required", required), ("running", running)],
+        ),
+        e => e.to_string(),
+    }
+}
+
 /// Number of plural forms a language's `|`-separated values have.
 #[cfg(test)]
 pub fn plural_forms(lang: &str) -> usize {
@@ -362,6 +377,23 @@ mod tests {
         assert_eq!(plural_index("ja", 7), 0);
         assert_eq!(tn("row.widgets", 1), "1 widget");
         assert_eq!(tn("row.widgets", 3), "3 widgets");
+    }
+
+    #[test]
+    fn package_errors() {
+        let e = vitrine_widgets::Error::EngineTooOld {
+            name: "Pack".into(),
+            required: "9.0.0".into(),
+            running: "2.0.0".into(),
+        };
+        let text = package_error(&e);
+        assert!(
+            text.contains("Pack") && text.contains("9.0.0") && text.contains("2.0.0"),
+            "{text}"
+        );
+        assert!(!text.contains('{'), "{text}");
+        let other = vitrine_widgets::Error::NotFound("x".into());
+        assert_eq!(package_error(&other), other.to_string());
     }
 
     #[test]

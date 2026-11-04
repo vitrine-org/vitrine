@@ -14,6 +14,12 @@ pub enum Error {
     Schema(String),
     #[error("unsafe or invalid archive: {0}")]
     Archive(String),
+    #[error("{name} needs Vitrine {required} or later (this is {running})")]
+    EngineTooOld {
+        name: String,
+        required: String,
+        running: String,
+    },
     #[error("not found: {0}")]
     NotFound(String),
 }

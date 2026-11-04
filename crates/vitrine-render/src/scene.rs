@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::anim::{Animations, parse_transitions};
+use crate::anim::{Animations, parse_transitions, transform_css, transform_pair};
 use crate::value::PropValue;
 
 pub type NodeId = u32;
@@ -204,6 +204,7 @@ impl Scene {
 
     fn animated(&self, id: NodeId, key: &str, declared: &PropValue, now: f64) -> PropValue {
         match self.anims.value(id, key, now) {
+            Some(v) if key.ends_with(":transform") => PropValue::String(transform_css(&v)),
             Some(v) if v.len() == 1 && !matches!(declared, PropValue::List(_)) => {
                 PropValue::Number(v[0] as f64)
             }
@@ -317,15 +318,26 @@ impl Scene {
                     .find(|(k, _)| k == "transition")
                     .map(|(_, v)| parse_transitions(&v.to_string()))
                     .unwrap_or_default();
+                // A node's first style is not a change, so it doesn't transition.
+                let styled = !self.nodes[&id].style.is_empty();
                 for spec in &specs {
                     for (k, v) in &new_style {
                         if spec.prop == *k || spec.prop == "all" {
-                            let from = self
-                                .style_value(id, k, now)
-                                .map(|p| p.as_numbers())
-                                .unwrap_or_default();
-                            self.anims
-                                .start(id, format!("s:{k}"), from, v.as_numbers(), spec, now);
+                            let old = self.style_value(id, k, now);
+                            let (from, to) = if k == "transform" {
+                                if !styled {
+                                    continue;
+                                }
+                                // A missing transform is `none`.
+                                let old = old.map(|p| p.to_string()).unwrap_or_default();
+                                transform_pair(&old, &v.to_string())
+                            } else {
+                                (
+                                    old.map(|p| p.as_numbers()).unwrap_or_default(),
+                                    v.as_numbers(),
+                                )
+                            };
+                            self.anims.start(id, format!("s:{k}"), from, to, spec, now);
                         }
                     }
                 }
@@ -347,19 +359,21 @@ impl Scene {
                     .iter()
                     .find(|s| s.prop == name || s.prop == "all")
                 {
-                    let from = self
-                        .attr_value(id, &name, now)
-                        .map(|p| p.as_numbers())
-                        .unwrap_or_default();
+                    let old = self.attr_value(id, &name, now);
+                    let (from, to) = if name == "transform" {
+                        match old {
+                            Some(old) => transform_pair(&old.to_string(), &value.to_string()),
+                            None => (Vec::new(), Vec::new()),
+                        }
+                    } else {
+                        (
+                            old.map(|p| p.as_numbers()).unwrap_or_default(),
+                            value.as_numbers(),
+                        )
+                    };
                     let spec = spec.clone();
-                    self.anims.start(
-                        id,
-                        format!("a:{name}"),
-                        from,
-                        value.as_numbers(),
-                        &spec,
-                        now,
-                    );
+                    self.anims
+                        .start(id, format!("a:{name}"), from, to, &spec, now);
                 }
                 let node = self.nodes.get_mut(&id).unwrap();
                 let layout_attr = matches!(name.as_str(), "src" | "width" | "height" | "viewBox")
@@ -457,6 +471,69 @@ mod tests {
         s.apply(Op::Destroy { id: 2 }, 0.0);
         assert!(s.node(2).is_none());
         assert_eq!(s.node(3).unwrap().parent, None);
+    }
+
+    #[test]
+    fn transform_transitions() {
+        let mut s = Scene::new();
+        create(&mut s, 1, "view");
+        let style = |scale: f64| {
+            PropValue::Map(vec![
+                (
+                    "transform".into(),
+                    PropValue::String(format!("scale({scale})")),
+                ),
+                ("transition".into(), "transform 200ms linear".into()),
+            ])
+        };
+        let set = |s: &mut Scene, v: PropValue, now: f64| {
+            s.apply(
+                Op::SetProp {
+                    id: 1,
+                    name: "style".into(),
+                    value: v,
+                },
+                now,
+            )
+        };
+        let matrix = |s: &Scene, now: f64| {
+            crate::style::parse_transform(&s.style_value(1, "transform", now).unwrap().to_string())
+        };
+        // The first style is applied at once.
+        set(&mut s, style(0.6), 0.0);
+        assert!(!s.animating(0.0));
+        // A change animates, component-wise.
+        set(&mut s, style(1.0), 1000.0);
+        assert!(s.animating(1100.0));
+        let m = matrix(&s, 1100.0);
+        assert!(
+            (m.0[0] - 0.8).abs() < 1e-4 && (m.0[3] - 0.8).abs() < 1e-4,
+            "{m:?}"
+        );
+        assert!(!s.anims.affects_layout(1100.0));
+        assert!(matrix(&s, 1300.0).is_identity());
+        // Retargeting starts from the current value.
+        set(&mut s, style(0.6), 2000.0);
+        set(&mut s, style(1.0), 2100.0);
+        let m = matrix(&s, 2200.0);
+        assert!((m.0[0] - 0.9).abs() < 1e-4, "{m:?}");
+        // SVG attributes too.
+        create(&mut s, 2, "rect");
+        let attr = |s: &mut Scene, name: &str, v: &str, now: f64| {
+            s.apply(
+                Op::SetProp {
+                    id: 2,
+                    name: name.into(),
+                    value: v.into(),
+                },
+                now,
+            )
+        };
+        attr(&mut s, "transition", "transform 100ms linear", 0.0);
+        attr(&mut s, "transform", "rotate(0 5 5)", 0.0);
+        attr(&mut s, "transform", "rotate(90 5 5)", 0.0);
+        let v = s.attr_value(2, "transform", 50.0).unwrap().to_string();
+        assert_eq!(v, "rotate(45 5 5)");
     }
 
     #[test]

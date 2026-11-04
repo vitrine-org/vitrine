@@ -31,6 +31,7 @@
   "status.place_hint": "Faites glisser le widget de la galerie vers votre Bureau",
   "status.installed": "Installé : {name} {version}",
   "status.could_not_install": "Impossible d'installer : {error}",
+  "status.needs_engine": "{name} nécessite Vitrine {required} ou une version ultérieure ; version actuelle : {running}.",
   "status.uninstalled": "Package désinstallé",
   "status.could_not_uninstall": "Impossible de désinstaller : {error}",
   "status.settings_reset": "Paramètres réinitialisés",
@@ -85,6 +86,7 @@
   "perm.drives": "Lit l'espace libre de vos disques",
   "perm.processes": "Lit la liste des applications ouvertes",
   "perm.network": "Lit l'activité réseau",
+  "perm.info": "Lit le nom de l'ordinateur, la version de Windows et la durée de fonctionnement",
   "perm.net": "Se connecte à {host}",
   "perm.used_by": "Utilisé par {widgets}",
 

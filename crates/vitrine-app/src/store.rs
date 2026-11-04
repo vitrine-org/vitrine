@@ -126,7 +126,7 @@ impl StorePack {
     pub fn supported(&self) -> bool {
         self.min_engine
             .as_deref()
-            .is_none_or(|m| compare_versions(env!("CARGO_PKG_VERSION"), m) != Ordering::Less)
+            .is_none_or(|m| compare_versions(ENGINE_VERSION, m) != Ordering::Less)
     }
 }
 
@@ -147,54 +147,8 @@ pub fn parse_catalogue(text: &str) -> Result<Catalogue, String> {
 
 // ── versions ──────────────────────────────────────────────────────────
 
-type Version<'a> = ([u64; 3], Vec<&'a str>);
-
-/// `MAJOR.MINOR.PATCH[-pre][+build]`, with an optional leading `v`.
-fn parse_version(v: &str) -> Option<Version<'_>> {
-    let v = v.trim().trim_start_matches('v');
-    let v = v.split('+').next()?;
-    let (core, pre) = match v.split_once('-') {
-        Some((c, p)) => (c, p.split('.').collect()),
-        None => (v, Vec::new()),
-    };
-    let mut nums = [0u64; 3];
-    let mut parts = core.split('.');
-    for n in &mut nums {
-        *n = parts.next()?.parse().ok()?;
-    }
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((nums, pre))
-}
-
-/// Semantic-version order; unparsable versions sort first.
-pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let (Some((an, ap)), Some((bn, bp))) = (parse_version(a), parse_version(b)) else {
-        return parse_version(a).is_some().cmp(&parse_version(b).is_some());
-    };
-    an.cmp(&bn)
-        .then_with(|| match (ap.is_empty(), bp.is_empty()) {
-            (true, true) => Ordering::Equal,
-            // A pre-release comes before its release.
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => {
-                for (x, y) in ap.iter().zip(&bp) {
-                    let o = match (x.parse::<u64>(), y.parse::<u64>()) {
-                        (Ok(x), Ok(y)) => x.cmp(&y),
-                        (Ok(_), Err(_)) => Ordering::Less,
-                        (Err(_), Ok(_)) => Ordering::Greater,
-                        (Err(_), Err(_)) => x.cmp(y),
-                    };
-                    if o != Ordering::Equal {
-                        return o;
-                    }
-                }
-                ap.len().cmp(&bp.len())
-            }
-        })
-}
+pub use vitrine_widgets::manifest::compare_versions;
+use vitrine_widgets::manifest::{ENGINE_VERSION, parse_version};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackState {
@@ -415,7 +369,8 @@ pub fn install_bytes(
     let mut f = std::fs::File::create(&file).map_err(|e| e.to_string())?;
     f.write_all(bytes).map_err(|e| e.to_string())?;
     drop(f);
-    let result = vitrine_widgets::package::install(&file, packages_dir).map_err(|e| e.to_string());
+    let result = vitrine_widgets::package::install(&file, packages_dir)
+        .map_err(|e| crate::i18n::package_error(&e));
     let _ = std::fs::remove_file(&file);
     let installed = result?;
     if installed.manifest.id != pack.id {

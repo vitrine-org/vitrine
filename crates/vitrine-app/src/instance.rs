@@ -57,7 +57,8 @@ fn host_of(url: &str) -> Option<String> {
     Some(host.split(':').next()?.to_ascii_lowercase())
 }
 
-/// Whether a `net:<pattern>` permission allows `host` (`*.example.com` matches subdomains).
+/// Whether a `net:<pattern>` permission allows the URL's host: `*.example.com`
+/// matches any subdomain of `example.com`, but not `example.com` itself.
 pub fn net_allowed(perms: &[Permission], url: &str) -> bool {
     let Some(host) = host_of(url) else {
         return false;
@@ -66,12 +67,22 @@ pub fn net_allowed(perms: &[Permission], url: &str) -> bool {
         Permission::Net(pattern) => {
             let pattern = pattern.to_ascii_lowercase();
             match pattern.strip_prefix("*.") {
-                Some(suffix) => host == suffix || host.ends_with(&format!(".{suffix}")),
+                Some(suffix) => host.ends_with(&format!(".{suffix}")),
                 None => host == pattern,
             }
         }
         _ => false,
     })
+}
+
+/// Whether the permissions grant a metric (`system` needs `system.info`).
+pub fn allows_metric(perms: &[Permission], metric: &str) -> bool {
+    let Some(needed) = vitrine_widgets::manifest::metric_permission(metric) else {
+        return false;
+    };
+    perms
+        .iter()
+        .any(|p| matches!(p, Permission::System(s) if s == needed))
 }
 
 impl WidgetInstance {
@@ -146,10 +157,7 @@ impl WidgetInstance {
     }
 
     fn allows_metric(&self, m: &str) -> bool {
-        self.widget
-            .permissions
-            .iter()
-            .any(|p| matches!(p, Permission::System(s) if s == m))
+        allows_metric(&self.widget.permissions, m)
     }
 
     /// Applies script output to the renderer and returns effects for the app.
@@ -261,6 +269,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metric_permissions() {
+        let p = vec![
+            Permission::System("cpu".into()),
+            Permission::System("info".into()),
+        ];
+        assert!(allows_metric(&p, "cpu"));
+        assert!(allows_metric(&p, "system"));
+        assert!(!allows_metric(&p, "info"), "`info` is not a metric");
+        assert!(!allows_metric(&p, "memory"));
+        assert!(!allows_metric(
+            &[Permission::System("cpu".into())],
+            "system"
+        ));
+    }
+
+    #[test]
     fn net_permissions() {
         let p = vec![
             Permission::Net("api.open-meteo.com".into()),
@@ -271,7 +295,15 @@ mod tests {
             "https://api.open-meteo.com/v1/forecast?x=1"
         ));
         assert!(net_allowed(&p, "https://a.b.example.com/x"));
-        assert!(net_allowed(&p, "https://example.com"));
+        assert!(
+            !net_allowed(&p, "https://example.com"),
+            "bare domain needs its own entry"
+        );
+        assert!(!net_allowed(&p, "https://badexample.com/"));
+        assert!(net_allowed(&p, "https://API.Example.com/"));
+        assert!(!net_allowed(&p, "https://sub.api.open-meteo.com/"));
+        let both = [p.clone(), vec![Permission::Net("example.com".into())]].concat();
+        assert!(net_allowed(&both, "https://example.com"));
         assert!(!net_allowed(&p, "https://evil.com/?api.open-meteo.com"));
         assert!(!net_allowed(&p, "https://api.open-meteo.com.evil.com/"));
         assert!(!net_allowed(&p, "ftp://api.open-meteo.com/"));

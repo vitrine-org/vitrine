@@ -31,6 +31,7 @@
   "status.place_hint": "Ziehen Sie das Widget aus dem Katalog auf Ihren Desktop",
   "status.installed": "{name} {version} installiert",
   "status.could_not_install": "Installation nicht möglich: {error}",
+  "status.needs_engine": "{name} erfordert Vitrine {required} oder neuer; installiert ist {running}.",
   "status.uninstalled": "Paket deinstalliert",
   "status.could_not_uninstall": "Deinstallation nicht möglich: {error}",
   "status.settings_reset": "Einstellungen zurückgesetzt",
@@ -85,6 +86,7 @@
   "perm.drives": "Liest den freien Speicherplatz Ihrer Laufwerke",
   "perm.processes": "Liest die Liste laufender Apps",
   "perm.network": "Liest die Netzwerkaktivität",
+  "perm.info": "Liest Computername, Windows-Version und Betriebszeit",
   "perm.net": "Verbindet sich mit {host}",
   "perm.used_by": "Verwendet von {widgets}",
 

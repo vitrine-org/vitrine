@@ -31,6 +31,7 @@
   "status.place_hint": "Drag the widget from the gallery onto your desktop",
   "status.installed": "Installed {name} {version}",
   "status.could_not_install": "Couldn't install: {error}",
+  "status.needs_engine": "{name} needs Vitrine {required} or later; this is {running}.",
   "status.uninstalled": "Package uninstalled",
   "status.could_not_uninstall": "Couldn't uninstall: {error}",
   "status.settings_reset": "Settings reset",
@@ -85,6 +86,7 @@
   "perm.drives": "Reads free space on your drives",
   "perm.processes": "Reads the list of running apps",
   "perm.network": "Reads network activity",
+  "perm.info": "Reads the computer name, Windows version and uptime",
   "perm.net": "Connects to {host}",
   "perm.used_by": "Used by {widgets}",
 

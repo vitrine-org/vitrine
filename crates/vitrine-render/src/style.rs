@@ -461,10 +461,59 @@ impl Transform2D {
     }
 }
 
+/// One function of a transform list, normalised to its primitive
+/// (`translateX(4px)` is `Translate(4, 0)`, as CSS interpolates them).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformFn {
+    Translate(f32, f32),
+    Scale(f32, f32),
+    /// Degrees, then the SVG rotation centre.
+    Rotate(f32, f32, f32),
+    Matrix(Transform2D),
+}
+
+impl TransformFn {
+    pub fn matrix(&self) -> Transform2D {
+        match *self {
+            TransformFn::Translate(x, y) => Transform2D::translate(x, y),
+            TransformFn::Scale(x, y) => Transform2D::scale(x, y),
+            TransformFn::Rotate(deg, cx, cy) if cx == 0.0 && cy == 0.0 => {
+                Transform2D::rotate_deg(deg)
+            }
+            TransformFn::Rotate(deg, cx, cy) => Transform2D::translate(-cx, -cy)
+                .then(Transform2D::rotate_deg(deg))
+                .then(Transform2D::translate(cx, cy)),
+            TransformFn::Matrix(m) => m,
+        }
+    }
+
+    /// The identity function of the same primitive.
+    pub fn identity(&self) -> TransformFn {
+        match *self {
+            TransformFn::Translate(..) => TransformFn::Translate(0.0, 0.0),
+            TransformFn::Scale(..) => TransformFn::Scale(1.0, 1.0),
+            TransformFn::Rotate(_, cx, cy) => TransformFn::Rotate(0.0, cx, cy),
+            TransformFn::Matrix(_) => TransformFn::Matrix(Transform2D::IDENTITY),
+        }
+    }
+}
+
+/// The matrix of a transform list (CSS/SVG semantics: the rightmost function
+/// is applied to the element first).
+pub fn compose_transform(list: &[TransformFn]) -> Transform2D {
+    list.iter()
+        .fold(Transform2D::IDENTITY, |t, f| f.matrix().then(t))
+}
+
 /// Parses CSS / SVG transform lists: `rotate(45deg) scale(1.2) translate(4px, 2px)`,
 /// SVG `rotate(150 44 44)` and `matrix(a b c d e f)`. Functions apply left to right.
 pub fn parse_transform(s: &str) -> Transform2D {
-    let mut t = Transform2D::IDENTITY;
+    compose_transform(&parse_transform_list(s))
+}
+
+/// The functions of a transform list; unknown or malformed ones are dropped.
+pub fn parse_transform_list(s: &str) -> Vec<TransformFn> {
+    let mut out = Vec::new();
     let mut rest = s.trim();
     while let Some(open) = rest.find('(') {
         let name = rest[..open].trim().trim_start_matches(',').trim();
@@ -480,30 +529,29 @@ pub fn parse_transform(s: &str) -> Transform2D {
             })
             .collect();
         let arg = |i: usize, d: f32| args.get(i).copied().unwrap_or(d);
-        let m = match name {
-            "translate" => Transform2D::translate(arg(0, 0.0), arg(1, 0.0)),
-            "translateX" => Transform2D::translate(arg(0, 0.0), 0.0),
-            "translateY" => Transform2D::translate(0.0, arg(0, 0.0)),
-            "scale" => Transform2D::scale(arg(0, 1.0), arg(1, arg(0, 1.0))),
-            "scaleX" => Transform2D::scale(arg(0, 1.0), 1.0),
-            "scaleY" => Transform2D::scale(1.0, arg(0, 1.0)),
+        let f = match name {
+            "translate" => TransformFn::Translate(arg(0, 0.0), arg(1, 0.0)),
+            "translateX" => TransformFn::Translate(arg(0, 0.0), 0.0),
+            "translateY" => TransformFn::Translate(0.0, arg(0, 0.0)),
+            "scale" => TransformFn::Scale(arg(0, 1.0), arg(1, arg(0, 1.0))),
+            "scaleX" => TransformFn::Scale(arg(0, 1.0), 1.0),
+            "scaleY" => TransformFn::Scale(1.0, arg(0, 1.0)),
             "rotate" if args.len() >= 3 => {
-                let (cx, cy) = (arg(1, 0.0), arg(2, 0.0));
-                Transform2D::translate(-cx, -cy)
-                    .then(Transform2D::rotate_deg(arg(0, 0.0)))
-                    .then(Transform2D::translate(cx, cy))
+                TransformFn::Rotate(arg(0, 0.0), arg(1, 0.0), arg(2, 0.0))
             }
-            "rotate" => Transform2D::rotate_deg(arg(0, 0.0)),
-            "matrix" if args.len() == 6 => {
-                Transform2D([args[0], args[1], args[2], args[3], args[4], args[5]])
+            "rotate" => TransformFn::Rotate(arg(0, 0.0), 0.0, 0.0),
+            "matrix" if args.len() == 6 => TransformFn::Matrix(Transform2D([
+                args[0], args[1], args[2], args[3], args[4], args[5],
+            ])),
+            _ => {
+                rest = &rest[open + close + 1..];
+                continue;
             }
-            _ => Transform2D::IDENTITY,
         };
-        // CSS/SVG semantics: the rightmost function is applied to the element first.
-        t = m.then(t);
+        out.push(f);
         rest = &rest[open + close + 1..];
     }
-    t
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]

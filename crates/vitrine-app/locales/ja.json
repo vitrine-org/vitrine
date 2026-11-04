@@ -31,6 +31,7 @@
   "status.place_hint": "ギャラリーからデスクトップにウィジェットをドラッグしてください",
   "status.installed": "{name} {version} をインストールしました",
   "status.could_not_install": "インストールできませんでした: {error}",
+  "status.needs_engine": "{name} には Vitrine {required} 以降が必要です（現在は {running}）。",
   "status.uninstalled": "パッケージをアンインストールしました",
   "status.could_not_uninstall": "アンインストールできませんでした: {error}",
   "status.settings_reset": "設定をリセットしました",
@@ -85,6 +86,7 @@
   "perm.drives": "ドライブの空き容量を読み取ります",
   "perm.processes": "実行中のアプリの一覧を読み取ります",
   "perm.network": "ネットワークの利用状況を読み取ります",
+  "perm.info": "コンピューター名、Windows のバージョン、稼働時間を読み取ります",
   "perm.net": "{host} に接続します",
   "perm.used_by": "使用するウィジェット: {widgets}",
 

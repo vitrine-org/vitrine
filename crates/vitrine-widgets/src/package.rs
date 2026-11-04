@@ -9,7 +9,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::manifest::{
-    MANIFEST_FILE, PackageManifest, WidgetManifest, is_safe_relative_path, is_valid_package_id,
+    ENGINE_VERSION, MANIFEST_FILE, PackageManifest, WidgetManifest, is_safe_relative_path,
+    is_valid_package_id,
 };
 use crate::settings::SettingsSchema;
 use crate::{Error, Result};
@@ -169,6 +170,7 @@ pub fn install(archive: &Path, packages_dir: &Path) -> Result<InstalledPackage> 
 
     extract(archive, &tmp.0)?;
     let manifest = load_and_verify(&tmp.0)?;
+    manifest.check_engine(ENGINE_VERSION)?;
 
     let target = packages_dir.join(&manifest.id);
     if target.exists() {
@@ -206,6 +208,7 @@ pub fn uninstall(id: &str, packages_dir: &Path) -> Result<()> {
 /// Opens an unpacked package folder (e.g. a `dist/` folder during development).
 pub fn open_dir(dir: &Path) -> Result<InstalledPackage> {
     let manifest = load_and_verify(dir)?;
+    manifest.check_engine(ENGINE_VERSION)?;
     Ok(InstalledPackage {
         manifest,
         dir: dir.to_path_buf(),
@@ -223,7 +226,7 @@ pub fn scan(packages_dir: &Path) -> Vec<InstalledPackage> {
         if name.starts_with('.') || !dir.is_dir() {
             continue;
         }
-        match load_and_verify(&dir) {
+        match load_and_verify(&dir).and_then(|m| m.check_engine(ENGINE_VERSION).map(|()| m)) {
             Ok(m) if m.id == name => out.push(InstalledPackage { manifest: m, dir }),
             Ok(m) => log::warn!("skipping package dir `{name}`: manifest id is `{}`", m.id),
             Err(e) => log::warn!("skipping package dir `{name}`: {e}"),
@@ -411,6 +414,30 @@ mod tests {
         assert!(scan(&sb.pkgs()).is_empty());
         uninstall("dev.vitrine.t", &sb.pkgs()).unwrap();
         assert!(uninstall("../x", &sb.pkgs()).is_err());
+    }
+
+    #[test]
+    fn refuses_newer_engine() {
+        let sb = Sandbox::new("engine");
+        let mut files = base_files("dev.vitrine.t", "1.0.0");
+        files[0].1 = manifest_json("dev.vitrine.t", "1.0.0")
+            .replacen('{', r#"{"minEngine":"99.0.0","#, 1)
+            .into_bytes();
+        let z = sb.zip("new.vitrine", &files);
+        let err = install(&z, &sb.pkgs()).unwrap_err();
+        assert!(matches!(err, Error::EngineTooOld { .. }), "{err}");
+        assert!(!sb.pkgs().join("dev.vitrine.t").exists());
+        assert!(leftovers(&sb.pkgs()).is_empty());
+
+        // Already on disk (e.g. after a downgrade): not loaded.
+        let dir = sb.pkgs().join("dev.vitrine.t");
+        for (name, data) in &files {
+            let p = dir.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, data).unwrap();
+        }
+        assert!(scan(&sb.pkgs()).is_empty());
+        assert!(matches!(open_dir(&dir), Err(Error::EngineTooOld { .. })));
     }
 
     fn rejects(tag: &str, mutate: impl FnOnce(&mut Vec<(String, Vec<u8>)>)) {

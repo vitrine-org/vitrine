@@ -108,7 +108,7 @@ fn install(path: &str) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", i18n::package_error(&e));
             1
         }
     }

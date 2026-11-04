@@ -31,6 +31,7 @@
   "status.place_hint": "将小组件从库中拖到桌面上",
   "status.installed": "已安装 {name} {version}",
   "status.could_not_install": "无法安装：{error}",
+  "status.needs_engine": "{name} 需要 Vitrine {required} 或更高版本（当前为 {running}）。",
   "status.uninstalled": "已卸载包",
   "status.could_not_uninstall": "无法卸载：{error}",
   "status.settings_reset": "已重置设置",
@@ -85,6 +86,7 @@
   "perm.drives": "读取驱动器的可用空间",
   "perm.processes": "读取正在运行的应用列表",
   "perm.network": "读取网络活动",
+  "perm.info": "读取计算机名称、Windows 版本和运行时间",
   "perm.net": "连接到 {host}",
   "perm.used_by": "使用者：{widgets}",
 
