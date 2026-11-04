@@ -57,6 +57,28 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const TIMER_REATTACH: usize = 1;
 const TIMER_POWER: usize = 2;
 const TIMER_RELAYOUT: usize = 3;
+const TIMER_DEV: usize = 4;
+
+/// `vitrine --dev <dir>`: an unpacked package loaded on top of the installed
+/// ones and restarted whenever its files change.
+pub static DEV_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Latest modification time of any file under `dir`.
+fn tree_stamp(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut latest = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).ok()?.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(e.path());
+            } else if let Ok(t) = meta.modified() {
+                latest = latest.max(Some(t));
+            }
+        }
+    }
+    latest
+}
 
 const WTS_SESSION_LOCK: u32 = 0x7;
 const WTS_SESSION_UNLOCK: u32 = 0x8;
@@ -140,6 +162,7 @@ pub struct Runtime {
     user_paused: bool,
     edit: Option<EditMode>,
     quit: bool,
+    dev_stamp: Option<std::time::SystemTime>,
 }
 
 fn storage_path(instance: &str) -> PathBuf {
@@ -204,6 +227,7 @@ impl Runtime {
             user_paused: false,
             edit: None,
             quit: false,
+            dev_stamp: DEV_DIR.get().and_then(|d| tree_stamp(d)),
         })
     }
 
@@ -307,6 +331,15 @@ impl Runtime {
     /// Re-reads packages and layout from disk and reconciles running widgets.
     fn reload(&mut self) {
         self.packages = package::scan(&paths::packages_dir());
+        if let Some(dir) = DEV_DIR.get() {
+            match package::open_dir(dir) {
+                Ok(dev) => {
+                    self.packages.retain(|p| p.manifest.id != dev.manifest.id);
+                    self.packages.push(dev);
+                }
+                Err(e) => log::error!("dev package {}: {e}", dir.display()),
+            }
+        }
         let first_run = !paths::layout_path().exists();
         self.layout = Layout::load(&paths::layout_path()).unwrap_or_else(|e| {
             log::error!("layout.json: {e}; starting empty");
@@ -317,6 +350,7 @@ impl Runtime {
             self.save_layout();
         }
         self.config = Config::load(&paths::config_path()).unwrap_or_default();
+        self.place_dev_widgets();
 
         let wanted: Vec<Instance> = self.layout.instances.clone();
         // Drop widgets that disappeared, whose package changed, or failed to load.
@@ -355,6 +389,75 @@ impl Runtime {
         }
         self.relayout();
         self.update_plan();
+    }
+
+    /// Dev mode: every widget of the dev package gets an instance if it has none.
+    fn place_dev_widgets(&mut self) {
+        let Some(dir) = DEV_DIR.get() else { return };
+        let Some(dev) = self.packages.iter().find(|p| p.dir == *dir).cloned() else {
+            return;
+        };
+        let Some(g) = self.primary_geometry() else {
+            return;
+        };
+        let mut changed = false;
+        for w in &dev.manifest.widgets {
+            if self
+                .layout
+                .instances
+                .iter()
+                .any(|i| i.package == dev.manifest.id && i.widget == w.id)
+            {
+                continue;
+            }
+            let (cw, ch) = (w.size.default[0] as i32, w.size.default[1] as i32);
+            if let Some((x, y)) = self
+                .layout
+                .find_free_spot("primary", g.cols, g.rows, cw, ch)
+            {
+                self.layout.instances.push(Instance {
+                    id: vitrine_widgets::layout::new_instance_id(),
+                    package: dev.manifest.id.clone(),
+                    widget: w.id.clone(),
+                    monitor: "primary".into(),
+                    x,
+                    y,
+                    w: cw,
+                    h: ch,
+                    settings: Map::new(),
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_layout();
+        }
+    }
+
+    /// Dev mode: restarts the dev package's widgets when its files change.
+    fn check_dev(&mut self, last: &mut Option<std::time::SystemTime>) {
+        let Some(dir) = DEV_DIR.get() else { return };
+        let stamp = tree_stamp(dir);
+        if stamp == *last {
+            return;
+        }
+        let first = last.is_none();
+        *last = stamp;
+        if first {
+            return;
+        }
+        log::info!("dev package changed: reloading");
+        let dev_id = package::open_dir(dir).map(|p| p.manifest.id).ok();
+        let mut i = 0;
+        while i < self.widgets.len() {
+            if Some(&self.widgets[i].entry.package) == dev_id.as_ref() {
+                let mut live = self.widgets.remove(i);
+                Self::destroy_window(&mut live);
+            } else {
+                i += 1;
+            }
+        }
+        self.reload();
     }
 
     fn settings_for(pkg: Option<&InstalledPackage>, entry: &Instance) -> String {
@@ -681,6 +784,11 @@ impl Runtime {
                 self.relayout();
             }
             HostMsg::Timer(TIMER_POWER) => self.check_power(),
+            HostMsg::Timer(TIMER_DEV) => {
+                let mut last = self.dev_stamp;
+                self.check_dev(&mut last);
+                self.dev_stamp = last;
+            }
             HostMsg::Timer(_) => {}
             HostMsg::TaskbarCreated => {
                 log::info!("Explorer restarted: re-attaching");
@@ -1343,6 +1451,9 @@ pub fn run() -> Result<(), String> {
         rt.check_power();
         register_hotkey(host, &rt.config.edit_hotkey);
         SetTimer(Some(host), TIMER_POWER, 5000, None);
+        if DEV_DIR.get().is_some() {
+            SetTimer(Some(host), TIMER_DEV, 700, None);
+        }
         RUNTIME.with_borrow_mut(|r| *r = Some(rt));
 
         let mut msg = MSG::default();

@@ -174,6 +174,39 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("--dev") => {
+            attach_console();
+            logger::init_stderr();
+            let Some(dir) = args.get(1).map(PathBuf::from) else {
+                eprintln!("{}", usage());
+                std::process::exit(2);
+            };
+            let dir = dir
+                .canonicalize()
+                .map(|p| {
+                    // Drop the verbatim prefix so paths match the ones Windows reports.
+                    let s = p.to_string_lossy();
+                    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+                })
+                .unwrap_or(dir);
+            if let Err(e) = vitrine_widgets::package::open_dir(&dir) {
+                eprintln!("error: {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+            if !single_instance() {
+                eprintln!("Vitrine is already running: quit it first (vitrine --quit)");
+                std::process::exit(1);
+            }
+            let _ = runtime::DEV_DIR.set(dir.clone());
+            println!(
+                "dev mode: {} (Ctrl+C or `vitrine --quit` to stop)",
+                dir.display()
+            );
+            if let Err(e) = runtime::run() {
+                eprintln!("fatal: {e}");
+                std::process::exit(1);
+            }
+        }
         None | Some("--background") => {
             logger::init_file();
             if !single_instance() {
