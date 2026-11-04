@@ -4985,7 +4985,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vitrine-app"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "embed-resource",
  "log",
@@ -5007,7 +5007,7 @@ dependencies = [
 
 [[package]]
 name = "vitrine-desktop"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "embed-manifest",
  "log",
@@ -5016,7 +5016,7 @@ dependencies = [
 
 [[package]]
 name = "vitrine-render"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "base64",
  "log",
@@ -5028,7 +5028,7 @@ dependencies = [
 
 [[package]]
 name = "vitrine-script"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "log",
  "rquickjs",
@@ -5039,7 +5039,7 @@ dependencies = [
 
 [[package]]
 name = "vitrine-system"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "log",
  "serde_json",
@@ -5049,7 +5049,7 @@ dependencies = [
 
 [[package]]
 name = "vitrine-widgets"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "log",
  "regex",
