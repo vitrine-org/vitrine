@@ -15,7 +15,9 @@ mod peek;
 mod power;
 mod prompt;
 mod runtime;
+mod search;
 mod shellapi;
+mod store;
 
 use std::path::PathBuf;
 
@@ -26,6 +28,7 @@ USAGE:
   vitrine                         run Vitrine (tray icon, widgets on the desktop)
   vitrine --dev <package-dir>     run and live-reload an unpacked widget package
   vitrine --panel                 open the control panel
+  vitrine --panel --page <name>   ...on gallery, packages, store or general
   vitrine --edit | --quit         toggle edit mode / quit the running instance
   vitrine install <file.vitrine>  install a widget package
   vitrine render <package> <widget> [--cells WxH | --size WxH] [--scale S]
@@ -56,13 +59,22 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 /// Opens the control panel (a separate process), optionally on one widget instance.
 pub fn open_panel(instance: Option<&str>) {
+    spawn_panel(instance.map(|id| ["--instance", id]));
+}
+
+/// Opens the control panel on a page (`store`, `gallery`, ...).
+pub fn open_panel_page(page: &str) {
+    spawn_panel(Some(["--page", page]));
+}
+
+fn spawn_panel(args: Option<[&str; 2]>) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--panel");
-    if let Some(id) = instance {
-        cmd.args(["--instance", id]);
+    if let Some(a) = args {
+        cmd.args(a);
     }
     if let Err(e) = cmd.spawn() {
         log::error!("cannot open the control panel: {e}");
@@ -113,6 +125,7 @@ enum Cmd {
     Send(u32),
     Panel {
         instance: Option<String>,
+        page: Option<String>,
     },
     /// `--prompt <options json> [--at x,y]`: the text prompt shown for a widget.
     Prompt {
@@ -179,6 +192,7 @@ fn parse_args(args: &[String]) -> Cmd {
         Some("--quit") => Cmd::Send(runtime::Runtime::CMD_QUIT),
         Some("--panel") => Cmd::Panel {
             instance: flag(args, "--instance").map(str::to_string),
+            page: flag(args, "--page").map(str::to_string),
         },
         Some("--prompt") => Cmd::Prompt {
             options: args.get(1).cloned().unwrap_or_else(|| "{}".into()),
@@ -240,9 +254,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::Panel { instance } => {
+        Cmd::Panel { instance, page } => {
             logger::init_file();
-            if let Err(e) = panel::run(instance) {
+            if let Err(e) = panel::run(instance, page) {
                 log::error!("control panel: {e}");
                 std::process::exit(1);
             }
@@ -347,7 +361,20 @@ mod tests {
 
     #[test]
     fn panel() {
-        assert_eq!(parse(&["--panel"]), Cmd::Panel { instance: None });
+        assert_eq!(
+            parse(&["--panel"]),
+            Cmd::Panel {
+                instance: None,
+                page: None
+            }
+        );
+        assert_eq!(
+            parse(&["--panel", "--page", "store"]),
+            Cmd::Panel {
+                instance: None,
+                page: Some("store".into())
+            }
+        );
         assert_eq!(
             parse(&["--prompt", "{\"title\":\"x\"}", "--at", "5,6"]),
             Cmd::Prompt {
@@ -365,13 +392,17 @@ mod tests {
         assert_eq!(
             parse(&["--panel", "--instance", "a1b2"]),
             Cmd::Panel {
-                instance: Some("a1b2".into())
+                instance: Some("a1b2".into()),
+                page: None
             }
         );
         // `--instance` without a value.
         assert_eq!(
             parse(&["--panel", "--instance"]),
-            Cmd::Panel { instance: None }
+            Cmd::Panel {
+                instance: None,
+                page: None
+            }
         );
     }
 

@@ -214,6 +214,8 @@ pub struct Runtime {
     edit: Option<EditMode>,
     /// Edit mode fading out, dropped at the deadline.
     edit_closing: Option<(EditMode, Instant)>,
+    /// The gallery's last package tab (a package id), kept for the session.
+    gallery_tab: Option<String>,
     /// Windows minimized for edit mode, restored when it ends.
     peek: Option<crate::peek::Peek>,
     /// Removed widgets fading out.
@@ -289,6 +291,7 @@ impl Runtime {
             user_paused: false,
             edit: None,
             edit_closing: None,
+            gallery_tab: None,
             peek: None,
             dying: Vec::new(),
             quit: false,
@@ -1101,7 +1104,9 @@ impl Runtime {
                 return;
             }
         };
-        self.edit = None;
+        if let Some(edit) = self.edit.take() {
+            self.gallery_tab = edit.tab();
+        }
         self.edit_closing = None;
         if let Some(peek) = self.peek.take() {
             peek.restore();
@@ -1254,7 +1259,7 @@ impl Runtime {
                 let _ = self.config.save(&paths::config_path());
             }
             MenuCommand::Folder => shellapi::open(&paths::data_dir().to_string_lossy()),
-            MenuCommand::Site => shellapi::open(SITE_URL),
+            MenuCommand::Site => crate::open_panel_page("store"),
             MenuCommand::Gallery => self.open_gallery(),
             MenuCommand::Panel => crate::open_panel(instance.as_deref()),
             MenuCommand::Remove => {
@@ -1439,8 +1444,10 @@ impl Runtime {
                     .iter()
                     .map(move |w| crate::edit::GalleryItem {
                         package: p.manifest.id.clone(),
+                        pack_name: p.manifest.name.clone(),
                         widget: w.id.clone(),
                         name: w.name.clone(),
+                        description: w.description.clone(),
                         size: (w.size.default[0] as i32, w.size.default[1] as i32),
                         dir: p.dir.clone(),
                         preview: w.preview.clone(),
@@ -1451,6 +1458,7 @@ impl Runtime {
 
     fn toggle_edit(&mut self) {
         if let Some(mut edit) = self.edit.take() {
+            self.gallery_tab = edit.tab();
             edit.begin_close(&self.gpu);
             self.edit_closing = Some((edit, Instant::now() + Duration::from_millis(200)));
             if let Some(peek) = self.peek.take() {
@@ -1472,7 +1480,8 @@ impl Runtime {
                 })
                 .collect();
             self.peek = Some(crate::peek::Peek::show_desktop());
-            match EditMode::open(&self.gpu, self.hinst, geometries, self.gallery()) {
+            let tab = self.gallery_tab.clone();
+            match EditMode::open(&self.gpu, self.hinst, geometries, self.gallery(), tab) {
                 Ok(e) => self.edit = Some(e),
                 Err(e) => {
                     log::error!("edit mode: {e}");
@@ -1527,8 +1536,6 @@ impl Runtime {
 }
 
 // ── pure helpers (menus, commands, pause) ────────────────────────────
-
-const SITE_URL: &str = "https://vitrine-org.github.io/";
 
 /// Errors after which the graphics devices must be recreated.
 fn is_device_lost(e: &windows::core::Error) -> bool {

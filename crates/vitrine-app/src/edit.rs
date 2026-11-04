@@ -2,7 +2,8 @@
 //! shows the grid. Widgets follow the pointer while dragged and settle into
 //! their cell with an animation; the corner handle resizes them live; hover
 //! controls remove a widget or open its settings; the gallery sheet lets you
-//! drag new widgets onto the desktop.
+//! search and filter the installed widgets by package and drag new ones onto
+//! the desktop.
 //!
 //! [`EditMode`] owns the overlay and the interaction state. It never touches
 //! the layout itself: it turns pointer input into [`Action`]s for the runtime.
@@ -16,7 +17,8 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_END,
+    VK_ESCAPE, VK_HOME, VK_LEFT, VK_RIGHT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, Interface, PCWSTR, Result, w};
@@ -48,9 +50,14 @@ pub struct Item {
 /// A widget that can be added from the gallery.
 #[derive(Clone, Debug)]
 pub struct GalleryItem {
+    /// Package id.
     pub package: String,
+    /// Localized package name (the gallery tabs, and searched).
+    pub pack_name: String,
     pub widget: String,
+    /// Localized widget name and description (both searched).
     pub name: String,
+    pub description: String,
     pub size: (i32, i32),
     pub dir: std::path::PathBuf,
     pub preview: Option<String>,
@@ -64,6 +71,111 @@ pub enum Input {
     RightUp(POINT),
     Wheel(i16),
     Escape,
+    /// A typed character (control characters are filtered out by the window).
+    Char(char),
+    /// Any other key press: virtual-key code, with Ctrl held or not.
+    Key {
+        vk: u16,
+        ctrl: bool,
+    },
+}
+
+/// A single-line text being edited: the text and the caret, a byte index that
+/// always sits on a char boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextField {
+    pub text: String,
+    pub caret: usize,
+}
+
+impl TextField {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.caret = 0;
+    }
+
+    pub fn insert(&mut self, s: &str) {
+        self.text.insert_str(self.caret, s);
+        self.caret += s.len();
+    }
+
+    fn prev(&self) -> usize {
+        self.text[..self.caret]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn next(&self) -> usize {
+        self.text[self.caret..]
+            .chars()
+            .next()
+            .map_or(self.caret, |c| self.caret + c.len_utf8())
+    }
+
+    /// Start of the word before the caret, skipping the blanks right before it.
+    fn word_start(&self) -> usize {
+        let before = self.text[..self.caret].trim_end();
+        before
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8())
+    }
+
+    /// End of the word after the caret, skipping the blanks right after it.
+    fn word_end(&self) -> usize {
+        let after = &self.text[self.caret..];
+        let skip = after.len() - after.trim_start().len();
+        let rest = &after[skip..];
+        self.caret + skip + rest.find(char::is_whitespace).unwrap_or(rest.len())
+    }
+
+    fn remove(&mut self, from: usize, to: usize) -> bool {
+        if from == to {
+            return false;
+        }
+        self.text.replace_range(from..to, "");
+        self.caret = from;
+        true
+    }
+
+    /// Deletes the character before the caret; true when the text changed.
+    pub fn backspace(&mut self) -> bool {
+        self.remove(self.prev(), self.caret)
+    }
+
+    /// Ctrl+Backspace: deletes the word before the caret.
+    pub fn backspace_word(&mut self) -> bool {
+        self.remove(self.word_start(), self.caret)
+    }
+
+    /// Deletes the character after the caret.
+    pub fn delete(&mut self) -> bool {
+        let (at, next) = (self.caret, self.next());
+        self.text.replace_range(at..next, "");
+        at != next
+    }
+
+    pub fn left(&mut self, word: bool) {
+        self.caret = if word { self.word_start() } else { self.prev() };
+    }
+
+    pub fn right(&mut self, word: bool) {
+        self.caret = if word { self.word_end() } else { self.next() };
+    }
+
+    pub fn home(&mut self) {
+        self.caret = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.caret = self.text.len();
+    }
 }
 
 /// What the runtime should do in response to input.
@@ -110,8 +222,14 @@ enum Hot {
     Handle(String),
     Add,
     Done,
+    /// A gallery card, by gallery index.
     Card(usize),
     Sheet,
+    /// The search field, and its clear button.
+    Search,
+    Clear,
+    /// A package tab: 0 is "All", then the packages in gallery order.
+    Tab(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -156,13 +274,55 @@ struct Fonts {
     button: IDWriteTextFormat,
     caption: IDWriteTextFormat,
     icon: IDWriteTextFormat,
+    /// Package tabs.
+    chip: IDWriteTextFormat,
+    /// Search field text (left-aligned, never trimmed).
+    field: IDWriteTextFormat,
+    /// Clear button glyph, and the empty-state glyph.
+    icon_small: IDWriteTextFormat,
+    icon_large: IDWriteTextFormat,
 }
+
+/// Where the gallery sheet's parts are, in screen pixels.
+#[derive(Clone, Debug, Default)]
+struct SheetLayout {
+    sheet: RECT,
+    field: RECT,
+    clear: RECT,
+    /// The visible tab strip (empty when there is a single package).
+    strip: RECT,
+    /// Tabs, scrolled.
+    tabs: Vec<RECT>,
+    /// The row the cards scroll in.
+    area: RECT,
+    /// Cards by gallery index, at their animated positions.
+    cards: Vec<RECT>,
+}
+
+/// Caret blink half-period, as in Windows' default.
+const BLINK_MS: u32 = 530;
 
 pub struct EditMode {
     overlays: Vec<Overlay>,
     /// One per overlay (kept apart so painting can borrow the rest immutably).
     visuals: Vec<WindowVisual>,
     gallery: Vec<GalleryItem>,
+    /// Packages in gallery order: (id, localized name).
+    packs: Vec<(String, String)>,
+    /// Selected package tab (None: all).
+    tab: Option<String>,
+    tab_scroll: f32,
+    search: TextField,
+    /// Blink phase starts here (reset by every edit so the caret shows while typing).
+    caret_epoch: Instant,
+    caret_on: bool,
+    /// By gallery index: passes the search and the tab.
+    matched: Vec<bool>,
+    /// By gallery index: animated x in the card row (unscrolled) and visibility 0..1.
+    card_x: Vec<f32>,
+    card_v: Vec<f32>,
+    /// Animated left and right edges of the selected-tab pill, in strip coordinates.
+    pill: (f32, f32),
     previews: HashMap<usize, Option<ID2D1Bitmap>>,
     images: ImageCache,
     dwrite: IDWriteFactory5,
@@ -271,11 +431,25 @@ impl Fonts {
             Ok::<_, windows::core::Error>(f)
         };
         let text = w!("Segoe UI Variable Text");
+        let icons = icon_family(dwrite);
+        let field = make(text, 14.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        unsafe {
+            let none = DWRITE_TRIMMING {
+                granularity: DWRITE_TRIMMING_GRANULARITY_NONE,
+                delimiter: 0,
+                delimiterCount: 0,
+            };
+            field.SetTrimming(&none, None)?;
+        }
         Ok(Fonts {
             label: make(text, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?,
             button: make(text, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?,
             caption: make(text, 13.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
-            icon: make(icon_family(dwrite), 14.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
+            icon: make(icons, 14.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
+            chip: make(text, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?,
+            field,
+            icon_small: make(icons, 10.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
+            icon_large: make(icons, 28.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
         })
     }
 }
@@ -286,6 +460,7 @@ impl EditMode {
         hinst: HINSTANCE,
         monitors: Vec<(String, Geometry, RECT)>,
         gallery: Vec<GalleryItem>,
+        tab: Option<String>,
     ) -> Result<EditMode> {
         let mut overlays = Vec::new();
         let mut visuals = Vec::new();
@@ -325,13 +500,50 @@ impl EditMode {
                 let _ = SetFocus(Some(o.hwnd));
             }
         }
-        Ok(EditMode {
+        Ok(EditMode::new(
             overlays,
             visuals,
             gallery,
+            tab,
+            ImageCache::new(gpu.wic.clone()),
+            gpu.dwrite.clone(),
+        ))
+    }
+
+    fn new(
+        overlays: Vec<Overlay>,
+        visuals: Vec<WindowVisual>,
+        gallery: Vec<GalleryItem>,
+        tab: Option<String>,
+        images: ImageCache,
+        dwrite: IDWriteFactory5,
+    ) -> EditMode {
+        let mut packs: Vec<(String, String)> = Vec::new();
+        for g in &gallery {
+            if !packs.iter().any(|(id, _)| *id == g.package) {
+                packs.push((g.package.clone(), g.pack_name.clone()));
+            }
+        }
+        // A package that is gone (or a single one, which has no tabs) means "All".
+        let tab = tab.filter(|t| packs.len() > 1 && packs.iter().any(|(id, _)| id == t));
+        let n = gallery.len();
+        let mut edit = EditMode {
+            overlays,
+            visuals,
+            gallery,
+            packs,
+            tab,
+            tab_scroll: 0.0,
+            search: TextField::default(),
+            caret_epoch: Instant::now(),
+            caret_on: true,
+            matched: vec![true; n],
+            card_x: vec![0.0; n],
+            card_v: vec![1.0; n],
+            pill: (0.0, 0.0),
             previews: HashMap::new(),
-            images: ImageCache::new(gpu.wic.clone()),
-            dwrite: gpu.dwrite.clone(),
+            images,
+            dwrite,
             hot: Hot::None,
             pressed: Hot::None,
             drag: None,
@@ -342,7 +554,16 @@ impl EditMode {
             last_frame: Instant::now(),
             dirty: true,
             closing: false,
-        })
+        };
+        edit.refilter();
+        edit.reveal_tab();
+        edit.snap();
+        edit
+    }
+
+    /// The selected package tab, for the runtime to remember across sessions of edit mode.
+    pub fn tab(&self) -> Option<String> {
+        self.tab.clone()
     }
 
     /// Fades the overlays out; the runtime drops the edit mode shortly after.
@@ -353,9 +574,211 @@ impl EditMode {
         }
     }
 
+    /// Shows the gallery with a fresh search (the package tab is kept).
     pub fn open_gallery(&mut self) {
-        self.gallery_open = true;
+        if !self.gallery_open {
+            self.gallery_open = true;
+            self.search.clear();
+            self.refilter();
+            self.caret_epoch = Instant::now();
+        }
         self.dirty = true;
+    }
+
+    // ── search and package tabs ───────────────────────────────────────
+
+    /// Recomputes which cards pass the search and the tab; the row scrolls
+    /// back to the start, and the cards reflow from where they are on screen.
+    fn refilter(&mut self) {
+        let tab = self.tab.as_deref();
+        let query = self.search.text.as_str();
+        let matched: Vec<bool> = self
+            .gallery
+            .iter()
+            .map(|g| {
+                tab.is_none_or(|t| t == g.package)
+                    && crate::search::matches(query, &[&g.name, &g.description, &g.pack_name])
+            })
+            .collect();
+        if matched == self.matched {
+            return;
+        }
+        self.matched = matched;
+        let scrolled = std::mem::take(&mut self.scroll);
+        for x in &mut self.card_x {
+            *x -= scrolled;
+        }
+        if !self.gallery_open && self.a("sheet") < 0.001 {
+            self.snap();
+        }
+        self.dirty = true;
+    }
+
+    /// Settles every sheet transition at its target (used while the sheet is hidden).
+    fn snap(&mut self) {
+        for (i, x) in self.card_targets().into_iter().enumerate() {
+            if let Some(x) = x {
+                self.card_x[i] = x;
+            }
+            self.card_v[i] = if self.matched[i] { 1.0 } else { 0.0 };
+        }
+        self.pill = self.pill_target();
+    }
+
+    /// Target x of each matched card in the row (unscrolled); None for the others.
+    fn card_targets(&self) -> Vec<Option<f32>> {
+        let s = self.scale();
+        let pitch = (176.0 * s).round() + (12.0 * s).round();
+        let mut rank = 0.0;
+        self.matched
+            .iter()
+            .map(|&m| {
+                m.then(|| {
+                    rank += 1.0;
+                    (rank - 1.0) * pitch
+                })
+            })
+            .collect()
+    }
+
+    fn tab_label(&self, i: usize) -> String {
+        match i {
+            0 => t("edit.all_packs"),
+            i => self.packs[i - 1].1.clone(),
+        }
+    }
+
+    fn tab_index(&self) -> usize {
+        self.tab
+            .as_ref()
+            .and_then(|t| self.packs.iter().position(|(id, _)| id == t))
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Tab extents in the strip (unscrolled pixels); empty with a single package.
+    fn tab_spans(&self) -> Vec<(i32, i32)> {
+        let Some(o) = self.primary() else {
+            return Vec::new();
+        };
+        if self.packs.len() < 2 {
+            return Vec::new();
+        }
+        let px = |v: f32| (v * o.geo.scale).round() as i32;
+        let mut x = 0;
+        (0..=self.packs.len())
+            .map(|i| {
+                let label = self.text_width(&self.tab_label(i), &o.text.chip).ceil() as i32;
+                let w = (label + px(28.0)).max(px(56.0));
+                let span = (x, x + w);
+                x += w + px(4.0);
+                span
+            })
+            .collect()
+    }
+
+    fn pill_target(&self) -> (f32, f32) {
+        self.tab_spans()
+            .get(self.tab_index())
+            .map_or((0.0, 0.0), |&(l, r)| (l as f32, r as f32))
+    }
+
+    fn tab_scroll_max(&self, spans: &[(i32, i32)]) -> f32 {
+        let l = self.sheet_layout();
+        let total = spans.last().map_or(0, |s| s.1);
+        (total - (l.strip.right - l.strip.left)).max(0) as f32
+    }
+
+    /// Scrolls the tab strip so the selected tab is in view.
+    fn reveal_tab(&mut self) {
+        let spans = self.tab_spans();
+        let Some(&(l, r)) = spans.get(self.tab_index()) else {
+            return;
+        };
+        let lay = self.sheet_layout();
+        let width = (lay.strip.right - lay.strip.left) as f32;
+        let margin = 24.0 * self.scale();
+        if (l as f32) < self.tab_scroll + margin {
+            self.tab_scroll = l as f32 - margin;
+        } else if r as f32 > self.tab_scroll + width - margin {
+            self.tab_scroll = r as f32 - width + margin;
+        }
+        self.tab_scroll = self.tab_scroll.clamp(0.0, self.tab_scroll_max(&spans));
+    }
+
+    fn select_tab(&mut self, i: usize) {
+        self.tab = match i {
+            0 => None,
+            i => self.packs.get(i - 1).map(|(id, _)| id.clone()),
+        };
+        self.refilter();
+        self.reveal_tab();
+    }
+
+    /// Applies a key to the search field. True when the text changed.
+    fn edit_search(&mut self, vk: u16, ctrl: bool) -> bool {
+        let f = &mut self.search;
+        let changed = match vk {
+            v if v == VK_BACK.0 && ctrl => f.backspace_word(),
+            v if v == VK_BACK.0 => f.backspace(),
+            v if v == VK_DELETE.0 => f.delete(),
+            v if v == VK_LEFT.0 => {
+                f.left(ctrl);
+                false
+            }
+            v if v == VK_RIGHT.0 => {
+                f.right(ctrl);
+                false
+            }
+            v if v == VK_HOME.0 => {
+                f.home();
+                false
+            }
+            v if v == VK_END.0 => {
+                f.end();
+                false
+            }
+            _ => return false,
+        };
+        self.caret_epoch = Instant::now();
+        changed
+    }
+
+    fn clear_search(&mut self) {
+        self.search.clear();
+        self.caret_epoch = Instant::now();
+        self.refilter();
+    }
+
+    /// Search text bounds and horizontal scroll: `(left, right, offset)` in screen
+    /// pixels. The text scrolls left once the caret would leave the field.
+    fn field_text(&self, l: &SheetLayout) -> (f32, f32, f32) {
+        let s = self.scale();
+        let left = l.field.left as f32 + 34.0 * s;
+        let right = l.clear.left as f32 - 2.0 * s;
+        let caret = match self.primary() {
+            Some(o) => self.text_width(&self.search.text[..self.search.caret], &o.text.field),
+            None => 0.0,
+        };
+        (left, right, (caret - (right - left) + 2.0 * s).max(0.0))
+    }
+
+    /// The char boundary nearest to screen x `x` in the search field.
+    fn caret_at(&self, x: i32) -> usize {
+        let Some(o) = self.primary() else {
+            return 0;
+        };
+        let (left, _, off) = self.field_text(&self.sheet_layout());
+        let want = x as f32 - left + off;
+        let text = &self.search.text;
+        text.char_indices()
+            .map(|(i, _)| i)
+            .chain([text.len()])
+            .min_by(|&a, &b| {
+                let da = (self.text_width(&text[..a], &o.text.field) - want).abs();
+                let db = (self.text_width(&text[..b], &o.text.field) - want).abs();
+                da.total_cmp(&db)
+            })
+            .unwrap_or(0)
     }
 
     fn primary(&self) -> Option<&Overlay> {
@@ -421,19 +844,40 @@ impl EditMode {
         ease(*self.anim.get("sheet").unwrap_or(&0.0))
     }
 
-    /// Gallery sheet and its cards (slides up from the bottom of the primary monitor).
+    /// Gallery sheet and its cards by gallery index (slides up from the bottom
+    /// of the primary monitor).
     fn sheet(&self) -> (RECT, Vec<RECT>) {
+        let l = self.sheet_layout();
+        (l.sheet, l.cards)
+    }
+
+    /// The sheet: a header with the title and the search field, the package
+    /// tabs, then the row of cards. Its width depends on the whole gallery, not
+    /// on the search results, so it holds still while filtering.
+    fn sheet_layout(&self) -> SheetLayout {
         let Some(o) = self.primary() else {
             return Default::default();
         };
         let s = o.geo.scale;
         let px = |v: f32| (v * s).round() as i32;
-        let (card_w, card_h, gap, pad, head) = (px(176.0), px(150.0), px(12.0), px(16.0), px(28.0));
+        let (card_w, card_h, gap, pad) = (px(176.0), px(150.0), px(12.0), px(16.0));
+        let (field_h, tab_h) = (px(32.0), px(28.0));
+        let spans = self.tab_spans();
         let n = self.gallery.len().max(1) as i32;
         let content = n * card_w + (n - 1) * gap + 2 * pad;
+        let title_w = self
+            .text_width(&t("edit.gallery_title"), &o.text.label)
+            .ceil() as i32;
+        let header = 2 * pad + title_w + px(24.0) + px(280.0);
+        let tabs = spans.last().map_or(0, |s| s.1 + 2 * pad);
         let max_w = (o.rect.right - o.rect.left) - px(48.0);
-        let width = content.min(max_w);
-        let height = pad + head + card_h + pad;
+        let width = content.max(header).max(tabs).min(max_w);
+        let tabs_row = if spans.is_empty() {
+            0
+        } else {
+            px(10.0) + tab_h
+        };
+        let height = pad + field_h + tabs_row + px(14.0) + card_h + pad;
         let hidden = height + px(40.0);
         let slide = ((1.0 - self.sheet_t()) * hidden as f32).round() as i32;
         let left = (o.rect.left + o.rect.right) / 2 - width / 2;
@@ -446,19 +890,68 @@ impl EditMode {
             right: left + width,
             bottom,
         };
+        let field_w = px(280.0)
+            .min(width - 2 * pad - title_w - px(16.0))
+            .max(px(120.0));
+        let field = RECT {
+            left: sheet.right - pad - field_w,
+            top: sheet.top + pad,
+            right: sheet.right - pad,
+            bottom: sheet.top + pad + field_h,
+        };
+        let b = field_h - px(8.0);
+        let clear = RECT {
+            left: field.right - px(4.0) - b,
+            top: field.top + px(4.0),
+            right: field.right - px(4.0),
+            bottom: field.top + px(4.0) + b,
+        };
+        let strip = RECT {
+            left: sheet.left + pad,
+            top: field.bottom + px(10.0),
+            right: sheet.right - pad,
+            bottom: field.bottom + tabs_row,
+        };
+        let tab_scroll = self.tab_scroll.round() as i32;
+        let tabs = spans
+            .iter()
+            .map(|&(l, r)| RECT {
+                left: strip.left + l - tab_scroll,
+                top: strip.top,
+                right: strip.left + r - tab_scroll,
+                bottom: strip.bottom,
+            })
+            .collect();
+        let top = field.bottom + tabs_row + px(14.0);
+        let area = RECT {
+            left: sheet.left + pad,
+            top,
+            right: sheet.right - pad,
+            bottom: top + card_h,
+        };
         let scroll = self.scroll.round() as i32;
-        let cards = (0..self.gallery.len() as i32)
-            .map(|i| {
-                let x = sheet.left + pad + i * (card_w + gap) - scroll;
+        let cards = self
+            .card_x
+            .iter()
+            .map(|&x| {
+                let x = area.left + x.round() as i32 - scroll;
                 RECT {
                     left: x,
-                    top: sheet.top + pad + head,
+                    top: area.top,
                     right: x + card_w,
-                    bottom: sheet.top + pad + head + card_h,
+                    bottom: area.bottom,
                 }
             })
             .collect();
-        (sheet, cards)
+        SheetLayout {
+            sheet,
+            field,
+            clear,
+            strip,
+            tabs,
+            area,
+            cards,
+        }
     }
 
     fn frame_px(&self, item: &Item) -> Option<RECT> {
@@ -516,6 +1009,9 @@ impl EditMode {
     }
 
     fn text_width(&self, text: &str, format: &IDWriteTextFormat) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
         let wide: Vec<u16> = text.encode_utf16().collect();
         unsafe {
             if let Ok(layout) = self.dwrite.CreateTextLayout(&wide, format, 4096.0, 256.0) {
@@ -540,11 +1036,27 @@ impl EditMode {
             return Hot::None;
         }
         if self.gallery_open {
-            let (sheet, cards) = self.sheet();
-            if contains(&sheet, pt) {
-                return cards
+            let l = self.sheet_layout();
+            if contains(&l.sheet, pt) {
+                if !self.search.is_empty() && contains(&l.clear, pt) {
+                    return Hot::Clear;
+                }
+                if contains(&l.field, pt) {
+                    return Hot::Search;
+                }
+                if contains(&l.strip, pt) {
+                    return l
+                        .tabs
+                        .iter()
+                        .position(|r| contains(r, pt))
+                        .map(Hot::Tab)
+                        .unwrap_or(Hot::Sheet);
+                }
+                return l
+                    .cards
                     .iter()
-                    .position(|c| contains(c, pt))
+                    .enumerate()
+                    .position(|(i, c)| self.matched[i] && contains(c, pt))
                     .map(Hot::Card)
                     .unwrap_or(Hot::Sheet);
             }
@@ -593,31 +1105,54 @@ impl EditMode {
         let mut actions = Vec::new();
         match input {
             Input::Escape => {
-                if self.gallery_open {
+                if self.gallery_open && !self.search.is_empty() {
+                    self.clear_search();
+                } else if self.gallery_open {
                     self.gallery_open = false;
                 } else {
                     actions.push(Action::Close);
                 }
             }
+            Input::Char(c) => {
+                // While the sheet is open, typing goes to the search field.
+                if self.gallery_open && !c.is_control() {
+                    self.search.insert(c.encode_utf8(&mut [0; 4]));
+                    self.caret_epoch = Instant::now();
+                    self.refilter();
+                }
+            }
+            Input::Key { vk, ctrl } => {
+                if ctrl && vk == u16::from(b'F') {
+                    self.open_gallery();
+                } else if self.gallery_open && self.edit_search(vk, ctrl) {
+                    self.refilter();
+                }
+            }
             Input::Wheel(delta) => {
-                if self.gallery_open
-                    && matches!(self.hit(items, self.pointer), Hot::Card(_) | Hot::Sheet)
-                {
-                    let (sheet, cards) = self.sheet();
+                let l = self.sheet_layout();
+                if self.gallery_open && contains(&l.sheet, self.pointer) {
                     let s = self.scale();
-                    let content = match (cards.first(), cards.last()) {
-                        (Some(a), Some(b)) => b.right - a.left,
-                        _ => 0,
-                    };
-                    let max =
-                        (content - (sheet.right - sheet.left) + (32.0 * s) as i32).max(0) as f32;
-                    self.scroll = (self.scroll - delta as f32 / 120.0 * 96.0 * s).clamp(0.0, max);
+                    let step = delta as f32 / 120.0 * 96.0 * s;
+                    if contains(&l.strip, self.pointer) {
+                        let max = self.tab_scroll_max(&self.tab_spans());
+                        self.tab_scroll = (self.tab_scroll - step / 2.0).clamp(0.0, max);
+                    } else {
+                        let n = self.matched.iter().filter(|&&m| m).count() as i32;
+                        let (card_w, gap) = ((176.0 * s).round() as i32, (12.0 * s).round() as i32);
+                        let content = (n * (card_w + gap) - gap).max(0);
+                        let max = (content - (l.area.right - l.area.left)).max(0) as f32;
+                        self.scroll = (self.scroll - step).clamp(0.0, max);
+                    }
                 }
             }
             Input::Down(pt) => {
                 self.pointer = pt;
                 let hot = self.hit(items, pt);
                 self.pressed = hot.clone();
+                if hot == Hot::Search {
+                    self.search.caret = self.caret_at(pt.x);
+                    self.caret_epoch = Instant::now();
+                }
                 let found = |id: &str| {
                     items
                         .iter()
@@ -677,9 +1212,14 @@ impl EditMode {
                     let cursor = match &hot {
                         Hot::Handle(_) => IDC_SIZENWSE,
                         Hot::Frame(_) => IDC_SIZEALL,
-                        Hot::Add | Hot::Done | Hot::Remove(_) | Hot::Settings(_) | Hot::Card(_) => {
-                            IDC_HAND
-                        }
+                        Hot::Search => IDC_IBEAM,
+                        Hot::Add
+                        | Hot::Done
+                        | Hot::Remove(_)
+                        | Hot::Settings(_)
+                        | Hot::Card(_)
+                        | Hot::Clear
+                        | Hot::Tab(_) => IDC_HAND,
                         _ => IDC_ARROW,
                     };
                     unsafe {
@@ -711,7 +1251,10 @@ impl EditMode {
                 if pressed == released_on {
                     match pressed {
                         Hot::Done => actions.push(Action::Close),
-                        Hot::Add => self.gallery_open = !self.gallery_open,
+                        Hot::Add if self.gallery_open => self.gallery_open = false,
+                        Hot::Add => self.open_gallery(),
+                        Hot::Clear => self.clear_search(),
+                        Hot::Tab(i) => self.select_tab(i),
                         Hot::Remove(id) => actions.push(Action::Remove { id }),
                         Hot::Settings(id) => actions.push(Action::Settings { id }),
                         _ => {}
@@ -888,8 +1431,18 @@ impl EditMode {
             Hot::Card(i) => {
                 wanted.insert(format!("card:{i}"), 1.0);
             }
+            Hot::Tab(i) => {
+                wanted.insert(format!("tab:{i}"), 1.0);
+            }
             _ => {}
         }
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        let open = self.gallery_open;
+        wanted.insert("focus".into(), flag(open));
+        wanted.insert("clear".into(), flag(!self.search.is_empty()));
+        wanted.insert("hot:search".into(), flag(self.hot == Hot::Search));
+        wanted.insert("hot:clear".into(), flag(self.hot == Hot::Clear));
+        wanted.insert("empty".into(), flag(open && !self.matched.contains(&true)));
         let mut moving = false;
         let rate = 1.0 - (-dt * 16.0).exp();
         for (k, target) in wanted {
@@ -897,8 +1450,9 @@ impl EditMode {
             let next = *v + (target - *v) * rate;
             if (next - target).abs() < 0.004 {
                 *v = target;
-                let transient =
-                    k.starts_with("frame:") || k.starts_with("card:") || k.starts_with("btn:");
+                let transient = ["frame:", "card:", "btn:", "tab:"]
+                    .iter()
+                    .any(|p| k.starts_with(p));
                 if target == 0.0 && transient {
                     self.anim.remove(&k);
                 }
@@ -907,6 +1461,47 @@ impl EditMode {
                 moving = true;
             }
         }
+        moving |= self.step_sheet(dt, rate);
+        moving
+    }
+
+    /// Card reflow and the tab pill. Positions are in pixels, so they settle
+    /// within half a pixel rather than the 0..1 threshold.
+    fn step_sheet(&mut self, dt: f32, rate: f32) -> bool {
+        if !self.gallery_open && self.a("sheet") < 0.001 {
+            self.snap();
+            return false;
+        }
+        let approach = |v: &mut f32, target: f32, rate: f32, eps: f32| {
+            let next = *v + (target - *v) * rate;
+            if (next - target).abs() < eps {
+                *v = target;
+                false
+            } else {
+                *v = next;
+                true
+            }
+        };
+        let mut moving = false;
+        for (i, x) in self.card_targets().into_iter().enumerate() {
+            if let Some(x) = x {
+                // A card coming back appears in its new place; the others glide there.
+                if self.card_v[i] < 0.02 {
+                    self.card_x[i] = x;
+                } else {
+                    moving |= approach(&mut self.card_x[i], x, rate, 0.5);
+                }
+            }
+            let v = if self.matched[i] { 1.0 } else { 0.0 };
+            moving |= approach(&mut self.card_v[i], v, rate, 0.004);
+        }
+        // The pill stretches towards the new tab: its leading edge runs ahead.
+        let (tl, tr) = self.pill_target();
+        let (fast, slow) = (1.0 - (-dt * 24.0).exp(), 1.0 - (-dt * 11.0).exp());
+        let right = tr > self.pill.1;
+        let (lr, rr) = if right { (slow, fast) } else { (fast, slow) };
+        moving |= approach(&mut self.pill.0, tl, lr, 0.5);
+        moving |= approach(&mut self.pill.1, tr, rr, 0.5);
         moving
     }
 
@@ -934,8 +1529,19 @@ impl EditMode {
     /// Repaints when needed. Returns how soon the loop should call again.
     pub fn paint(&mut self, gpu: &Gpu, dc: &ID2D1DeviceContext, items: &[Item]) -> u32 {
         let moving = self.step();
+        // The caret blinks while the search field has focus (the sheet is open).
+        let blink = (self.gallery_open && !self.closing).then(|| {
+            let ms = self.caret_epoch.elapsed().as_millis();
+            let on = (ms / BLINK_MS as u128).is_multiple_of(2);
+            if on != self.caret_on {
+                self.caret_on = on;
+                self.dirty = true;
+            }
+            (BLINK_MS - (ms % BLINK_MS as u128) as u32).max(1)
+        });
+        let idle = blink.unwrap_or(u32::MAX);
         if !self.dirty && !moving {
-            return u32::MAX;
+            return idle;
         }
         self.dirty = false;
         let previews: Vec<Option<ID2D1Bitmap>> = (0..self.gallery.len())
@@ -967,7 +1573,7 @@ impl EditMode {
             }
         }
         self.visuals = visuals;
-        if moving { 16 } else { u32::MAX }
+        if moving { 16 } else { idle }
     }
 }
 
@@ -1228,16 +1834,16 @@ impl Painter<'_> {
                 // Gallery sheet.
                 let alpha = e.sheet_t();
                 if alpha > 0.001 {
-                    let (sheet, cards) = e.sheet();
-                    let sr = rf(sheet);
+                    let l = e.sheet_layout();
+                    let sr = rf(l.sheet);
                     shadow(sr, 16.0, 0.14 * alpha);
                     fill(rr(sr, 16.0), color(0x202020, 0.96 * alpha));
                     stroke(rr(sr, 16.0), color(0xFFFFFF, 0.10 * alpha), 1.0);
+                    let fr = rf(l.field);
                     let title = D2D_RECT_F {
                         left: sr.left + 18.0 * s,
-                        top: sr.top + 12.0 * s,
-                        right: sr.right - 18.0 * s,
-                        bottom: sr.top + 40.0 * s,
+                        right: fr.left - 12.0 * s,
+                        ..fr
                     };
                     draw_text(
                         &t("edit.gallery_title"),
@@ -1245,12 +1851,232 @@ impl Painter<'_> {
                         title,
                         color(0xFFFFFF, 0.7 * alpha),
                     );
-                    dc.PushAxisAlignedClip(&sr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+                    // Search field (Fluent text box: subtle fill, accent underline on focus).
+                    let focus = e.a("focus");
+                    let hover = e.a("hot:search").max(e.a("hot:clear"));
+                    let rest = color(0xFFFFFF, 0.06 + 0.025 * hover);
+                    let fill_c = mix(rest, color(0x1E1E1E, 0.70), focus);
+                    fill(
+                        rr(fr, 4.0),
+                        D2D1_COLOR_F {
+                            a: fill_c.a * alpha,
+                            ..fill_c
+                        },
+                    );
+                    stroke(rr(fr, 4.0), color(0xFFFFFF, 0.08 * alpha), 1.0);
+                    brush.SetColor(&color(0xFFFFFF, 0.36 * alpha * (1.0 - focus)));
+                    dc.FillRectangle(
+                        &D2D_RECT_F {
+                            left: fr.left + 3.0 * s,
+                            top: fr.bottom - 1.0 * s,
+                            right: fr.right - 3.0 * s,
+                            bottom: fr.bottom,
+                        },
+                        &brush,
+                    );
+                    // The focus line grows out from the centre.
+                    let mid = (fr.left + fr.right) / 2.0;
+                    let half = ((fr.right - fr.left) / 2.0 - 3.0 * s) * ease(focus);
+                    if half > 0.5 {
+                        fill(
+                            rr(
+                                D2D_RECT_F {
+                                    left: mid - half,
+                                    top: fr.bottom - 2.0 * s,
+                                    right: mid + half,
+                                    bottom: fr.bottom,
+                                },
+                                1.0,
+                            ),
+                            color(ACCENT, alpha),
+                        );
+                    }
+                    draw_text(
+                        "\u{E721}",
+                        &o.text.icon,
+                        D2D_RECT_F {
+                            left: fr.left + 6.0 * s,
+                            right: fr.left + 32.0 * s,
+                            ..fr
+                        },
+                        color(0xFFFFFF, (0.6 + 0.3 * focus) * alpha),
+                    );
+                    let (tl, tr, off) = e.field_text(&l);
+                    let text_r = D2D_RECT_F {
+                        left: tl + dx,
+                        right: tr + dx,
+                        ..fr
+                    };
+                    dc.PushAxisAlignedClip(&text_r, D2D1_ANTIALIAS_MODE_ALIASED);
+                    if e.search.is_empty() {
+                        draw_text(
+                            &t("edit.search_placeholder"),
+                            &o.text.field,
+                            D2D_RECT_F {
+                                right: text_r.left + 4096.0,
+                                ..text_r
+                            },
+                            color(0xFFFFFF, 0.55 * alpha),
+                        );
+                    } else {
+                        draw_text(
+                            &e.search.text,
+                            &o.text.field,
+                            D2D_RECT_F {
+                                left: text_r.left - off,
+                                right: text_r.left - off + 4096.0,
+                                ..text_r
+                            },
+                            color(0xFFFFFF, 0.95 * alpha),
+                        );
+                    }
+                    if e.caret_on && focus > 0.5 && !e.closing {
+                        let before = &e.search.text[..e.search.caret];
+                        let x = (text_r.left - off + e.text_width(before, &o.text.field)).round();
+                        brush.SetColor(&color(0xFFFFFF, 0.95 * alpha));
+                        dc.FillRectangle(
+                            &D2D_RECT_F {
+                                left: x,
+                                top: fr.top + 8.0 * s,
+                                right: x + s.round().max(1.0),
+                                bottom: fr.bottom - 8.0 * s,
+                            },
+                            &brush,
+                        );
+                    }
+                    dc.PopAxisAlignedClip();
+                    let cv = e.a("clear");
+                    if cv > 0.01 {
+                        let c = rf(l.clear);
+                        fill(
+                            rr(c, 4.0),
+                            color(0xFFFFFF, 0.08 * e.a("hot:clear") * cv * alpha),
+                        );
+                        draw_text(
+                            "\u{E711}",
+                            &o.text.icon_small,
+                            c,
+                            color(0xFFFFFF, 0.8 * cv * alpha),
+                        );
+                    }
+
+                    // Package tabs: an accent pill slides (and stretches) between them.
+                    if !l.tabs.is_empty() {
+                        let st = rf(l.strip);
+                        dc.PushAxisAlignedClip(&st, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                        let x0 = st.left - e.tab_scroll.round();
+                        let pill = D2D_RECT_F {
+                            left: x0 + e.pill.0,
+                            right: x0 + e.pill.1,
+                            ..st
+                        };
+                        let radius = (st.bottom - st.top) / 2.0 / s;
+                        for (i, tab) in l.tabs.iter().enumerate() {
+                            let h = e.a(&format!("tab:{i}"));
+                            if h > 0.01 {
+                                fill(rr(rf(*tab), radius), color(0xFFFFFF, 0.07 * h * alpha));
+                            }
+                        }
+                        if pill.right - pill.left > 1.0 {
+                            fill(rr(pill, radius), color(ACCENT, alpha));
+                        }
+                        for (i, tab) in l.tabs.iter().enumerate() {
+                            let r = rf(*tab);
+                            // Text turns dark as the pill covers the tab.
+                            let covered = (pill.right.min(r.right) - pill.left.max(r.left))
+                                .max(0.0)
+                                / (r.right - r.left).max(1.0);
+                            let h = e.a(&format!("tab:{i}"));
+                            let c = mix(
+                                color(0xFFFFFF, (0.75 + 0.2 * h) * alpha),
+                                color(0x000000, 0.9 * alpha),
+                                covered.clamp(0.0, 1.0),
+                            );
+                            draw_text(&e.tab_label(i), &o.text.chip, r, c);
+                        }
+                        // Overflowing strips fade out at the scrolled edges.
+                        let max = e.tab_scroll_max(&e.tab_spans());
+                        for (edge, show) in [
+                            (st.left, e.tab_scroll > 0.5),
+                            (st.right, e.tab_scroll < max - 0.5),
+                        ] {
+                            if !show {
+                                continue;
+                            }
+                            for k in 0..8 {
+                                let w = 3.0 * s;
+                                let x = if edge == st.left {
+                                    edge + k as f32 * w
+                                } else {
+                                    edge - (k + 1) as f32 * w
+                                };
+                                brush.SetColor(&color(
+                                    0x202020,
+                                    0.96 * alpha * (1.0 - k as f32 / 8.0),
+                                ));
+                                dc.FillRectangle(
+                                    &D2D_RECT_F {
+                                        left: x,
+                                        right: x + w,
+                                        ..st
+                                    },
+                                    &brush,
+                                );
+                            }
+                        }
+                        dc.PopAxisAlignedClip();
+                    }
+
+                    // Nothing matches: say so, in the middle of the card row.
+                    let empty = e.a("empty");
+                    if empty > 0.01 {
+                        let ar = rf(l.area);
+                        let rise = (1.0 - empty) * 6.0 * s;
+                        let mid = (ar.top + ar.bottom) / 2.0 + rise;
+                        draw_text(
+                            "\u{E721}",
+                            &o.text.icon_large,
+                            D2D_RECT_F {
+                                top: mid - 44.0 * s,
+                                bottom: mid - 4.0 * s,
+                                ..ar
+                            },
+                            color(0xFFFFFF, 0.35 * empty * alpha),
+                        );
+                        let text = if e.gallery.is_empty() {
+                            t("edit.no_widgets")
+                        } else {
+                            crate::i18n::tf("edit.no_results", &[("query", e.search.text.trim())])
+                        };
+                        draw_text(
+                            &text,
+                            &o.text.caption,
+                            D2D_RECT_F {
+                                top: mid + 2.0 * s,
+                                bottom: mid + 26.0 * s,
+                                ..ar
+                            },
+                            color(0xFFFFFF, 0.7 * empty * alpha),
+                        );
+                    }
+
+                    let clip = D2D_RECT_F {
+                        left: sr.left + 1.0,
+                        top: rf(l.area).top - 8.0 * s,
+                        right: sr.right - 1.0,
+                        bottom: sr.bottom - 1.0,
+                    };
+                    dc.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
                     let new_drag = drag.and_then(|d| match d.kind {
                         DragKind::New { card } => Some(card),
                         _ => None,
                     });
-                    for (i, c) in cards.iter().enumerate() {
+                    for (i, c) in l.cards.iter().enumerate() {
+                        let shown = e.card_v[i];
+                        if shown < 0.002 {
+                            continue;
+                        }
                         let hover = e.a(&format!("card:{i}"));
                         let lift = 3.0 * s * hover;
                         let base = rf(*c);
@@ -1259,11 +2085,26 @@ impl Painter<'_> {
                             bottom: base.bottom - lift,
                             ..base
                         };
+                        // Filtered cards shrink a little as they fade.
+                        let k = 0.92 + 0.08 * shown;
+                        dc.SetTransform(&Matrix3x2::scale_around(
+                            k,
+                            k,
+                            Vector2 {
+                                X: (cr.left + cr.right) / 2.0,
+                                Y: (cr.top + cr.bottom) / 2.0,
+                            },
+                        ));
+                        let alpha = alpha * shown;
                         let faded = if new_drag == Some(i) { 0.4 } else { 1.0 };
                         fill(rr(cr, 10.0), color(0x2B2B2B, alpha * faded));
                         stroke(
                             rr(cr, 10.0),
-                            mix(color(0xFFFFFF, 0.08), color(ACCENT, 0.9), hover),
+                            mix(
+                                color(0xFFFFFF, 0.08 * alpha),
+                                color(ACCENT, 0.9 * alpha),
+                                hover,
+                            ),
                             1.0,
                         );
                         let img = D2D_RECT_F {
@@ -1289,6 +2130,7 @@ impl Painter<'_> {
                             color(0xFFFFFF, 0.92 * alpha * faded),
                         );
                     }
+                    dc.SetTransform(&Matrix3x2::identity());
                     dc.PopAxisAlignedClip();
                 }
             }
@@ -1368,6 +2210,30 @@ fn screen_point(hwnd: HWND, lparam: LPARAM) -> POINT {
     pt
 }
 
+thread_local! {
+    /// The high half of a surrogate pair, waiting for its low half.
+    static HIGH_SURROGATE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// Turns WM_CHAR code units into characters: pairs surrogates (characters
+/// outside the BMP arrive as two messages) and drops control characters.
+fn utf16_char(unit: u16) -> Option<char> {
+    HIGH_SURROGATE.with(|high| {
+        if (0xD800..0xDC00).contains(&unit) {
+            high.set(Some(unit));
+            return None;
+        }
+        let units: Vec<u16> = match high.take() {
+            Some(h) if (0xDC00..0xE000).contains(&unit) => vec![h, unit],
+            _ => vec![unit],
+        };
+        char::decode_utf16(units)
+            .next()
+            .and_then(|r| r.ok())
+            .filter(|c| !c.is_control())
+    })
+}
+
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let push = |i: Input| crate::runtime::push_host(HostMsg::Edit(i));
     match msg {
@@ -1386,6 +2252,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         // Wheel coordinates are already in screen space; the pointer position is tracked.
         WM_MOUSEWHEEL => push(Input::Wheel(((wparam.0 >> 16) & 0xFFFF) as u16 as i16)),
         WM_KEYDOWN if wparam.0 as u16 == VK_ESCAPE.0 => push(Input::Escape),
+        WM_KEYDOWN => {
+            let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            push(Input::Key {
+                vk: wparam.0 as u16,
+                ctrl,
+            });
+        }
+        // IME results arrive here too: WM_IME_* fall through to DefWindowProc,
+        // which turns composed text into WM_CHAR.
+        WM_CHAR => {
+            if let Some(c) = utf16_char(wparam.0 as u16) {
+                push(Input::Char(c));
+            }
+        }
         WM_SETCURSOR => return LRESULT(1), // set on mouse move
         WM_MOUSEACTIVATE => return LRESULT(MA_ACTIVATE as isize),
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -1427,6 +2307,14 @@ mod tests {
 
     /// An edit mode without windows or GPU: overlays have no HWND and no visual.
     fn mode_with(monitors: &[(&str, RECT, f32)], gallery: Vec<GalleryItem>) -> EditMode {
+        mode_full(monitors, gallery, None)
+    }
+
+    fn mode_full(
+        monitors: &[(&str, RECT, f32)],
+        gallery: Vec<GalleryItem>,
+        tab: Option<String>,
+    ) -> EditMode {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         }
@@ -1446,24 +2334,16 @@ mod tests {
                 shown: true,
             })
             .collect();
-        EditMode {
+        let mut m = EditMode::new(
             overlays,
-            visuals: Vec::new(),
+            Vec::new(),
             gallery,
-            previews: HashMap::new(),
-            images: ImageCache::new(wic),
+            tab,
+            ImageCache::new(wic),
             dwrite,
-            hot: Hot::None,
-            pressed: Hot::None,
-            drag: None,
-            pointer: POINT::default(),
-            gallery_open: false,
-            scroll: 0.0,
-            anim: HashMap::new(),
-            last_frame: Instant::now(),
-            dirty: false,
-            closing: false,
-        }
+        );
+        m.dirty = false;
+        m
     }
 
     fn mode() -> EditMode {
@@ -1474,8 +2354,10 @@ mod tests {
         (0..n)
             .map(|i| GalleryItem {
                 package: "dev.pack".into(),
+                pack_name: "Dev".into(),
                 widget: format!("w{i}"),
                 name: format!("Widget {i}"),
+                description: String::new(),
                 size: (2, 2),
                 dir: std::path::PathBuf::new(),
                 preview: None,
@@ -2089,5 +2971,467 @@ mod tests {
         assert!(!m.anim.contains_key("frame:a"));
         assert_eq!(m.a("sheet"), 0.0);
         assert!(!m.step());
+    }
+
+    // ── search field ──
+
+    fn field(text: &str, caret: usize) -> TextField {
+        TextField {
+            text: text.into(),
+            caret,
+        }
+    }
+
+    #[test]
+    fn text_field_inserts_at_the_caret() {
+        let mut f = TextField::default();
+        f.insert("wrd");
+        f.left(false);
+        f.left(false);
+        f.insert("o");
+        assert_eq!(f, field("word", 2));
+        f.end();
+        f.insert(" ×時計");
+        assert_eq!(f.text, "word ×時計");
+        assert_eq!(f.caret, f.text.len());
+        f.home();
+        assert_eq!(f.caret, 0);
+        f.left(false);
+        assert_eq!(f.caret, 0, "stops at the start");
+        f.end();
+        f.right(false);
+        assert_eq!(f.caret, f.text.len(), "stops at the end");
+    }
+
+    #[test]
+    fn text_field_moves_and_deletes_whole_characters() {
+        let mut f = field("aé😀b", 0);
+        f.right(false);
+        f.right(false);
+        assert_eq!(f.caret, 3, "é is two bytes");
+        f.right(false);
+        assert_eq!(f.caret, 7, "the emoji is four");
+        assert!(f.backspace());
+        assert_eq!(f, field("aéb", 3));
+        assert!(f.delete());
+        assert_eq!(f, field("aé", 3));
+        assert!(!f.delete(), "nothing after the caret");
+        f.left(false);
+        assert!(f.backspace());
+        assert_eq!(f, field("é", 0));
+        assert!(!f.backspace(), "nothing before the caret");
+    }
+
+    #[test]
+    fn text_field_word_editing() {
+        let mut f = field("weather  clock now", 18);
+        assert!(f.backspace_word());
+        assert_eq!(f, field("weather  clock ", 15));
+        // Blanks right before the caret go with the word.
+        assert!(f.backspace_word());
+        assert_eq!(f, field("weather  ", 9));
+        f.left(true);
+        assert_eq!(f.caret, 0);
+        f.right(true);
+        assert_eq!(f.caret, 7);
+        f.right(true);
+        assert_eq!(f.caret, 9, "to the end of the text");
+        f.home();
+        assert!(!f.backspace_word());
+        let mut f = field("météo 時計", "météo 時計".len());
+        assert!(f.backspace_word());
+        assert_eq!(f, field("météo ", 8));
+    }
+
+    #[test]
+    fn wm_char_pairs_surrogates_and_drops_control_characters() {
+        assert_eq!(utf16_char(b'a' as u16), Some('a'));
+        assert_eq!(utf16_char(0x00E9), Some('é'));
+        assert_eq!(utf16_char(0xD83D), None);
+        assert_eq!(utf16_char(0xDE00), Some('😀'));
+        // Backspace, Ctrl+Backspace, Esc, Ctrl+F and Enter are control characters.
+        for c in [0x08, 0x7F, 0x1B, 0x06, 0x0D] {
+            assert_eq!(utf16_char(c), None);
+        }
+        // A lone low surrogate is not a character.
+        assert_eq!(utf16_char(0xDE00), None);
+    }
+
+    fn type_text(m: &mut EditMode, text: &str) {
+        for c in text.chars() {
+            m.input(Input::Char(c), &[]);
+        }
+    }
+
+    fn key(m: &mut EditMode, vk: u16, ctrl: bool) -> Vec<Action> {
+        m.input(Input::Key { vk, ctrl }, &[])
+    }
+
+    fn settle(m: &mut EditMode) {
+        for _ in 0..200 {
+            m.last_frame = Instant::now() - std::time::Duration::from_millis(100);
+            m.step();
+        }
+    }
+
+    fn packs_gallery() -> Vec<GalleryItem> {
+        let mk =
+            |package: &str, pack: &str, widget: &str, name: &str, description: &str| GalleryItem {
+                package: package.into(),
+                pack_name: pack.into(),
+                widget: widget.into(),
+                name: name.into(),
+                description: description.into(),
+                size: (2, 2),
+                dir: std::path::PathBuf::new(),
+                preview: None,
+            };
+        vec![
+            mk(
+                "dev.clocks",
+                "Clocks",
+                "analog",
+                "Analog clock",
+                "Hands and a dial",
+            ),
+            mk(
+                "dev.clocks",
+                "Clocks",
+                "word",
+                "Word clock",
+                "The time in words",
+            ),
+            mk(
+                "dev.weather",
+                "Weather",
+                "now",
+                "Météo",
+                "Current conditions",
+            ),
+            mk(
+                "dev.weather",
+                "Weather",
+                "week",
+                "Forecast",
+                "The next seven days",
+            ),
+        ]
+    }
+
+    fn packs_mode() -> EditMode {
+        mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], packs_gallery())
+    }
+
+    #[test]
+    fn typing_filters_by_name_description_and_package() {
+        let mut m = packs_mode();
+        // Typing goes nowhere while the sheet is closed.
+        type_text(&mut m, "clock");
+        assert!(m.search.is_empty());
+        open_sheet(&mut m);
+        for (query, want) in [
+            ("clock", [true, true, false, false]),
+            ("words", [false, true, false, false]),
+            ("WEATHER", [false, false, true, true]),
+            ("meteo", [false, false, true, false]),
+            ("seven weather", [false, false, false, true]),
+            ("", [true, true, true, true]),
+        ] {
+            m.search = TextField::default();
+            type_text(&mut m, query);
+            m.refilter();
+            assert_eq!(m.matched, want, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn search_keys_edit_the_query() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        type_text(&mut m, "word clock");
+        assert_eq!(m.matched, [false, true, false, false]);
+        key(&mut m, VK_BACK.0, true);
+        assert_eq!(m.search.text, "word ");
+        key(&mut m, VK_BACK.0, false);
+        key(&mut m, VK_HOME.0, false);
+        key(&mut m, VK_DELETE.0, false);
+        assert_eq!(m.search, field("ord", 0));
+        type_text(&mut m, "w");
+        assert_eq!(m.search, field("word", 1));
+        key(&mut m, VK_END.0, false);
+        type_text(&mut m, "s");
+        key(&mut m, VK_LEFT.0, false);
+        assert_eq!(m.search, field("words", 4));
+        assert_eq!(
+            m.matched,
+            [false, true, false, false],
+            "found in the description"
+        );
+    }
+
+    #[test]
+    fn ctrl_f_opens_the_sheet_with_a_fresh_search() {
+        let mut m = packs_mode();
+        assert!(key(&mut m, b'F' as u16, true).is_empty());
+        assert!(m.gallery_open);
+        type_text(&mut m, "météo");
+        assert_eq!(m.search.text, "météo");
+        // Ctrl+F again keeps the query; a plain F key is left to WM_CHAR.
+        key(&mut m, b'F' as u16, true);
+        key(&mut m, b'F' as u16, false);
+        assert_eq!(m.search.text, "météo");
+        m.input(Input::Escape, &[]);
+        m.input(Input::Escape, &[]);
+        assert!(!m.gallery_open);
+        m.open_gallery();
+        assert!(m.search.is_empty() && m.matched.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn escape_clears_the_query_then_closes_the_sheet_then_edit_mode() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        type_text(&mut m, "zzz");
+        assert!(m.input(Input::Escape, &[]).is_empty());
+        assert!(m.search.is_empty() && m.gallery_open);
+        assert_eq!(m.matched, [true; 4]);
+        assert!(m.input(Input::Escape, &[]).is_empty());
+        assert!(!m.gallery_open);
+        assert!(matches!(
+            m.input(Input::Escape, &[]).as_slice(),
+            [Action::Close]
+        ));
+    }
+
+    #[test]
+    fn clear_button_and_caret_placement() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        let l = m.sheet_layout();
+        // No clear button while the field is empty.
+        assert_eq!(m.hit(&[], center(l.clear)), Hot::Search);
+        assert_eq!(m.hit(&[], center(l.field)), Hot::Search);
+        type_text(&mut m, "clock");
+        assert_eq!(m.hit(&[], center(l.clear)), Hot::Clear);
+        click(&mut m, &[], pt(l.field.left + 36, center(l.field).y));
+        assert_eq!(m.search.caret, 0);
+        click(&mut m, &[], pt(l.clear.left - 4, center(l.field).y));
+        assert_eq!(m.search.caret, 5);
+        assert!(click(&mut m, &[], center(l.clear)).is_empty());
+        assert!(m.search.is_empty() && m.gallery_open);
+    }
+
+    #[test]
+    fn typing_restarts_the_caret_blink() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        m.caret_epoch = Instant::now() - std::time::Duration::from_secs(5);
+        type_text(&mut m, "a");
+        assert!(m.caret_epoch.elapsed().as_millis() < BLINK_MS as u128);
+        m.caret_epoch = Instant::now() - std::time::Duration::from_secs(5);
+        key(&mut m, VK_LEFT.0, false);
+        assert!(m.caret_epoch.elapsed().as_millis() < BLINK_MS as u128);
+    }
+
+    // ── package tabs ──
+
+    #[test]
+    fn single_package_has_no_tabs() {
+        let mut m = mode();
+        open_sheet(&mut m);
+        assert!(m.sheet_layout().tabs.is_empty());
+        let m = mode_full(
+            &[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)],
+            gallery(2),
+            Some("dev.pack".into()),
+        );
+        assert_eq!(m.tab(), None);
+    }
+
+    #[test]
+    fn tabs_filter_by_package() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        let l = m.sheet_layout();
+        assert_eq!(l.tabs.len(), 3);
+        assert!(l.tabs.windows(2).all(|w| w[0].right < w[1].left));
+        assert!(l.tabs.iter().all(|t| contains(&l.sheet, center(*t))));
+        assert!(l.strip.bottom <= l.area.top && l.field.bottom <= l.strip.top);
+        assert_eq!(m.hit(&[], center(l.tabs[0])), Hot::Tab(0));
+        assert_eq!(m.hit(&[], center(l.tabs[2])), Hot::Tab(2));
+        assert_eq!(m.tab_label(1), "Clocks");
+
+        assert!(click(&mut m, &[], center(l.tabs[2])).is_empty());
+        assert_eq!(m.tab().as_deref(), Some("dev.weather"));
+        assert_eq!(m.matched, [false, false, true, true]);
+        // The tab and the search combine.
+        type_text(&mut m, "seven");
+        assert_eq!(m.matched, [false, false, false, true]);
+        type_text(&mut m, " clock");
+        assert!(!m.matched.contains(&true));
+        settle(&mut m);
+        assert_eq!(m.a("empty"), 1.0);
+        assert_eq!(m.hit(&[], center(m.sheet_layout().area)), Hot::Sheet);
+
+        m.clear_search();
+        click(&mut m, &[], center(l.tabs[0]));
+        assert_eq!(m.tab(), None);
+        assert_eq!(m.matched, [true; 4]);
+    }
+
+    #[test]
+    fn the_pill_slides_to_the_selected_tab() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        let spans = m.tab_spans();
+        assert_eq!(m.pill, (spans[0].0 as f32, spans[0].1 as f32));
+        m.select_tab(1);
+        m.last_frame = Instant::now() - std::time::Duration::from_millis(16);
+        assert!(m.step());
+        // Moving right, the leading (right) edge runs ahead of the trailing one.
+        let (l, r) = m.pill;
+        let l_done = (l - spans[0].0 as f32) / (spans[1].0 - spans[0].0) as f32;
+        let r_done = (r - spans[0].1 as f32) / (spans[1].1 - spans[0].1) as f32;
+        assert!(r_done > l_done, "{l_done} {r_done}");
+        settle(&mut m);
+        assert_eq!(m.pill, (spans[1].0 as f32, spans[1].1 as f32));
+    }
+
+    #[test]
+    fn the_last_tab_is_remembered() {
+        let monitors = [(PRIMARY, rect(0, 0, 1920, 1080), 1.0)];
+        let m = mode_full(&monitors, packs_gallery(), Some("dev.weather".into()));
+        assert_eq!(m.tab().as_deref(), Some("dev.weather"));
+        assert_eq!(m.matched, [false, false, true, true]);
+        // Already settled: the first weather card sits in the first slot.
+        assert_eq!(m.card_x[2], 0.0);
+        assert_eq!(m.pill_target(), m.pill);
+        // A package that is no longer installed falls back to all.
+        let m = mode_full(&monitors, packs_gallery(), Some("dev.gone".into()));
+        assert_eq!(m.tab(), None);
+        assert_eq!(m.matched, [true; 4]);
+    }
+
+    #[test]
+    fn many_tabs_scroll_with_the_wheel() {
+        let gallery: Vec<GalleryItem> = (0..40)
+            .map(|i| GalleryItem {
+                package: format!("dev.pack{i}"),
+                pack_name: format!("A rather long package name {i}"),
+                ..gallery(1).remove(0)
+            })
+            .collect();
+        let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery);
+        open_sheet(&mut m);
+        let l = m.sheet_layout();
+        assert!(l.sheet.right - l.sheet.left <= 1920 - 48);
+        let max = m.tab_scroll_max(&m.tab_spans());
+        assert!(max > 0.0);
+        m.pointer = center(l.tabs[1]);
+        m.input(Input::Wheel(-120), &[]);
+        assert!(m.tab_scroll > 0.0);
+        for _ in 0..200 {
+            m.input(Input::Wheel(-120), &[]);
+        }
+        assert_eq!(m.tab_scroll, max);
+        // Selecting a tab brings it into view.
+        m.select_tab(0);
+        assert_eq!(m.tab_scroll, 0.0);
+        m.select_tab(40);
+        assert_eq!(m.tab_scroll, max);
+    }
+
+    // ── filtered results ──
+
+    #[test]
+    fn filtered_cards_reflow_and_fade() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        let before = m.sheet();
+        type_text(&mut m, "forecast");
+        assert_eq!(m.matched, [false, false, false, true]);
+        // The sheet holds its width while the results change.
+        assert_eq!(m.sheet().0, before.0);
+        // Cards glide: nothing jumps on the first frame.
+        assert_eq!(m.sheet().1[3], before.1[3]);
+        m.last_frame = Instant::now() - std::time::Duration::from_millis(16);
+        assert!(m.step());
+        let mid = m.sheet().1[3];
+        assert!(mid.left < before.1[3].left && mid.left > before.1[0].left);
+        assert!(m.card_v[0] < 1.0 && m.card_v[0] > 0.0);
+        settle(&mut m);
+        assert_eq!(m.sheet().1[3].left, before.1[0].left);
+        assert_eq!(m.card_v, [0.0, 0.0, 0.0, 1.0]);
+        // Only the matching card is hit, even where a faded one was.
+        assert_eq!(m.hit(&[], center(m.sheet().1[3])), Hot::Card(3));
+        assert_eq!(m.hit(&[], center(before.1[1])), Hot::Sheet);
+    }
+
+    #[test]
+    fn filtering_resets_the_scroll() {
+        let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery(20));
+        open_sheet(&mut m);
+        let l = m.sheet_layout();
+        m.pointer = pt(l.area.left + 30, l.area.bottom - 30);
+        m.input(Input::Wheel(-360), &[]);
+        assert!(m.scroll > 0.0);
+        let on_screen = m.sheet().1[19];
+        type_text(&mut m, "19");
+        assert_eq!(m.scroll, 0.0);
+        // The card stays where it was on screen, then glides to the first slot.
+        assert_eq!(m.sheet().1[19], on_screen);
+        settle(&mut m);
+        assert_eq!(m.sheet().1[19].left, l.area.left);
+    }
+
+    #[test]
+    fn click_on_a_filtered_card_adds_that_widget() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        type_text(&mut m, "forecast");
+        settle(&mut m);
+        let card = m.sheet().1[3];
+        match click(&mut m, &[], center(card)).as_slice() {
+            [
+                Action::Add {
+                    package,
+                    widget,
+                    at: None,
+                },
+            ] => {
+                assert_eq!((package.as_str(), widget.as_str()), ("dev.weather", "week"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn drag_a_filtered_card_onto_the_desktop() {
+        let mut m = packs_mode();
+        open_sheet(&mut m);
+        let l = m.sheet_layout();
+        click(&mut m, &[], center(l.tabs[1]));
+        type_text(&mut m, "word");
+        settle(&mut m);
+        let card = m.sheet().1[1];
+        assert_eq!(card.left, l.area.left);
+        let items = items();
+        let g = m.geometry(PRIMARY).unwrap();
+        let target = center(g.rect(16, 2, 2, 2));
+        match drag(&mut m, &items, center(card), target).as_slice() {
+            [
+                Action::Add {
+                    package,
+                    widget,
+                    at: Some((monitor, cells)),
+                },
+            ] => {
+                assert_eq!((package.as_str(), widget.as_str()), ("dev.clocks", "word"));
+                assert_eq!((monitor.as_str(), *cells), (PRIMARY, (16, 2, 2, 2)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The tab outlives the sheet.
+        assert_eq!(m.tab().as_deref(), Some("dev.clocks"));
     }
 }

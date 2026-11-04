@@ -31,6 +31,17 @@ pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
+/// `%LOCALAPPDATA%\Vitrine\cache`: downloads and store previews, safe to delete.
+pub fn cache_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("AppData").join("Local"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("Vitrine").join("cache")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,7 @@
 //! Settings changes therefore apply live, without restarting widgets.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +20,9 @@ use vitrine_widgets::settings::{SettingDef, SettingType, SettingsSchema};
 use crate::grid::Geometry;
 use crate::i18n::{self, t, tf, tn};
 use crate::runtime;
+use crate::search::{Facts, Filter, SizeClass};
 use crate::shellapi;
+use crate::store::{self, Catalogue, PackState, StorePack};
 
 slint::include_modules!();
 
@@ -40,15 +43,52 @@ struct State {
     preview_gen: Arc<AtomicU64>,
     /// Debounces settings-page previews while the user types.
     preview_timer: Rc<slint::Timer>,
+    /// The same packages in their original language (search matches both).
+    originals: Vec<InstalledPackage>,
+    gallery: Gallery,
+    store: StoreState,
 }
 
-/// Installed packages, with names and descriptions in the UI language.
-fn scan_packages() -> Vec<InstalledPackage> {
-    let mut packages = package::scan(&paths::packages_dir());
+/// The gallery's results: one card per widget, filtered in place so cards
+/// can animate between positions.
+#[derive(Default)]
+struct Gallery {
+    model: Rc<VecModel<LibraryRow>>,
+    facts: Vec<Facts>,
+    /// Package of each chip (None for "All packages").
+    chips: Vec<Option<String>>,
+    chip_model: Rc<VecModel<PackChip>>,
+    /// Packages and versions the model was built from.
+    signature: String,
+}
+
+#[derive(Default)]
+struct StoreState {
+    catalogue: Option<Catalogue>,
+    /// Downloaded during this session (otherwise it is the cached copy).
+    fresh: bool,
+    loading: bool,
+    rows: Rc<VecModel<StoreRow>>,
+    /// Preview of each row, as a catalogue path.
+    row_previews: Vec<String>,
+    tags: Vec<Option<String>>,
+    tag_model: Rc<VecModel<PackChip>>,
+    /// Pack on the detail page and its widgets' preview paths.
+    detail: Option<String>,
+    detail_previews: Vec<String>,
+    previews: HashMap<String, slint::Image>,
+    requested: HashSet<String>,
+    installing: Option<String>,
+}
+
+/// Installed packages localised, and as written (for search in both languages).
+fn scan_both() -> (Vec<InstalledPackage>, Vec<InstalledPackage>) {
+    let originals = package::scan(&paths::packages_dir());
+    let mut packages = originals.clone();
     for p in &mut packages {
         p.manifest.localize(i18n::language());
     }
-    packages
+    (packages, originals)
 }
 
 fn layout_stamp() -> Option<SystemTime> {
@@ -74,12 +114,19 @@ impl State {
             detail: None,
             preview_gen: Arc::new(AtomicU64::new(0)),
             preview_timer: Rc::new(slint::Timer::default()),
+            originals: Vec::new(),
+            gallery: Gallery::default(),
+            store: StoreState::default(),
         }
     }
 
     fn load() -> State {
+        let (packages, originals) = scan_both();
         State {
-            packages: scan_packages(),
+            originals,
+            gallery: Gallery::default(),
+            store: StoreState::default(),
+            packages,
             layout: Layout::load(&paths::layout_path()).unwrap_or_default(),
             layout_stamp: layout_stamp(),
             config: Config::load(&paths::config_path()).unwrap_or_default(),
@@ -95,6 +142,14 @@ impl State {
 
     fn package(&self, id: &str) -> Option<&InstalledPackage> {
         self.packages.iter().find(|p| p.manifest.id == id)
+    }
+
+    fn rescan(&mut self) {
+        (self.packages, self.originals) = scan_both();
+    }
+
+    fn installed_version(&self, id: &str) -> Option<&str> {
+        self.package(id).map(|p| p.manifest.version.as_str())
     }
 
     fn reload_layout(&mut self) {
@@ -263,6 +318,8 @@ fn open_detail(ui: &PanelWindow, st: &mut State, package: &str, widget: &str) {
         pack: s(pkg.manifest.name.as_str()),
         size: s(format!("{}×{}", def.0, def.1)),
         preview: preview_image(&pkg, &w),
+        slot: 0,
+        shown: true,
     });
     ui.set_detail_preview(preview_image(&pkg, &w));
     ui.set_detail_sizes(ModelRc::new(VecModel::from(
@@ -363,9 +420,181 @@ fn library_rows(st: &State) -> Vec<LibraryRow> {
                 pack: s(p.manifest.name.as_str()),
                 size: s(format!("{}×{}", w.size.default[0], w.size.default[1])),
                 preview: preview_image(p, w),
+                slot: 0,
+                shown: true,
             })
         })
         .collect()
+}
+
+/// What the gallery filters on, per widget, in `library_rows` order.
+fn library_facts(packages: &[InstalledPackage], originals: &[InstalledPackage]) -> Vec<Facts> {
+    use vitrine_widgets::manifest::Permission;
+    packages
+        .iter()
+        .flat_map(|p| {
+            let original = originals.iter().find(|o| o.manifest.id == p.manifest.id);
+            p.manifest.widgets.iter().map(move |w| {
+                let mut text = vec![
+                    w.name.clone(),
+                    w.description.clone(),
+                    p.manifest.name.clone(),
+                ];
+                if let Some(o) = original {
+                    text.push(o.manifest.name.clone());
+                    if let Some(ow) = o.widget(&w.id) {
+                        text.push(ow.name.clone());
+                        text.push(ow.description.clone());
+                    }
+                }
+                Facts {
+                    text,
+                    pack: p.manifest.id.clone(),
+                    size: (w.size.default[0] as i32, w.size.default[1] as i32),
+                    interactive: w.interactive,
+                    online: w
+                        .permissions
+                        .iter()
+                        .any(|p| matches!(p, Permission::Net(_))),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Avatar colour of a package chip, stable for its id.
+fn tint(id: &str) -> slint::Color {
+    const TINTS: [u32; 8] = [
+        0x0067C0, 0x8764B8, 0x00838F, 0xC239B3, 0x2D7D9A, 0xCA5010, 0x498205, 0x5D5A58,
+    ];
+    let h = id.bytes().fold(0x811C_9DC5u32, |h, b| {
+        (h ^ b as u32).wrapping_mul(0x0100_0193)
+    });
+    let c = TINTS[h as usize % TINTS.len()];
+    slint::Color::from_rgb_u8((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+fn initial(name: &str) -> String {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_default()
+}
+
+/// Positions of the results: matching items take the next slot; the others
+/// keep their old one (so they fade out where they were). Returns the count.
+fn assign_slots(shown: &[bool], old_slots: &mut [i32]) -> usize {
+    let mut next = 0;
+    for (slot, &on) in old_slots.iter_mut().zip(shown) {
+        if on {
+            *slot = next;
+            next += 1;
+        }
+    }
+    next as usize
+}
+
+/// Rebuilds the gallery model when the installed packages changed.
+fn rebuild_gallery(ui: &PanelWindow, st: &mut State) {
+    let signature: String = st
+        .packages
+        .iter()
+        .map(|p| format!("{}@{};", p.manifest.id, p.manifest.version))
+        .chain(std::iter::once(i18n::language().to_string()))
+        .collect();
+    if signature == st.gallery.signature && st.gallery.model.row_count() > 0 {
+        return;
+    }
+    st.gallery.signature = signature;
+    st.gallery.model = Rc::new(VecModel::from(library_rows(st)));
+    st.gallery.facts = library_facts(&st.packages, &st.originals);
+    let selected = st
+        .gallery
+        .chips
+        .get(ui.get_pack_index().max(0) as usize)
+        .cloned()
+        .flatten();
+    st.gallery.chips = std::iter::once(None)
+        .chain(st.packages.iter().map(|p| Some(p.manifest.id.clone())))
+        .collect();
+    let chips: Vec<PackChip> = std::iter::once(PackChip {
+        name: s(t("gallery.all_packs")),
+        ..Default::default()
+    })
+    .chain(st.packages.iter().map(|p| PackChip {
+        id: s(p.manifest.id.as_str()),
+        name: s(p.manifest.name.as_str()),
+        initial: s(initial(&p.manifest.name)),
+        tint: tint(&p.manifest.id),
+        count: 0,
+    }))
+    .collect();
+    st.gallery.chip_model = Rc::new(VecModel::from(chips));
+    ui.set_pack_index(
+        st.gallery
+            .chips
+            .iter()
+            .position(|c| *c == selected)
+            .unwrap_or(0) as i32,
+    );
+    ui.set_library(ModelRc::from(st.gallery.model.clone()));
+    ui.set_pack_chips(ModelRc::from(st.gallery.chip_model.clone()));
+    apply_gallery_filter(ui, st);
+}
+
+fn gallery_filter(ui: &PanelWindow, st: &State) -> Filter {
+    Filter {
+        query: ui.get_gallery_query().to_string(),
+        pack: st
+            .gallery
+            .chips
+            .get(ui.get_pack_index().max(0) as usize)
+            .cloned()
+            .flatten(),
+        size: match ui.get_size_filter() {
+            1 => Some(SizeClass::Small),
+            2 => Some(SizeClass::Medium),
+            3 => Some(SizeClass::Large),
+            _ => None,
+        },
+        interactive: ui.get_only_interactive(),
+        online: ui.get_only_online(),
+    }
+}
+
+/// Shows the widgets that match the search and filters, and updates the counts.
+fn apply_gallery_filter(ui: &PanelWindow, st: &State) {
+    let filter = gallery_filter(ui, st);
+    let g = &st.gallery;
+    let shown: Vec<bool> = g.facts.iter().map(|f| filter.accepts(f)).collect();
+    let mut slots: Vec<i32> = (0..g.model.row_count())
+        .map(|i| g.model.row_data(i).map_or(0, |r| r.slot))
+        .collect();
+    let count = assign_slots(&shown, &mut slots);
+    for (i, (&on, &slot)) in shown.iter().zip(&slots).enumerate() {
+        if let Some(mut row) = g.model.row_data(i)
+            && (row.shown != on || row.slot != slot)
+        {
+            row.shown = on;
+            row.slot = slot;
+            g.model.set_row_data(i, row);
+        }
+    }
+    for (i, pack) in g.chips.iter().enumerate() {
+        let n = g
+            .facts
+            .iter()
+            .filter(|f| pack.as_ref().is_none_or(|p| *p == f.pack) && filter.accepts_any_pack(f))
+            .count() as i32;
+        if let Some(mut chip) = g.chip_model.row_data(i)
+            && chip.count != n
+        {
+            chip.count = n;
+            g.chip_model.set_row_data(i, chip);
+        }
+    }
+    ui.set_result_count(count as i32);
+    ui.set_result_text(s(tn("row.widgets", count as u64)));
 }
 
 fn package_rows(st: &State) -> Vec<PackageRow> {
@@ -593,10 +822,13 @@ fn error_text(schema: &SettingsSchema, key: &str, message: String) -> String {
     })
 }
 
-fn refresh(ui: &PanelWindow, st: &State) {
+fn refresh(ui: &PanelWindow, st: &mut State) {
     ui.set_instances(ModelRc::new(VecModel::from(instance_rows(st))));
-    ui.set_library(ModelRc::new(VecModel::from(library_rows(st))));
+    rebuild_gallery(ui, st);
     ui.set_packages(ModelRc::new(VecModel::from(package_rows(st))));
+    if st.store.catalogue.is_some() {
+        update_store_states(ui, st);
+    }
 }
 
 fn add_widget(
@@ -641,6 +873,563 @@ fn add_widget(
     placed
 }
 
+// ── store ─────────────────────────────────────────────────────────────
+
+/// The panel and its state.
+type Shared = (slint::Weak<PanelWindow>, Rc<RefCell<State>>);
+
+thread_local! {
+    /// The panel and its state, for results that come back from worker threads.
+    static PANEL: RefCell<Option<Shared>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` on the UI thread with the panel and its state.
+fn on_ui(f: impl FnOnce(&PanelWindow, &mut State) + Send + 'static) {
+    let _ = slint::invoke_from_event_loop(move || {
+        PANEL.with(|p| {
+            if let Some((weak, st)) = &*p.borrow()
+                && let Some(ui) = weak.upgrade()
+            {
+                f(&ui, &mut st.borrow_mut());
+            }
+        });
+    });
+}
+
+/// "918 KB", "1,2 MB": sizes with the decimal separator of the UI language.
+fn format_size(bytes: u64) -> String {
+    let (key, value) = if bytes < 1024 * 1024 {
+        (
+            "store.size_kb",
+            format!("{}", (bytes as f64 / 1024.0).round().max(1.0)),
+        )
+    } else {
+        (
+            "store.size_mb",
+            format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)),
+        )
+    };
+    let comma = matches!(i18n::language(), "it" | "fr" | "de" | "es" | "pt-BR" | "ru");
+    let value = if comma {
+        value.replace('.', ",")
+    } else {
+        value
+    };
+    tf(key, &[("size", &value)])
+}
+
+fn state_code(state: PackState) -> i32 {
+    match state {
+        PackState::NotInstalled => 0,
+        PackState::Installed => 1,
+        PackState::UpdateAvailable => 2,
+    }
+}
+
+fn pack_state_of(st: &State, pack: &StorePack) -> PackState {
+    store::pack_state(&pack.version, st.installed_version(&pack.id))
+}
+
+/// Packs with a newer version in the catalogue than installed.
+fn count_updates(st: &State) -> i32 {
+    st.store.catalogue.as_ref().map_or(0, |c| {
+        c.packs
+            .iter()
+            .filter(|p| pack_state_of(st, p) == PackState::UpdateAvailable)
+            .count() as i32
+    })
+}
+
+/// Shows a cached preview, or downloads it in the background.
+fn store_preview(st: &mut State, rel: &str) -> slint::Image {
+    if let Some(img) = st.store.previews.get(rel) {
+        return img.clone();
+    }
+    if !rel.is_empty() && st.store.requested.insert(rel.to_string()) {
+        let rel = rel.to_string();
+        let _ = std::thread::Builder::new()
+            .name("vitrine-store-preview".into())
+            .spawn(move || {
+                let path = store::preview(&rel);
+                on_ui(move |ui, st| {
+                    let img = path
+                        .and_then(|p| slint::Image::load_from_path(&p).ok())
+                        .unwrap_or_default();
+                    st.store.previews.insert(rel.clone(), img.clone());
+                    for (i, key) in st.store.row_previews.iter().enumerate() {
+                        if *key == rel
+                            && let Some(mut row) = st.store.rows.row_data(i)
+                        {
+                            row.preview = img.clone();
+                            st.store.rows.set_row_data(i, row);
+                        }
+                    }
+                    let widgets = ui.get_store_detail_widgets();
+                    for (i, key) in st.store.detail_previews.iter().enumerate() {
+                        if *key == rel
+                            && let Some(mut row) = widgets.row_data(i)
+                        {
+                            row.preview = img.clone();
+                            widgets.set_row_data(i, row);
+                        }
+                    }
+                });
+            });
+    }
+    slint::Image::default()
+}
+
+fn store_summary(pack: &StorePack) -> String {
+    format!(
+        "{} · {}",
+        tn("row.widgets", pack.widgets.len() as u64),
+        format_size(pack.size)
+    )
+}
+
+/// Builds the Store grid and its tag chips from the catalogue.
+fn rebuild_store(ui: &PanelWindow, st: &mut State) {
+    let Some(catalogue) = st.store.catalogue.clone() else {
+        return;
+    };
+    let mut rows = Vec::new();
+    let mut previews = Vec::new();
+    for pack in &catalogue.packs {
+        let rel = pack
+            .widgets
+            .iter()
+            .find_map(|w| w.preview.clone())
+            .unwrap_or_default();
+        rows.push(StoreRow {
+            id: s(pack.id.as_str()),
+            name: s(pack.name.as_str()),
+            author: s(tf("store.by", &[("author", &pack.author)])),
+            description: s(pack.description.as_str()),
+            summary: s(store_summary(pack)),
+            official: pack.official,
+            state: state_code(pack_state_of(st, pack)),
+            preview: store_preview(st, &rel),
+            slot: 0,
+            shown: true,
+        });
+        previews.push(rel);
+    }
+    st.store.row_previews = previews;
+    st.store.rows = Rc::new(VecModel::from(rows));
+    // Tags, most used first.
+    let mut tags: Vec<(String, usize)> = Vec::new();
+    for tag in catalogue.packs.iter().flat_map(|p| &p.tags) {
+        match tags.iter_mut().find(|(t, _)| t == tag) {
+            Some((_, n)) => *n += 1,
+            None => tags.push((tag.clone(), 1)),
+        }
+    }
+    tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let selected = st
+        .store
+        .tags
+        .get(ui.get_store_tag().max(0) as usize)
+        .cloned()
+        .flatten();
+    st.store.tags = std::iter::once(None)
+        .chain(tags.iter().map(|(t, _)| Some(t.clone())))
+        .collect();
+    let chips: Vec<PackChip> = std::iter::once(PackChip {
+        name: s(t("store.all_tags")),
+        ..Default::default()
+    })
+    .chain(tags.iter().map(|(tag, _)| PackChip {
+        id: s(tag.as_str()),
+        name: s(tag.as_str()),
+        ..Default::default()
+    }))
+    .collect();
+    st.store.tag_model = Rc::new(VecModel::from(chips));
+    ui.set_store_tag(
+        st.store
+            .tags
+            .iter()
+            .position(|t| *t == selected)
+            .unwrap_or(0) as i32,
+    );
+    ui.set_store_packs(ModelRc::from(st.store.rows.clone()));
+    ui.set_store_tags(ModelRc::from(st.store.tag_model.clone()));
+    ui.set_store_updates(count_updates(st));
+    apply_store_filter(ui, st);
+}
+
+/// True when `pack` matches the Store search box and tag chip.
+fn store_matches(pack: &StorePack, query: &str, tag: Option<&str>) -> bool {
+    if tag.is_some_and(|t| !pack.tags.iter().any(|x| x == t)) {
+        return false;
+    }
+    let mut fields: Vec<&str> = vec![&pack.name, &pack.description, &pack.author, &pack.id];
+    fields.extend(pack.tags.iter().map(String::as_str));
+    for w in &pack.widgets {
+        fields.push(&w.name);
+        fields.push(&w.description);
+    }
+    crate::search::matches(query, &fields)
+}
+
+fn apply_store_filter(ui: &PanelWindow, st: &State) {
+    let Some(catalogue) = &st.store.catalogue else {
+        return;
+    };
+    let query = ui.get_store_query().to_string();
+    let tag = st
+        .store
+        .tags
+        .get(ui.get_store_tag().max(0) as usize)
+        .cloned()
+        .flatten();
+    let rows = &st.store.rows;
+    let shown: Vec<bool> = catalogue
+        .packs
+        .iter()
+        .map(|p| store_matches(p, &query, tag.as_deref()))
+        .collect();
+    let mut slots: Vec<i32> = (0..rows.row_count())
+        .map(|i| rows.row_data(i).map_or(0, |r| r.slot))
+        .collect();
+    let count = assign_slots(&shown, &mut slots);
+    for (i, (&on, &slot)) in shown.iter().zip(&slots).enumerate() {
+        if let Some(mut row) = rows.row_data(i)
+            && (row.shown != on || row.slot != slot)
+        {
+            row.shown = on;
+            row.slot = slot;
+            rows.set_row_data(i, row);
+        }
+    }
+    for (i, t) in st.store.tags.iter().enumerate() {
+        let n = catalogue
+            .packs
+            .iter()
+            .filter(|p| store_matches(p, &query, t.as_deref()))
+            .count() as i32;
+        if let Some(mut chip) = st.store.tag_model.row_data(i)
+            && chip.count != n
+        {
+            chip.count = n;
+            st.store.tag_model.set_row_data(i, chip);
+        }
+    }
+    ui.set_store_count(count as i32);
+    ui.set_store_count_text(s(tn("store.packs", count as u64)));
+}
+
+/// Installed / update badges after packages changed.
+fn update_store_states(ui: &PanelWindow, st: &mut State) {
+    let Some(catalogue) = st.store.catalogue.clone() else {
+        return;
+    };
+    for (i, pack) in catalogue.packs.iter().enumerate() {
+        let code = state_code(pack_state_of(st, pack));
+        if let Some(mut row) = st.store.rows.row_data(i)
+            && row.state != code
+        {
+            row.state = code;
+            st.store.rows.set_row_data(i, row);
+        }
+    }
+    ui.set_store_updates(count_updates(st));
+    if let Some(id) = st.store.detail.clone()
+        && st.store.installing.is_none()
+    {
+        fill_store_detail(ui, st, &id);
+    }
+}
+
+/// Downloads the catalogue in the background. `quiet` keeps the page as it
+/// is while loading (the daily update check).
+fn fetch_store(ui: &PanelWindow, st: &mut State, quiet: bool) {
+    if st.store.loading {
+        return;
+    }
+    st.store.loading = true;
+    if !quiet && st.store.catalogue.is_none() {
+        ui.set_store_state(0);
+    }
+    let _ = std::thread::Builder::new()
+        .name("vitrine-store".into())
+        .spawn(move || {
+            let result = store::fetch_catalogue();
+            on_ui(move |ui, st| {
+                st.store.loading = false;
+                match result {
+                    Ok(c) => {
+                        st.store.catalogue = Some(c);
+                        st.store.fresh = true;
+                        ui.set_store_stale(false);
+                        ui.set_store_state(1);
+                        rebuild_store(ui, st);
+                        if let Some(id) = st.store.detail.clone()
+                            && ui.get_page() == 7
+                        {
+                            fill_store_detail(ui, st, &id);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("store: {e}");
+                        // Shown when the Store page is (or becomes) visible.
+                        if st.store.catalogue.is_some() {
+                            ui.set_store_stale(true);
+                            ui.set_store_state(1);
+                        } else {
+                            ui.set_store_state(2);
+                        }
+                    }
+                }
+            });
+        });
+}
+
+/// The Store page became visible.
+fn open_store(ui: &PanelWindow, st: &mut State) {
+    if st.store.catalogue.is_some() {
+        ui.set_store_state(1);
+        if st.store.rows.row_count() == 0 {
+            rebuild_store(ui, st);
+        }
+    }
+    if !st.store.fresh {
+        fetch_store(ui, st, false);
+    }
+}
+
+fn permission_rows(pack: &StorePack) -> Vec<PermissionRow> {
+    let mut rows = Vec::new();
+    for perm in pack.permissions() {
+        let users: Vec<&str> = pack
+            .widgets
+            .iter()
+            .filter(|w| w.permissions.contains(&perm))
+            .map(|w| w.name.as_str())
+            .collect();
+        let detail = tf("perm.used_by", &[("widgets", &users.join(", "))]);
+        let (glyph, title) = if let Some(host) = perm.strip_prefix("net:") {
+            ("\u{E774}", tf("perm.net", &[("host", host)]))
+        } else {
+            let metric = perm.strip_prefix("system.").unwrap_or(&perm);
+            let glyph = match metric {
+                "battery" => "\u{E83F}",
+                "drives" => "\u{EDA2}",
+                "network" => "\u{E839}",
+                _ => "\u{E9D9}",
+            };
+            let key = format!("perm.{metric}");
+            let known = vitrine_widgets::manifest::SYSTEM_METRICS.contains(&metric);
+            (glyph, if known { t(&key) } else { perm.clone() })
+        };
+        rows.push(PermissionRow {
+            glyph: s(glyph),
+            title: s(title),
+            detail: s(detail),
+        });
+    }
+    if rows.is_empty() {
+        rows.push(PermissionRow {
+            glyph: s("\u{E72E}"),
+            title: s(t("perm.none")),
+            detail: s(t("perm.none_detail")),
+        });
+    }
+    rows
+}
+
+/// Fills the pack detail page.
+fn fill_store_detail(ui: &PanelWindow, st: &mut State, id: &str) {
+    let Some(pack) = st
+        .store
+        .catalogue
+        .as_ref()
+        .and_then(|c| c.packs.iter().find(|p| p.id == id))
+        .cloned()
+    else {
+        return;
+    };
+    let state = pack_state_of(st, &pack);
+    let index = st
+        .store
+        .catalogue
+        .as_ref()
+        .and_then(|c| c.packs.iter().position(|p| p.id == id))
+        .unwrap_or(0);
+    let mut row = st.store.rows.row_data(index).unwrap_or_default();
+    row.state = state_code(state);
+    ui.set_store_detail(row);
+    ui.set_store_detail_meta(s(format!(
+        "{} · {} · {}",
+        tf("store.by", &[("author", &pack.author)]),
+        tf("row.version", &[("version", &pack.version)]),
+        format_size(pack.size)
+    )));
+    ui.set_store_detail_description(s(pack.description.as_str()));
+    let mut widgets = Vec::new();
+    let mut previews = Vec::new();
+    for w in &pack.widgets {
+        let rel = w.preview.clone().unwrap_or_default();
+        widgets.push(StoreWidgetRow {
+            name: s(w.name.as_str()),
+            description: s(w.description.as_str()),
+            size: s(format!("{}×{}", w.size.default[0], w.size.default[1])),
+            interactive: w.interactive,
+            online: w.permissions.iter().any(|p| p.starts_with("net:")),
+            preview: store_preview(st, &rel),
+        });
+        previews.push(rel);
+    }
+    st.store.detail_previews = previews;
+    ui.set_store_detail_widgets(ModelRc::new(VecModel::from(widgets)));
+    ui.set_store_detail_permissions(ModelRc::new(VecModel::from(permission_rows(&pack))));
+    let mut facts = vec![
+        (t("store.fact_version"), pack.version.clone()),
+        (t("store.fact_author"), pack.author.clone()),
+        (
+            t("store.fact_license"),
+            pack.license
+                .clone()
+                .unwrap_or_else(|| t("store.license_unknown")),
+        ),
+        (t("store.fact_size"), format_size(pack.size)),
+    ];
+    if let Some(date) = pack.published.as_deref().and_then(|d| d.get(..10)) {
+        facts.push((t("store.fact_updated"), date.to_string()));
+    }
+    facts.push((t("store.fact_repo"), format!("github.com/{}", pack.repo)));
+    if !pack.tags.is_empty() {
+        facts.push((t("store.fact_tags"), pack.tags.join(", ")));
+    }
+    ui.set_store_detail_facts(ModelRc::new(VecModel::from(
+        facts
+            .into_iter()
+            .map(|(label, value)| DetailRow {
+                label: s(label),
+                value: s(value),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_store_action(s(match state {
+        PackState::NotInstalled => t("store.install"),
+        PackState::UpdateAvailable => tf("store.update", &[("version", &pack.version)]),
+        PackState::Installed => String::new(),
+    }));
+    ui.set_store_note(s(if pack.supported() {
+        String::new()
+    } else {
+        tf(
+            "store.needs_engine",
+            &[("version", pack.min_engine.as_deref().unwrap_or(""))],
+        )
+    }));
+    if st.store.detail.as_deref() != Some(id) {
+        ui.set_store_error(s(""));
+    }
+    st.store.detail = Some(id.to_string());
+}
+
+fn download_error_text(e: &store::DownloadError) -> String {
+    match e {
+        store::DownloadError::NotAllowed(_) => t("store.error_blocked"),
+        store::DownloadError::Network(_) => t("store.error_network"),
+        store::DownloadError::TooLarge => t("store.error_too_large"),
+        store::DownloadError::Checksum => t("store.error_checksum"),
+    }
+}
+
+/// Downloads, verifies and installs the pack on the detail page.
+fn install_from_store(ui: &PanelWindow, st: &mut State) {
+    let Some(id) = st.store.detail.clone() else {
+        return;
+    };
+    if st.store.installing.is_some() {
+        return;
+    }
+    let Some(pack) = st
+        .store
+        .catalogue
+        .as_ref()
+        .and_then(|c| c.packs.iter().find(|p| p.id == id))
+        .cloned()
+    else {
+        return;
+    };
+    if !pack.supported() {
+        return;
+    }
+    let update = st.installed_version(&id).is_some();
+    st.store.installing = Some(id);
+    ui.set_store_error(s(""));
+    ui.set_store_busy(true);
+    ui.set_store_progress(0.0);
+    ui.set_store_progress_text(s(tf("store.downloading", &[("percent", "0")])));
+    let _ = std::thread::Builder::new()
+        .name("vitrine-store-install".into())
+        .spawn(move || {
+            let mut shown = -1i64;
+            let result = store::download(&pack, |got, total| {
+                let percent = (got * 100 / total.max(1)).min(100) as i64;
+                if percent != shown {
+                    shown = percent;
+                    on_ui(move |ui, _| {
+                        ui.set_store_progress(percent as f32 / 100.0);
+                        ui.set_store_progress_text(s(tf(
+                            "store.downloading",
+                            &[("percent", &percent.to_string())],
+                        )));
+                    });
+                }
+            })
+            .map_err(|e| {
+                log::warn!("store download {}: {e:?}", pack.id);
+                download_error_text(&e)
+            })
+            .and_then(|bytes| {
+                on_ui(|ui, _| {
+                    ui.set_store_progress(1.0);
+                    ui.set_store_progress_text(s(t("store.installing")));
+                });
+                store::install_bytes(&pack, &bytes, &paths::packages_dir())
+                    .map_err(|e| tf("status.could_not_install", &[("error", &e)]))
+            });
+            on_ui(move |ui, st| {
+                st.store.installing = None;
+                ui.set_store_busy(false);
+                match result {
+                    Ok(installed) => {
+                        let mut m = installed.manifest.clone();
+                        m.localize(i18n::language());
+                        let args = [("name", m.name.as_str()), ("version", m.version.as_str())];
+                        ui.set_status(s(if update {
+                            tf("status.updated", &args)
+                        } else {
+                            tf("status.installed", &args)
+                        }));
+                        st.rescan();
+                        notify();
+                        refresh(ui, st);
+                    }
+                    Err(e) => ui.set_store_error(s(e)),
+                }
+            });
+        });
+}
+
+/// Once a day, looks for pack updates so the Store item can show a badge.
+fn check_updates(ui: &PanelWindow, st: &mut State) {
+    match store::cached_catalogue() {
+        Some((c, age)) => {
+            st.store.catalogue = Some(c);
+            ui.set_store_updates(count_updates(st));
+            if age > store::CHECK_EVERY {
+                fetch_store(ui, st, true);
+            }
+        }
+        None => fetch_store(ui, st, true),
+    }
+}
+
 /// Shows the system file picker for `.vitrine` packages.
 fn pick_package() -> Option<std::path::PathBuf> {
     use windows::Win32::System::Com::*;
@@ -674,7 +1463,7 @@ fn pick_package() -> Option<std::path::PathBuf> {
     }
 }
 
-pub fn run(instance: Option<String>) -> Result<(), String> {
+pub fn run(instance: Option<String>, page: Option<String>) -> Result<(), String> {
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,
@@ -684,15 +1473,32 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
     let ui = PanelWindow::new().map_err(|e| e.to_string())?;
     i18n::apply_to_slint();
     ui.set_ui_font(s(i18n::ui_font()));
+    ui.set_theme(match std::env::var("VITRINE_THEME").as_deref() {
+        Ok("light") => 1,
+        Ok("dark") => 2,
+        _ => 0,
+    });
     let st = Rc::new(RefCell::new(State::load()));
+    PANEL.with(|p| *p.borrow_mut() = Some((ui.as_weak(), st.clone())));
     {
-        let st = st.borrow();
+        let st = &mut st.borrow_mut();
         set_languages(&ui, &st.config);
         ui.set_version(s(env!("CARGO_PKG_VERSION")));
         ui.set_autostart(shellapi::autostart_enabled());
         ui.set_slow_on_battery(st.config.pause_on_battery_saver);
         ui.set_hotkey(s(st.config.edit_hotkey.as_str()));
-        refresh(&ui, &st);
+        refresh(&ui, st);
+        check_updates(&ui, st);
+        match page.as_deref() {
+            Some("gallery" | "add") => ui.set_page(1),
+            Some("packages") => ui.set_page(2),
+            Some("general") => ui.set_page(3),
+            Some("store") => {
+                ui.set_page(6);
+                open_store(&ui, st);
+            }
+            _ => {}
+        }
     }
     if let Some(id) = instance {
         open_settings(&ui, &mut st.borrow_mut(), &id);
@@ -774,7 +1580,7 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         match package::uninstall(&id, &paths::packages_dir()) {
             Ok(()) => {
                 let _ = st.update_layout(|l| l.instances.retain(|i| i.package != id));
-                st.packages = scan_packages();
+                st.rescan();
                 ui.set_status(s(t("status.uninstalled")));
             }
             Err(e) => ui.set_status(s(tf(
@@ -794,7 +1600,7 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
                     "status.installed",
                     &[("name", &m.name), ("version", &m.version)],
                 )));
-                st.packages = scan_packages();
+                st.rescan();
                 notify();
                 ui.set_page(1);
             }
@@ -881,7 +1687,7 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         i18n::apply_to_slint();
         ui.set_ui_font(s(i18n::ui_font()));
         set_languages(&ui, &st.config);
-        st.packages = scan_packages();
+        st.rescan();
         refresh(&ui, st);
         if let Some(id) = st.editing.clone()
             && ui.get_page() == 4
@@ -908,7 +1714,30 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         }
     }));
     ui.on_open_folder(|| shellapi::open(&paths::data_dir().to_string_lossy()));
-    ui.on_open_site(|| shellapi::open("https://vitrine-org.github.io/"));
+    ui.on_filter_changed(with!(|ui, st| { apply_gallery_filter(&ui, st) }));
+    ui.on_store_open(with!(|ui, st| { open_store(&ui, st) }));
+    ui.on_store_retry(with!(|ui, st| {
+        st.store.fresh = false;
+        fetch_store(&ui, st, false);
+    }));
+    ui.on_store_filter_changed(with!(|ui, st| { apply_store_filter(&ui, st) }));
+    ui.on_store_open_pack(with!(|ui, st, id: SharedString| {
+        st.store.detail = None;
+        fill_store_detail(&ui, st, &id);
+        ui.set_page(7);
+    }));
+    ui.on_store_install(with!(|ui, st| { install_from_store(&ui, st) }));
+    ui.on_store_open_repo(with!(|_ui, st| {
+        let pack = st.store.detail.as_ref().and_then(|id| {
+            st.store
+                .catalogue
+                .as_ref()
+                .and_then(|c| c.packs.iter().find(|p| p.id == *id))
+        });
+        if let Some(url) = pack.and_then(|p| p.repo_url()) {
+            shellapi::open(&url);
+        }
+    }));
     ui.on_edit_layout(with!(|ui, _st| {
         if !runtime::send_command(runtime::Runtime::CMD_EDIT) {
             ui.set_status(s(t("status.not_running")));
@@ -923,7 +1752,7 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         with!(|ui, st| {
             if layout_stamp() != st.layout_stamp {
                 st.reload_layout();
-                st.packages = scan_packages();
+                st.rescan();
                 refresh(&ui, st);
             }
         }),
@@ -967,6 +1796,9 @@ mod tests {
             detail: None,
             preview_gen: Arc::new(AtomicU64::new(0)),
             preview_timer: Rc::new(slint::Timer::default()),
+            originals: Vec::new(),
+            gallery: Gallery::default(),
+            store: StoreState::default(),
         }
     }
 
@@ -1188,5 +2020,55 @@ mod tests {
         // A missing package keeps the widget id as its name.
         assert_eq!(rows[2].name, "old");
         assert_eq!(rows[2].detail, "Missing package dev.gone");
+    }
+
+    #[test]
+    fn slots_follow_the_results_and_keep_hidden_places() {
+        let mut slots = vec![0, 1, 2, 3];
+        assert_eq!(assign_slots(&[true, false, true, true], &mut slots), 3);
+        assert_eq!(slots, [0, 1, 1, 2], "the hidden card stays where it was");
+        assert_eq!(assign_slots(&[false, true, false, false], &mut slots), 1);
+        assert_eq!(slots, [0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn store_search_matches_names_tags_and_widgets() {
+        let text = r#"{"version":1,"packs":[{"id":"dev.vitrine.mond","name":"Mond","version":"2.1.1",
+            "author":"Emanuele","description":"A wide geometric weekday","repo":"vitrine-org/mond",
+            "tags":["theme","minimal"],"download":"https://github.com/x/y.vitrine","size":1,
+            "sha256":"6726651db3d79decb4d169275fb2c1a6f71c79d786a581c869081d017010b302",
+            "widgets":[{"id":"weather","name":"Weather","size":{"default":[6,2]}}]}]}"#;
+        let pack = &store::parse_catalogue(text).unwrap().packs[0];
+        assert!(store_matches(pack, "", None));
+        assert!(store_matches(pack, "geometric", None));
+        assert!(store_matches(pack, "weather emanuele", Some("theme")));
+        assert!(!store_matches(pack, "", Some("clock")));
+        assert!(!store_matches(pack, "calendar", None));
+    }
+
+    #[test]
+    fn library_facts_search_both_languages() {
+        let original = package(serde_json::json!({
+            "id": "dev.pack", "name": "Pack", "version": "1.0.0",
+            "widgets": [{"id": "clock", "name": "Clock", "entry": "c.js",
+                "size": {"default": [2, 2], "min": [1, 1], "max": [4, 4]},
+                "permissions": ["net:example.com"]}],
+            "locales": {"it": {"widgets": {"clock": {"name": "Orologio"}}}}
+        }));
+        let mut local = original.clone();
+        local.manifest.localize("it");
+        let facts = library_facts(&[local], &[original]);
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].online);
+        let f = Filter {
+            query: "clock".into(),
+            ..Filter::default()
+        };
+        assert!(f.accepts(&facts[0]), "the English name still matches");
+        let f = Filter {
+            query: "orologio".into(),
+            ..Filter::default()
+        };
+        assert!(f.accepts(&facts[0]));
     }
 }

@@ -1,7 +1,7 @@
 // Vitrine control panel — Windows 11 Fluent layout: navigation pane on the
 // left, pages on the right that cross-fade and slide when you navigate.
 
-import { Button, ComboBox, LineEdit, Palette, ScrollView, SpinBox, Switch } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, Palette, ProgressIndicator, ScrollView, SpinBox, Spinner, Switch } from "std-widgets.slint";
 
 export struct InstanceRow {
     id: string,
@@ -19,6 +19,52 @@ export struct LibraryRow {
     pack: string,
     size: string,
     preview: image,
+    // Position in the results grid (kept while it fades out) and whether it matches.
+    slot: int,
+    shown: bool,
+}
+
+// A package filter chip; `initial` and `tint` draw its avatar (empty for "All").
+export struct PackChip {
+    id: string,
+    name: string,
+    initial: string,
+    tint: color,
+    count: int,
+}
+
+// state: 0 not installed, 1 installed, 2 update available
+export struct StoreRow {
+    id: string,
+    name: string,
+    author: string,
+    description: string,
+    summary: string,
+    official: bool,
+    state: int,
+    preview: image,
+    slot: int,
+    shown: bool,
+}
+
+export struct StoreWidgetRow {
+    name: string,
+    description: string,
+    size: string,
+    interactive: bool,
+    online: bool,
+    preview: image,
+}
+
+export struct PermissionRow {
+    glyph: string,
+    title: string,
+    detail: string,
+}
+
+export struct DetailRow {
+    label: string,
+    value: string,
 }
 
 export struct PackageRow {
@@ -57,6 +103,8 @@ component NavItem inherits Rectangle {
     in property <string> glyph;
     in property <string> label;
     in property <bool> selected;
+    // A count shown as an accent pill at the end (0 hides it).
+    in property <int> badge;
     callback clicked();
     height: 36px;
     border-radius: 4px;
@@ -84,6 +132,30 @@ component NavItem inherits Rectangle {
             text: root.label;
             vertical-alignment: center;
             font-size: 14px;
+        }
+        Rectangle { }
+        VerticalLayout {
+            alignment: center;
+            padding-right: 10px;
+            Rectangle {
+                height: 18px;
+                width: Math.max(18px, badge-text.preferred-width + 10px);
+                border-radius: 9px;
+                background: Palette.accent-background;
+                opacity: root.badge > 0 ? 1 : 0;
+                transform-scale-x: root.badge > 0 ? 100% : 60%;
+                transform-scale-y: root.badge > 0 ? 100% : 60%;
+                animate opacity { duration: 180ms; }
+                animate transform-scale-x, transform-scale-y { duration: 260ms; easing: cubic-bezier(0.2, 1.4, 0.4, 1); }
+                badge-text := Text {
+                    text: root.badge;
+                    color: Palette.accent-foreground;
+                    font-size: 11px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
         }
     }
 }
@@ -159,21 +231,42 @@ component PreviewWell inherits Rectangle {
     }
 }
 
-component GalleryCard inherits Rectangle {
-    in property <LibraryRow> item;
+// Cards of a results grid fade and scale in when they appear, glide to their
+// new place when the results change, and fade out when filtered away.
+component ResultCard inherits Rectangle {
+    in property <bool> shown: true;
     callback clicked();
+    property <bool> appeared;
+    property <bool> on: self.appeared && root.shown;
+    init => {
+        self.appeared = true;
+    }
     border-radius: 10px;
-    background: touch.has-hover ? Palette.control-background.mix(Palette.foreground, 0.94) : Palette.control-background;
+    background: touch.pressed ? Palette.control-background.mix(Palette.foreground, 0.9)
+        : touch.has-hover ? Palette.control-background.mix(Palette.foreground, 0.95) : Palette.control-background;
     border-width: 1px;
     border-color: touch.has-hover ? Palette.accent-background.with-alpha(0.7) : Palette.border.with-alpha(0.35);
     drop-shadow-blur: touch.has-hover ? 16px : 0px;
     drop-shadow-offset-y: touch.has-hover ? 4px : 0px;
     drop-shadow-color: #00000040;
+    opacity: root.on ? 1 : 0;
+    visible: self.opacity > 0.01;
+    transform-scale-x: root.on ? (touch.pressed ? 98.5% : 100%) : 94%;
+    transform-scale-y: self.transform-scale-x;
     animate background, border-color { duration: 140ms; }
     animate drop-shadow-blur, drop-shadow-offset-y { duration: 200ms; easing: ease-out; }
+    animate opacity { duration: 200ms; easing: ease-out; }
+    animate transform-scale-x { duration: 280ms; easing: cubic-bezier(0.1, 0.9, 0.2, 1); }
     touch := TouchArea {
+        enabled: root.shown;
         clicked => { root.clicked(); }
     }
+    @children
+}
+
+component GalleryCard inherits ResultCard {
+    in property <LibraryRow> item;
+    shown: root.item.shown;
     VerticalLayout {
         padding: 8px;
         spacing: 6px;
@@ -229,6 +322,302 @@ component Chip inherits Rectangle {
     }
 }
 
+// A search field: LineEdit with a magnifier that turns into a clear button.
+component SearchBox inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text;
+    callback edited(string);
+    public function focus-input() {
+        input.focus();
+        input.select-all();
+    }
+    height: 34px;
+    input := LineEdit {
+        width: 100%;
+        height: 100%;
+        placeholder-text: root.placeholder;
+        text <=> root.text;
+        edited(t) => { root.edited(t); }
+    }
+    Rectangle {
+        width: 28px;
+        height: 26px;
+        x: parent.width - self.width - 4px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 4px;
+        background: root.text != "" && clear.has-hover ? Palette.alternate-background.mix(Palette.foreground, 0.9) : Palette.control-background.with-alpha(0);
+        animate background { duration: 120ms; }
+        Glyph {
+            text: "\u{E721}";
+            font-size: 14px;
+            color: Palette.foreground.with-alpha(0.6);
+            opacity: root.text == "" ? 1 : 0;
+            transform-rotation: root.text == "" ? 0deg : -90deg;
+            animate opacity, transform-rotation { duration: 160ms; easing: ease-out; }
+        }
+        Glyph {
+            text: "\u{E711}";
+            font-size: 11px;
+            color: Palette.foreground.with-alpha(0.8);
+            opacity: root.text == "" ? 0 : 1;
+            transform-rotation: root.text == "" ? 90deg : 0deg;
+            animate opacity, transform-rotation { duration: 160ms; easing: ease-out; }
+        }
+        clear := TouchArea {
+            enabled: root.text != "";
+            mouse-cursor: root.text != "" ? pointer : default;
+            clicked => {
+                root.text = "";
+                root.edited("");
+                input.focus();
+            }
+        }
+    }
+}
+
+// A package chip: avatar initial, name and how many widgets match.
+component PackChipView inherits Rectangle {
+    in property <PackChip> chip;
+    in property <bool> selected;
+    callback clicked();
+    height: 32px;
+    width: row.preferred-width;
+    border-radius: 16px;
+    background: root.selected ? Palette.accent-background
+        : touch.pressed ? Palette.control-background.mix(Palette.foreground, 0.88)
+        : touch.has-hover ? Palette.control-background.mix(Palette.foreground, 0.93) : Palette.control-background;
+    border-width: 1px;
+    border-color: root.selected ? Palette.accent-background : Palette.border.with-alpha(0.5);
+    opacity: root.chip.count == 0 && !root.selected ? 0.55 : 1;
+    animate background, border-color { duration: 160ms; }
+    animate opacity { duration: 180ms; }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+    row := HorizontalLayout {
+        padding-left: root.chip.initial == "" ? 14px : 5px;
+        padding-right: 12px;
+        spacing: 8px;
+        if root.chip.initial != "": VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 22px;
+                height: 22px;
+                border-radius: 11px;
+                background: root.chip.tint;
+                Text {
+                    text: root.chip.initial;
+                    color: #ffffff;
+                    font-size: 11px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text {
+            text: root.chip.name;
+            vertical-alignment: center;
+            color: root.selected ? Palette.accent-foreground : Palette.foreground;
+        }
+        Text {
+            text: root.chip.count;
+            font-size: 12px;
+            vertical-alignment: center;
+            color: root.selected ? Palette.accent-foreground.with-alpha(0.75) : Palette.foreground.with-alpha(0.55);
+        }
+    }
+}
+
+// A small toggle chip for facets (size, interactive, online).
+component FacetChip inherits Rectangle {
+    in property <string> text;
+    in property <string> glyph;
+    in property <bool> selected;
+    callback clicked();
+    height: 28px;
+    width: row.preferred-width;
+    border-radius: 14px;
+    background: root.selected ? Palette.accent-background.with-alpha(0.16)
+        : touch.pressed ? Palette.control-background.mix(Palette.foreground, 0.88)
+        : touch.has-hover ? Palette.control-background.mix(Palette.foreground, 0.94) : Palette.control-background.with-alpha(0);
+    border-width: 1px;
+    border-color: root.selected ? Palette.accent-background : Palette.border.with-alpha(0.45);
+    animate background, border-color { duration: 160ms; }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+    row := HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 12px;
+        spacing: 6px;
+        if root.glyph != "" || root.selected: Glyph {
+            text: root.selected ? "\u{E73E}" : root.glyph;
+            font-size: 12px;
+            color: root.selected ? Palette.accent-background : Palette.foreground.with-alpha(0.75);
+        }
+        Text {
+            text: root.text;
+            font-size: 12px;
+            vertical-alignment: center;
+            color: Palette.foreground;
+        }
+    }
+}
+
+// "Official", "Installed", "Update available": a compact pill.
+component Pill inherits Rectangle {
+    in property <string> text;
+    in property <string> glyph;
+    // 0 subtle, 1 accent tint, 2 accent filled
+    in property <int> tone;
+    height: 20px;
+    width: row.preferred-width;
+    border-radius: 10px;
+    background: root.tone == 2 ? Palette.accent-background
+        : root.tone == 1 ? Palette.accent-background.with-alpha(0.14) : Palette.foreground.with-alpha(0.07);
+    row := HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 8px;
+        spacing: 4px;
+        if root.glyph != "": Glyph {
+            text: root.glyph;
+            font-size: 10px;
+            color: root.tone == 2 ? Palette.accent-foreground : root.tone == 1 ? Palette.accent-background : Palette.foreground.with-alpha(0.75);
+        }
+        Text {
+            text: root.text;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+            color: root.tone == 2 ? Palette.accent-foreground : root.tone == 1 ? Palette.accent-background : Palette.foreground.with-alpha(0.8);
+        }
+    }
+}
+
+// A friendly message in place of an empty list.
+component EmptyState inherits Card {
+    in property <string> glyph;
+    in property <string> title;
+    in property <string> caption;
+    in property <string> action;
+    in property <bool> busy;
+    callback activated();
+    height: 200px;
+    property <bool> appeared;
+    init => {
+        self.appeared = true;
+    }
+    opacity: self.appeared ? 1 : 0;
+    animate opacity { duration: 240ms; easing: ease-out; }
+    VerticalLayout {
+        alignment: center;
+        spacing: 6px;
+        if root.busy: HorizontalLayout {
+            alignment: center;
+            padding-bottom: 6px;
+            Spinner {
+                indeterminate: true;
+                width: 32px;
+                height: 32px;
+            }
+        }
+        if !root.busy && root.glyph != "": Glyph {
+            text: root.glyph;
+            font-size: 32px;
+            height: 44px;
+            color: Palette.foreground.with-alpha(0.45);
+        }
+        Text {
+            text: root.title;
+            font-size: 16px;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+        if root.caption != "": Caption {
+            text: root.caption;
+            horizontal-alignment: center;
+        }
+        if root.action != "": HorizontalLayout {
+            alignment: center;
+            padding-top: 8px;
+            Button {
+                text: root.action;
+                clicked => { root.activated(); }
+            }
+        }
+    }
+}
+
+component StoreCard inherits ResultCard {
+    in property <StoreRow> item;
+    shown: root.item.shown;
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        PreviewWell {
+            source: root.item.preview;
+            vertical-stretch: 1;
+        }
+        VerticalLayout {
+            padding-left: 6px;
+            padding-right: 6px;
+            padding-top: 4px;
+            spacing: 2px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.item.name;
+                    font-size: 15px;
+                    font-weight: 600;
+                    overflow: elide;
+                    horizontal-stretch: 0;
+                }
+                if root.item.official: VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: @tr("Official");
+                        glyph: "\u{E930}";
+                        tone: 1;
+                    }
+                }
+                Rectangle { }
+                if root.item.state != 0: VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: root.item.state == 2 ? @tr("Update available") : @tr("Installed");
+                        glyph: root.item.state == 2 ? "\u{E896}" : "\u{E73E}";
+                        tone: root.item.state == 2 ? 2 : 0;
+                    }
+                }
+            }
+            Caption {
+                text: root.item.author;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+            Text {
+                text: root.item.description;
+                font-size: 13px;
+                wrap: word-wrap;
+                overflow: elide;
+                height: 36px;
+                color: Palette.foreground.with-alpha(0.85);
+            }
+            Caption {
+                text: root.item.summary;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+component SectionTitle inherits Text {
+    font-size: 16px;
+    font-weight: 600;
+}
+
 export component PanelWindow inherits Window {
     title: "Vitrine";
     icon: @image-url("../../../assets/icon/png/vitrine-32.png");
@@ -241,7 +630,8 @@ export component PanelWindow inherits Window {
     default-font-family: root.ui-font;
     default-font-size: 14px;
 
-    // 0 widgets, 1 gallery, 2 packages, 3 general, 4 instance settings, 5 widget detail
+    // 0 widgets, 1 gallery, 2 packages, 3 general, 4 instance settings, 5 widget detail,
+    // 6 store, 7 store pack
     in-out property <int> page: 0;
     in property <[InstanceRow]> instances;
     in property <[LibraryRow]> library;
@@ -286,477 +676,961 @@ export component PanelWindow inherits Window {
     callback set-hotkey(string);
     callback set-language(int);
     callback open-folder();
-    callback open-site();
     callback edit-layout();
 
-    HorizontalLayout {
-        // Navigation pane.
-        Rectangle {
-            width: 264px;
-            background: Palette.alternate-background;
-            VerticalLayout {
-                padding: 8px;
-                padding-top: 16px;
-                spacing: 4px;
-                HorizontalLayout {
-                    padding-left: 12px;
-                    padding-bottom: 18px;
-                    spacing: 10px;
-                    Image {
-                        source: @image-url("../../../assets/icon/png/vitrine-32.png");
-                        width: 24px;
-                        height: 24px;
-                    }
-                    Text {
-                        text: "Vitrine";
-                        font-size: 14px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
+    // Gallery search and filters; Rust recomputes the results on filter-changed.
+    in-out property <string> gallery-query;
+    in property <[PackChip]> pack-chips;
+    in-out property <int> pack-index: 0;
+    // 0 any, 1 small, 2 medium, 3 large
+    in-out property <int> size-filter: 0;
+    in-out property <bool> only-interactive;
+    in-out property <bool> only-online;
+    in property <int> result-count;
+    in property <string> result-text;
+    property <bool> filtered: root.gallery-query != "" || root.pack-index != 0 || root.size-filter != 0
+        || root.only-interactive || root.only-online;
+    callback filter-changed();
+    function clear-filters() {
+        root.gallery-query = "";
+        root.pack-index = 0;
+        root.size-filter = 0;
+        root.only-interactive = false;
+        root.only-online = false;
+        root.filter-changed();
+    }
+    function toggle-size(size: int) {
+        root.size-filter = root.size-filter == size ? 0 : size;
+        root.filter-changed();
+    }
+
+    // Store: 0 loading, 1 ready, 2 offline (and nothing cached).
+    in property <int> store-state;
+    // Showing the saved catalogue because the Store can't be reached.
+    in property <bool> store-stale;
+    in property <[StoreRow]> store-packs;
+    in property <int> store-count;
+    in property <string> store-count-text;
+    in-out property <string> store-query;
+    in property <[PackChip]> store-tags;
+    in-out property <int> store-tag;
+    in property <int> store-updates;
+    in property <StoreRow> store-detail;
+    in property <string> store-detail-meta;
+    in property <string> store-detail-description;
+    in property <[StoreWidgetRow]> store-detail-widgets;
+    in property <[PermissionRow]> store-detail-permissions;
+    in property <[DetailRow]> store-detail-facts;
+    // The install button's text; empty when the latest version is installed.
+    in property <string> store-action;
+    in property <string> store-note;
+    in property <bool> store-busy;
+    in property <float> store-progress;
+    in property <string> store-progress-text;
+    in property <string> store-error;
+    callback store-open();
+    callback store-retry();
+    callback store-filter-changed();
+    callback store-open-pack(string);
+    callback store-install();
+    callback store-open-repo();
+    function open-store() {
+        root.page = 6;
+        root.store-open();
+    }
+    function clear-store-filters() {
+        root.store-query = "";
+        root.store-tag = 0;
+        root.store-filter-changed();
+    }
+
+    // 0 follows Windows, 1 light, 2 dark (the VITRINE_THEME environment variable).
+    in property <int> theme;
+    changed theme => {
+        Palette.color-scheme = root.theme == 1 ? ColorScheme.light : root.theme == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+    init => {
+        keys.focus();
+    }
+
+    // Ctrl+F searches the current list; Esc clears the search.
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.modifiers.control && (event.text == "f" || event.text == "F")) {
+                if (root.page == 6 || root.page == 7) {
+                    root.page = 6;
+                    store-search.focus-input();
+                } else {
+                    root.page = 1;
+                    gallery-search.focus-input();
                 }
-                NavItem {
-                    glyph: "\u{E8A9}";
-                    label: @tr("My widgets");
-                    selected: root.page == 0 || root.page == 4;
-                    clicked => { root.page = 0; }
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if ((root.page == 1 || root.page == 5) && root.filtered) {
+                    root.clear-filters();
+                    return accept;
                 }
-                NavItem {
-                    glyph: "\u{E710}";
-                    label: @tr("Add widgets");
-                    selected: root.page == 1 || root.page == 5;
-                    clicked => { root.page = 1; }
+                if (root.page == 6 && (root.store-query != "" || root.store-tag != 0)) {
+                    root.clear-store-filters();
+                    return accept;
                 }
-                NavItem {
-                    glyph: "\u{E7B8}";
-                    label: @tr("Packages");
-                    selected: root.page == 2;
-                    clicked => { root.page = 2; }
-                }
-                NavItem {
-                    glyph: "\u{E713}";
-                    label: @tr("General");
-                    selected: root.page == 3;
-                    clicked => { root.page = 3; }
-                }
-                Rectangle { }
-                Caption {
-                    text: root.status;
-                    x: 12px;
-                    width: parent.width - 24px;
-                    opacity: root.status == "" ? 0 : 1;
-                    animate opacity { duration: 200ms; }
-                }
-                Caption {
-                    text: @tr("Version {}", root.version);
-                    x: 12px;
+                if (root.page == 5 || root.page == 4 || root.page == 7) {
+                    root.page = root.page == 5 ? 1 : root.page == 7 ? 6 : 0;
+                    return accept;
                 }
             }
+            reject
         }
-
-        // Pages, stacked; the active one fades in.
-        Rectangle {
-            background: Palette.background;
-
-            Page {
-                active: root.page == 0;
-                HorizontalLayout {
-                    PageTitle { text: @tr("My widgets"); }
-                    Rectangle { }
-                    VerticalLayout {
-                        alignment: center;
-                        Button {
-                            text: @tr("Edit layout");
-                            clicked => { root.edit-layout(); }
-                        }
-                    }
-                }
-                Caption {
-                    text: @tr("The widgets on your desktop. Arrange them in Edit layout (Ctrl+Alt+V); your windows step aside while you do.");
-                }
-                Rectangle { height: 8px; }
-                if root.instances.length == 0: Card {
-                    height: 120px;
-                    VerticalLayout {
-                        alignment: center;
+        HorizontalLayout {
+            // Navigation pane.
+            Rectangle {
+                width: 264px;
+                background: Palette.alternate-background;
+                VerticalLayout {
+                    padding: 8px;
+                    padding-top: 16px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-bottom: 18px;
                         spacing: 10px;
-                        Caption {
-                            text: @tr("No widgets yet.");
-                            horizontal-alignment: center;
+                        Image {
+                            source: @image-url("../../../assets/icon/png/vitrine-32.png");
+                            width: 24px;
+                            height: 24px;
                         }
-                        HorizontalLayout {
-                            alignment: center;
-                            Button {
-                                text: @tr("Browse widgets");
-                                primary: true;
-                                clicked => { root.page = 1; }
-                            }
-                        }
-                    }
-                }
-                for item in root.instances: Card {
-                    height: 76px;
-                    HorizontalLayout {
-                        padding: 8px;
-                        padding-right: 12px;
-                        spacing: 14px;
-                        PreviewWell {
-                            width: 104px;
-                            source: item.preview;
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: item.name; font-weight: 600; }
-                            Caption { text: item.detail; }
-                        }
-                        Rectangle { }
-                        if item.has-settings: VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: @tr("Settings");
-                                clicked => { root.open-settings(item.id); }
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: @tr("Remove");
-                                clicked => { root.remove-instance(item.id); }
-                            }
+                        Text {
+                            text: "Vitrine";
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
                         }
                     }
-                }
-            }
-
-            Page {
-                active: root.page == 1;
-                HorizontalLayout {
-                    PageTitle { text: @tr("Add widgets"); }
-                    Rectangle { }
-                    VerticalLayout {
-                        alignment: center;
-                        Button {
-                            text: @tr("Get more widgets");
-                            clicked => { root.open-site(); }
-                        }
-                    }
-                }
-                Caption { text: @tr("Choose a widget to preview it, pick a size and add it to your desktop."); }
-                Rectangle { height: 8px; }
-                grid := Rectangle {
-                    property <length> gap: 12px;
-                    property <int> cols: Math.max(1, Math.floor((self.width + gap) / (220px + gap)));
-                    property <length> card-w: (self.width - (cols - 1) * gap) / cols;
-                    property <length> card-h: card-w * 0.78;
-                    height: Math.ceil(root.library.length / cols) * (card-h + gap);
-                    for item[i] in root.library: GalleryCard {
-                        item: item;
-                        x: Math.mod(i, grid.cols) * (grid.card-w + grid.gap);
-                        y: Math.floor(i / grid.cols) * (grid.card-h + grid.gap);
-                        width: grid.card-w;
-                        height: grid.card-h;
-                        clicked => { root.open-detail(item.package, item.widget); }
-                    }
-                }
-            }
-
-            Page {
-                active: root.page == 2;
-                HorizontalLayout {
-                    PageTitle { text: @tr("Packages"); }
-                    Rectangle { }
-                    VerticalLayout {
-                        alignment: center;
-                        Button {
-                            text: @tr("Install package…");
-                            primary: true;
-                            clicked => { root.install-file(); }
-                        }
-                    }
-                }
-                Caption {
-                    text: @tr("A package (.vitrine) contains one or more widgets. Double-click a .vitrine file to install it.");
-                }
-                Rectangle { height: 8px; }
-                for item in root.packages: Card {
-                    height: 64px;
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 12px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: item.name; font-weight: 600; }
-                            Caption { text: item.detail; }
-                        }
-                        Rectangle { }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: @tr("Uninstall");
-                                clicked => { root.uninstall(item.id); }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Page {
-                active: root.page == 3;
-                PageTitle { text: @tr("General"); }
-                Rectangle { height: 8px; }
-                Card {
-                    height: 68px;
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: @tr("Start with Windows"); }
-                            Caption { text: @tr("Show your widgets when you sign in."); }
-                        }
-                        Rectangle { }
-                        Switch {
-                            checked <=> root.autostart;
-                            toggled => { root.set-autostart(self.checked); }
-                        }
-                    }
-                }
-                Card {
-                    height: 68px;
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: @tr("Save battery"); }
-                            Caption { text: @tr("Update system widgets less often on battery power."); }
-                        }
-                        Rectangle { }
-                        Switch {
-                            checked <=> root.slow-on-battery;
-                            toggled => { root.set-slow-on-battery(self.checked); }
-                        }
-                    }
-                }
-                Card {
-                    height: root.hotkey-error == "" ? 68px : 88px;
-                    animate height { duration: 160ms; }
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        spacing: 12px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: @tr("Edit layout shortcut"); }
-                            Caption { text: @tr("For example Ctrl+Alt+V. Takes effect the next time Vitrine starts."); }
-                            if root.hotkey-error != "": Text {
-                                text: root.hotkey-error;
-                                color: #e81123;
-                                font-size: 12px;
-                            }
-                        }
-                        Rectangle { }
-                        VerticalLayout {
-                            alignment: center;
-                            LineEdit {
-                                width: 160px;
-                                text <=> root.hotkey;
-                                accepted(t) => { root.set-hotkey(t); }
-                                edited(t) => { root.set-hotkey(t); }
-                            }
-                        }
-                    }
-                }
-                Card {
-                    height: 68px;
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        spacing: 12px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: @tr("Language"); }
-                            Caption { text: @tr("Used by Vitrine and by widgets that support it."); }
-                        }
-                        Rectangle { }
-                        VerticalLayout {
-                            alignment: center;
-                            ComboBox {
-                                width: 220px;
-                                model: root.languages;
-                                current-index <=> root.language-index;
-                                selected => { root.set-language(self.current-index); }
-                            }
-                        }
-                    }
-                }
-                Card {
-                    height: 68px;
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        VerticalLayout {
-                            alignment: center;
-                            Text { text: @tr("Data folder"); }
-                            Caption { text: @tr("Layout, settings, packages and logs."); }
-                        }
-                        Rectangle { }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: @tr("Open");
-                                clicked => { root.open-folder(); }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Page {
-                active: root.page == 4;
-                HorizontalLayout {
-                    spacing: 8px;
-                    IconButton {
-                        glyph: "\u{E72B}";
-                        y: 4px;
+                    NavItem {
+                        glyph: "\u{E8A9}";
+                        label: @tr("My widgets");
+                        selected: root.page == 0 || root.page == 4;
                         clicked => { root.page = 0; }
                     }
-                    PageTitle { text: root.settings-title; }
+                    NavItem {
+                        glyph: "\u{E710}";
+                        label: @tr("Add widgets");
+                        selected: root.page == 1 || root.page == 5;
+                        clicked => { root.page = 1; }
+                    }
+                    NavItem {
+                        glyph: "\u{E719}";
+                        label: @tr("Store");
+                        selected: root.page == 6 || root.page == 7;
+                        badge: root.store-updates;
+                        clicked => { root.open-store(); }
+                    }
+                    NavItem {
+                        glyph: "\u{E7B8}";
+                        label: @tr("Packages");
+                        selected: root.page == 2;
+                        clicked => { root.page = 2; }
+                    }
+                    NavItem {
+                        glyph: "\u{E713}";
+                        label: @tr("General");
+                        selected: root.page == 3;
+                        clicked => { root.page = 3; }
+                    }
+                    Rectangle { }
+                    Caption {
+                        text: root.status;
+                        x: 12px;
+                        width: parent.width - 24px;
+                        opacity: root.status == "" ? 0 : 1;
+                        animate opacity { duration: 200ms; }
+                    }
+                    Caption {
+                        text: @tr("Version {}", root.version);
+                        x: 12px;
+                    }
                 }
-                Caption { text: root.settings-subtitle; }
-                Rectangle { height: 8px; }
-                PreviewWell {
-                    height: 200px;
-                    source: root.settings-preview;
-                    opacity: root.settings-preview-busy ? 0.6 : 1;
-                    animate opacity { duration: 180ms; }
+            }
+
+            // Pages, stacked; the active one fades in.
+            Rectangle {
+                background: Palette.background;
+
+                Page {
+                    active: root.page == 0;
+                    HorizontalLayout {
+                        PageTitle { text: @tr("My widgets"); }
+                        Rectangle { }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: @tr("Edit layout");
+                                clicked => { root.edit-layout(); }
+                            }
+                        }
+                    }
+                    Caption {
+                        text: @tr("The widgets on your desktop. Arrange them in Edit layout (Ctrl+Alt+V); your windows step aside while you do.");
+                    }
+                    Rectangle { height: 8px; }
+                    if root.instances.length == 0: Card {
+                        height: 120px;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 10px;
+                            Caption {
+                                text: @tr("No widgets yet.");
+                                horizontal-alignment: center;
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Browse widgets");
+                                    primary: true;
+                                    clicked => { root.page = 1; }
+                                }
+                            }
+                        }
+                    }
+                    for item in root.instances: Card {
+                        height: 76px;
+                        HorizontalLayout {
+                            padding: 8px;
+                            padding-right: 12px;
+                            spacing: 14px;
+                            PreviewWell {
+                                width: 104px;
+                                source: item.preview;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: item.name; font-weight: 600; }
+                                Caption { text: item.detail; }
+                            }
+                            Rectangle { }
+                            if item.has-settings: VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Settings");
+                                    clicked => { root.open-settings(item.id); }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Remove");
+                                    clicked => { root.remove-instance(item.id); }
+                                }
+                            }
+                        }
+                    }
                 }
-                Rectangle { height: 8px; }
-                for row in root.settings: VerticalLayout {
-                    spacing: 4px;
-                    if row.section != "": Text {
-                        text: row.section;
-                        font-weight: 600;
-                        font-size: 14px;
+
+                Page {
+                    active: root.page == 1;
+                    HorizontalLayout {
+                        PageTitle { text: @tr("Add widgets"); }
+                        Rectangle { }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: @tr("Get more widgets");
+                                clicked => { root.open-store(); }
+                            }
+                        }
+                    }
+                    Caption { text: @tr("Choose a widget to preview it, pick a size and add it to your desktop."); }
+                    Rectangle { height: 8px; }
+                    HorizontalLayout {
+                        spacing: 16px;
+                        gallery-search := SearchBox {
+                            placeholder: @tr("Search widgets");
+                            text <=> root.gallery-query;
+                            edited => { root.filter-changed(); }
+                        }
+                        Caption {
+                            text: root.result-text;
+                            vertical-alignment: center;
+                            wrap: no-wrap;
+                            horizontal-stretch: 0;
+                        }
+                    }
+                    Flickable {
+                        height: 40px;
+                        content-width: chips.preferred-width;
+                        chips := HorizontalLayout {
+                            spacing: 8px;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            for chip[i] in root.pack-chips: PackChipView {
+                                chip: chip;
+                                selected: i == root.pack-index;
+                                clicked => {
+                                    root.pack-index = i;
+                                    root.filter-changed();
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        FacetChip {
+                            text: @tr("Small");
+                            selected: root.size-filter == 1;
+                            clicked => { root.toggle-size(1); }
+                        }
+                        FacetChip {
+                            text: @tr("Medium");
+                            selected: root.size-filter == 2;
+                            clicked => { root.toggle-size(2); }
+                        }
+                        FacetChip {
+                            text: @tr("Large");
+                            selected: root.size-filter == 3;
+                            clicked => { root.toggle-size(3); }
+                        }
+                        Rectangle {
+                            width: 1px;
+                            background: Palette.border.with-alpha(0.5);
+                        }
+                        FacetChip {
+                            text: @tr("Interactive");
+                            glyph: "\u{E7C9}";
+                            selected: root.only-interactive;
+                            clicked => {
+                                root.only-interactive = !root.only-interactive;
+                                root.filter-changed();
+                            }
+                        }
+                        FacetChip {
+                            text: @tr("Uses the internet");
+                            glyph: "\u{E774}";
+                            selected: root.only-online;
+                            clicked => {
+                                root.only-online = !root.only-online;
+                                root.filter-changed();
+                            }
+                        }
+                    }
+                    Rectangle { height: 6px; }
+                    if root.library.length == 0: EmptyState {
+                        glyph: "\u{E719}";
+                        title: @tr("No widgets installed");
+                        caption: @tr("Find widget packs in the Store.");
+                        action: @tr("Open the Store");
+                        activated => { root.open-store(); }
+                    }
+                    if root.library.length > 0 && root.result-count == 0: EmptyState {
+                        glyph: "\u{E721}";
+                        title: @tr("No widgets found");
+                        caption: @tr("Try a different search, or clear the filters.");
+                        action: @tr("Clear filters");
+                        activated => { root.clear-filters(); }
+                    }
+                    grid := Rectangle {
+                        property <length> gap: 12px;
+                        property <int> cols: Math.max(1, Math.floor((self.width + gap) / (220px + gap)));
+                        property <length> card-w: (self.width - (cols - 1) * gap) / cols;
+                        property <length> card-h: card-w * 0.78;
+                        height: Math.ceil(root.result-count / cols) * (card-h + gap);
+                        animate height { duration: 320ms; easing: cubic-bezier(0.1, 0.9, 0.2, 1); }
+                        for item[i] in root.library: GalleryCard {
+                            item: item;
+                            x: Math.mod(item.slot, grid.cols) * (grid.card-w + grid.gap);
+                            y: Math.floor(item.slot / grid.cols) * (grid.card-h + grid.gap);
+                            animate x, y { duration: 340ms; easing: cubic-bezier(0.1, 0.9, 0.2, 1); }
+                            width: grid.card-w;
+                            height: grid.card-h;
+                            clicked => { root.open-detail(item.package, item.widget); }
+                        }
+                    }
+                }
+
+                Page {
+                    active: root.page == 2;
+                    HorizontalLayout {
+                        PageTitle { text: @tr("Packages"); }
+                        Rectangle { }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: @tr("Install package…");
+                                primary: true;
+                                clicked => { root.install-file(); }
+                            }
+                        }
+                    }
+                    Caption {
+                        text: @tr("A package (.vitrine) contains one or more widgets. Double-click a .vitrine file to install it.");
+                    }
+                    Rectangle { height: 8px; }
+                    for item in root.packages: Card {
+                        height: 64px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 12px;
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: item.name; font-weight: 600; }
+                                Caption { text: item.detail; }
+                            }
+                            Rectangle { }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Uninstall");
+                                    clicked => { root.uninstall(item.id); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Page {
+                    active: root.page == 3;
+                    PageTitle { text: @tr("General"); }
+                    Rectangle { height: 8px; }
+                    Card {
+                        height: 68px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: @tr("Start with Windows"); }
+                                Caption { text: @tr("Show your widgets when you sign in."); }
+                            }
+                            Rectangle { }
+                            Switch {
+                                checked <=> root.autostart;
+                                toggled => { root.set-autostart(self.checked); }
+                            }
+                        }
                     }
                     Card {
-                        height: row.error != "" ? 84px : (row.description != "" ? 68px : 52px);
-                        opacity: row.enabled ? 1 : 0.5;
-                        animate opacity { duration: 160ms; }
+                        height: 68px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: @tr("Save battery"); }
+                                Caption { text: @tr("Update system widgets less often on battery power."); }
+                            }
+                            Rectangle { }
+                            Switch {
+                                checked <=> root.slow-on-battery;
+                                toggled => { root.set-slow-on-battery(self.checked); }
+                            }
+                        }
+                    }
+                    Card {
+                        height: root.hotkey-error == "" ? 68px : 88px;
+                        animate height { duration: 160ms; }
                         HorizontalLayout {
                             padding-left: 16px;
                             padding-right: 16px;
                             spacing: 12px;
                             VerticalLayout {
                                 alignment: center;
-                                Text { text: row.label; }
-                                if row.description != "": Caption { text: row.description; }
-                                if row.error != "": Text {
-                                    text: row.error;
+                                Text { text: @tr("Edit layout shortcut"); }
+                                Caption { text: @tr("For example Ctrl+Alt+V. Takes effect the next time Vitrine starts."); }
+                                if root.hotkey-error != "": Text {
+                                    text: root.hotkey-error;
                                     color: #e81123;
                                     font-size: 12px;
                                 }
                             }
                             Rectangle { }
-                            if row.kind == 0: Switch {
-                                enabled: row.enabled;
-                                checked: row.bool-value;
-                                toggled => { root.set-bool(row.key, self.checked); }
-                            }
-                            if row.kind == 1: VerticalLayout {
-                                alignment: center;
-                                SpinBox {
-                                    width: 140px;
-                                    enabled: row.enabled;
-                                    minimum: row.min;
-                                    maximum: row.max;
-                                    step-size: row.step;
-                                    value: row.int-value;
-                                    edited(v) => { root.set-int(row.key, v); }
-                                }
-                            }
-                            if row.kind == 2 || row.kind == 4: VerticalLayout {
+                            VerticalLayout {
                                 alignment: center;
                                 LineEdit {
-                                    width: 220px;
-                                    enabled: row.enabled;
-                                    text: row.text-value;
-                                    input-type: row.kind == 4 ? InputType.decimal : InputType.text;
-                                    edited(t) => { root.set-text(row.key, t); }
+                                    width: 160px;
+                                    text <=> root.hotkey;
+                                    accepted(t) => { root.set-hotkey(t); }
+                                    edited(t) => { root.set-hotkey(t); }
                                 }
                             }
-                            if row.kind == 3: VerticalLayout {
+                        }
+                    }
+                    Card {
+                        height: 68px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: @tr("Language"); }
+                                Caption { text: @tr("Used by Vitrine and by widgets that support it."); }
+                            }
+                            Rectangle { }
+                            VerticalLayout {
                                 alignment: center;
                                 ComboBox {
                                     width: 220px;
-                                    enabled: row.enabled;
-                                    model: row.options;
-                                    current-index: row.selected;
-                                    selected => { root.set-choice(row.key, self.current-index); }
+                                    model: root.languages;
+                                    current-index <=> root.language-index;
+                                    selected => { root.set-language(self.current-index); }
+                                }
+                            }
+                        }
+                    }
+                    Card {
+                        height: 68px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            VerticalLayout {
+                                alignment: center;
+                                Text { text: @tr("Data folder"); }
+                                Caption { text: @tr("Layout, settings, packages and logs."); }
+                            }
+                            Rectangle { }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Open");
+                                    clicked => { root.open-folder(); }
                                 }
                             }
                         }
                     }
                 }
-                HorizontalLayout {
-                    padding-top: 8px;
-                    Button {
-                        text: @tr("Reset to defaults");
-                        clicked => { root.reset-settings(); }
-                    }
-                    Rectangle { }
-                }
-            }
 
-            Page {
-                active: root.page == 5;
-                HorizontalLayout {
-                    spacing: 8px;
-                    IconButton {
-                        glyph: "\u{E72B}";
-                        y: 4px;
-                        clicked => { root.page = 1; }
+                Page {
+                    active: root.page == 4;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        IconButton {
+                            glyph: "\u{E72B}";
+                            y: 4px;
+                            clicked => { root.page = 0; }
+                        }
+                        PageTitle { text: root.settings-title; }
                     }
-                    PageTitle { text: root.detail.name; }
+                    Caption { text: root.settings-subtitle; }
+                    Rectangle { height: 8px; }
+                    PreviewWell {
+                        height: 200px;
+                        source: root.settings-preview;
+                        opacity: root.settings-preview-busy ? 0.6 : 1;
+                        animate opacity { duration: 180ms; }
+                    }
+                    Rectangle { height: 8px; }
+                    for row in root.settings: VerticalLayout {
+                        spacing: 4px;
+                        if row.section != "": Text {
+                            text: row.section;
+                            font-weight: 600;
+                            font-size: 14px;
+                        }
+                        Card {
+                            height: row.error != "" ? 84px : (row.description != "" ? 68px : 52px);
+                            opacity: row.enabled ? 1 : 0.5;
+                            animate opacity { duration: 160ms; }
+                            HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                spacing: 12px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text { text: row.label; }
+                                    if row.description != "": Caption { text: row.description; }
+                                    if row.error != "": Text {
+                                        text: row.error;
+                                        color: #e81123;
+                                        font-size: 12px;
+                                    }
+                                }
+                                Rectangle { }
+                                if row.kind == 0: Switch {
+                                    enabled: row.enabled;
+                                    checked: row.bool-value;
+                                    toggled => { root.set-bool(row.key, self.checked); }
+                                }
+                                if row.kind == 1: VerticalLayout {
+                                    alignment: center;
+                                    SpinBox {
+                                        width: 140px;
+                                        enabled: row.enabled;
+                                        minimum: row.min;
+                                        maximum: row.max;
+                                        step-size: row.step;
+                                        value: row.int-value;
+                                        edited(v) => { root.set-int(row.key, v); }
+                                    }
+                                }
+                                if row.kind == 2 || row.kind == 4: VerticalLayout {
+                                    alignment: center;
+                                    LineEdit {
+                                        width: 220px;
+                                        enabled: row.enabled;
+                                        text: row.text-value;
+                                        input-type: row.kind == 4 ? InputType.decimal : InputType.text;
+                                        edited(t) => { root.set-text(row.key, t); }
+                                    }
+                                }
+                                if row.kind == 3: VerticalLayout {
+                                    alignment: center;
+                                    ComboBox {
+                                        width: 220px;
+                                        enabled: row.enabled;
+                                        model: row.options;
+                                        current-index: row.selected;
+                                        selected => { root.set-choice(row.key, self.current-index); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-top: 8px;
+                        Button {
+                            text: @tr("Reset to defaults");
+                            clicked => { root.reset-settings(); }
+                        }
+                        Rectangle { }
+                    }
                 }
-                Caption {
-                    text: root.detail.description != "" ? root.detail.description + " · " + root.detail.pack : root.detail.pack;
-                }
-                Rectangle { height: 8px; }
-                PreviewWell {
-                    height: 300px;
-                    source: root.detail-preview;
-                    opacity: root.detail-busy ? 0.55 : 1;
-                    animate opacity { duration: 180ms; }
-                }
-                Rectangle { height: 12px; }
-                Text {
-                    text: @tr("Size");
-                    font-weight: 600;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    for s[i] in root.detail-sizes: Chip {
-                        text: s;
-                        selected: i == root.detail-size;
-                        clicked => {
-                            root.detail-size = i;
-                            root.choose-size(i);
+
+                Page {
+                    active: root.page == 5;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        IconButton {
+                            glyph: "\u{E72B}";
+                            y: 4px;
+                            clicked => { root.page = 1; }
+                        }
+                        PageTitle { text: root.detail.name; }
+                    }
+                    Caption {
+                        text: root.detail.description != "" ? root.detail.description + " · " + root.detail.pack : root.detail.pack;
+                    }
+                    Rectangle { height: 8px; }
+                    PreviewWell {
+                        height: 300px;
+                        source: root.detail-preview;
+                        opacity: root.detail-busy ? 0.55 : 1;
+                        animate opacity { duration: 180ms; }
+                    }
+                    Rectangle { height: 12px; }
+                    Text {
+                        text: @tr("Size");
+                        font-weight: 600;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        for s[i] in root.detail-sizes: Chip {
+                            text: s;
+                            selected: i == root.detail-size;
+                            clicked => {
+                                root.detail-size = i;
+                                root.choose-size(i);
+                            }
+                        }
+                    }
+                    Rectangle { height: 12px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Button {
+                            text: @tr("Add to desktop");
+                            primary: true;
+                            clicked => { root.add-detail(); }
+                        }
+                        Button {
+                            text: @tr("Place it myself…");
+                            clicked => { root.place-detail(); }
                         }
                     }
                 }
-                Rectangle { height: 12px; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    Button {
-                        text: @tr("Add to desktop");
-                        primary: true;
-                        clicked => { root.add-detail(); }
+
+                Page {
+                    active: root.page == 6;
+                    HorizontalLayout {
+                        PageTitle { text: @tr("Store"); }
+                        Rectangle { }
+                        VerticalLayout {
+                            alignment: center;
+                            IconButton {
+                                glyph: "\u{E72C}";
+                                clicked => { root.store-retry(); }
+                            }
+                        }
                     }
-                    Button {
-                        text: @tr("Place it myself…");
-                        clicked => { root.place-detail(); }
+                    Caption { text: @tr("Widget packs from the Vitrine community. Each one is reviewed before it's listed."); }
+                    Rectangle { height: 8px; }
+                    HorizontalLayout {
+                        spacing: 16px;
+                        store-search := SearchBox {
+                            placeholder: @tr("Search packs");
+                            text <=> root.store-query;
+                            edited => { root.store-filter-changed(); }
+                        }
+                        Caption {
+                            text: root.store-count-text;
+                            vertical-alignment: center;
+                            wrap: no-wrap;
+                            horizontal-stretch: 0;
+                        }
+                    }
+                    Flickable {
+                        height: 40px;
+                        content-width: tags.preferred-width;
+                        tags := HorizontalLayout {
+                            spacing: 8px;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            for tag[i] in root.store-tags: PackChipView {
+                                chip: tag;
+                                selected: i == root.store-tag;
+                                clicked => {
+                                    root.store-tag = i;
+                                    root.store-filter-changed();
+                                }
+                            }
+                        }
+                    }
+                    if root.store-stale && root.store-state == 1: Card {
+                        height: 44px;
+                        background: Palette.accent-background.with-alpha(0.08);
+                        border-color: Palette.accent-background.with-alpha(0.35);
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 6px;
+                            spacing: 12px;
+                            Glyph {
+                                text: "\u{F384}";
+                                width: 18px;
+                            }
+                            Text {
+                                text: @tr("You're offline. This is the Store as it was last time.");
+                                vertical-alignment: center;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                            Rectangle { }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Try again");
+                                    clicked => { root.store-retry(); }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 6px; }
+                    if root.store-state == 0: EmptyState {
+                        busy: true;
+                        title: @tr("Loading the Store…");
+                    }
+                    if root.store-state == 2: EmptyState {
+                        glyph: "\u{F384}";
+                        title: @tr("Can't reach the Store");
+                        caption: @tr("Check your internet connection and try again.");
+                        action: @tr("Try again");
+                        activated => { root.store-retry(); }
+                    }
+                    if root.store-state == 1 && root.store-count == 0: EmptyState {
+                        glyph: "\u{E721}";
+                        title: @tr("No packs found");
+                        caption: @tr("Try a different search, or clear the filters.");
+                        action: @tr("Clear filters");
+                        activated => { root.clear-store-filters(); }
+                    }
+                    store-grid := Rectangle {
+                        property <length> gap: 14px;
+                        property <int> cols: Math.max(1, Math.floor((self.width + gap) / (290px + gap)));
+                        property <length> card-w: (self.width - (cols - 1) * gap) / cols;
+                        property <length> card-h: card-w * 0.5 + 118px;
+                        height: root.store-state == 1 ? Math.ceil(root.store-count / cols) * (card-h + gap) : 0px;
+                        animate height { duration: 320ms; easing: cubic-bezier(0.1, 0.9, 0.2, 1); }
+                        for item in root.store-packs: StoreCard {
+                            item: item;
+                            x: Math.mod(item.slot, store-grid.cols) * (store-grid.card-w + store-grid.gap);
+                            y: Math.floor(item.slot / store-grid.cols) * (store-grid.card-h + store-grid.gap);
+                            animate x, y { duration: 340ms; easing: cubic-bezier(0.1, 0.9, 0.2, 1); }
+                            width: store-grid.card-w;
+                            height: store-grid.card-h;
+                            clicked => { root.store-open-pack(item.id); }
+                        }
+                    }
+                }
+
+                Page {
+                    active: root.page == 7;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        IconButton {
+                            glyph: "\u{E72B}";
+                            y: 4px;
+                            clicked => { root.page = 6; }
+                        }
+                        PageTitle {
+                            text: root.store-detail.name;
+                            horizontal-stretch: 0;
+                        }
+                        if root.store-detail.official: VerticalLayout {
+                            alignment: center;
+                            padding-top: 4px;
+                            padding-left: 4px;
+                            Pill {
+                                text: @tr("Official");
+                                glyph: "\u{E930}";
+                                tone: 1;
+                            }
+                        }
+                        Rectangle { }
+                    }
+                    Caption { text: root.store-detail-meta; }
+                    Rectangle { height: 4px; }
+                    if root.store-detail-description != "": Text {
+                        text: root.store-detail-description;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 8px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        if root.store-action != "": Button {
+                            text: root.store-action;
+                            primary: true;
+                            enabled: !root.store-busy && root.store-note == "";
+                            clicked => { root.store-install(); }
+                        }
+                        if root.store-action == "": Button {
+                            text: @tr("Installed");
+                            enabled: false;
+                        }
+                        Button {
+                            text: @tr("View on GitHub");
+                            clicked => { root.store-open-repo(); }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            padding-left: 8px;
+                            spacing: 4px;
+                            opacity: root.store-busy ? 1 : 0;
+                            animate opacity { duration: 200ms; }
+                            ProgressIndicator {
+                                width: 200px;
+                                progress: root.store-progress;
+                                indeterminate: root.store-busy && root.store-progress <= 0;
+                            }
+                            Caption {
+                                text: root.store-progress-text;
+                                wrap: no-wrap;
+                            }
+                        }
+                    }
+                    if root.store-note != "": Caption { text: root.store-note; }
+                    if root.store-error != "": Text {
+                        text: root.store-error;
+                        color: #e81123;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                    Rectangle { height: 14px; }
+                    SectionTitle { text: @tr("Widgets"); }
+                    for w in root.store-detail-widgets: Card {
+                        height: 96px;
+                        HorizontalLayout {
+                            padding: 8px;
+                            padding-right: 14px;
+                            spacing: 14px;
+                            PreviewWell {
+                                width: 136px;
+                                source: w.preview;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                Text {
+                                    text: w.name;
+                                    font-weight: 600;
+                                }
+                                if w.description != "": Caption {
+                                    text: w.description;
+                                    wrap: no-wrap;
+                                    overflow: elide;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    padding-top: 4px;
+                                    Pill {
+                                        text: w.size;
+                                        glyph: "\u{E740}";
+                                    }
+                                    if w.interactive: Pill {
+                                        text: @tr("Interactive");
+                                        glyph: "\u{E7C9}";
+                                    }
+                                    if w.online: Pill {
+                                        text: @tr("Uses the internet");
+                                        glyph: "\u{E774}";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 14px; }
+                    SectionTitle { text: @tr("Permissions"); }
+                    Caption { text: @tr("What these widgets are allowed to use. Anything not listed stays off-limits."); }
+                    Card {
+                        height: perms.preferred-height;
+                        perms := VerticalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            for p in root.store-detail-permissions: HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                padding-top: 10px;
+                                padding-bottom: 10px;
+                                spacing: 14px;
+                                Glyph {
+                                    text: p.glyph;
+                                    width: 20px;
+                                    color: Palette.accent-background;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Text { text: p.title; }
+                                    if p.detail != "": Caption { text: p.detail; }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle { height: 14px; }
+                    SectionTitle { text: @tr("Details"); }
+                    Card {
+                        height: facts.preferred-height;
+                        facts := VerticalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            for f in root.store-detail-facts: HorizontalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                height: 38px;
+                                spacing: 12px;
+                                Text {
+                                    text: f.label;
+                                    vertical-alignment: center;
+                                    width: 160px;
+                                }
+                                Caption {
+                                    text: f.value;
+                                    vertical-alignment: center;
+                                    wrap: no-wrap;
+                                    overflow: elide;
+                                }
+                            }
+                        }
                     }
                 }
             }
