@@ -35,9 +35,17 @@ the 2.1.0 theme releases deleted. Don't add widgets to the themes without asking
 
 ## Next steps (in order)
 
-1. **Check the site** the last agent pushed (landing, `/store/`, docs) in light/dark and mobile; it was
-   still doing final checks when the session ended. Alnitak's merged widget and the removed theme
-   widgets must be reflected there.
+1. **Review the site** (deployed, 65 pages, no broken links): landing with real renders, Store at
+   `/packs/` and `/it/packs/` (`/store/` is the catalogue's own Pages site), 50 docs pages for SDK
+   v2.2.0. Check that Alnitak's merged widget and the removed theme widgets are reflected. Point the
+   tray's "Get more widgets" fallback / site links at `/packs/` where relevant.
+   Issues the site agent found while documenting (verify, then fix):
+   - `net:*.host` wildcard is rejected by the manifest parser;
+   - the `system` metric has no permission that grants it;
+   - `minEngine` is never enforced;
+   - `transform` transitions don't animate, though Essentials' to-do and links use them;
+   - the SDK template fails `tsc`: Solid's JSX types clash with `view`/`text`/`svg`;
+   - the Antares date widget clips "Wednesday" at every width.
 2. **Release Vitrine 2.0.0**: review `docs/release-notes/v2.0.0.md` (add menus, store, languages,
    search), then `git tag -a v2.0.0 && git push origin v2.0.0`. `release.yml` builds the NSIS installer
    (with the latest Essentials release) and a portable zip. The installer was never compiled locally
