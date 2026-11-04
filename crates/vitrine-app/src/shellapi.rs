@@ -73,6 +73,7 @@ impl Drop for Tray {
 }
 
 /// A popup menu built from a simple description.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     Action {
         id: u32,
@@ -205,6 +206,11 @@ pub fn popup(owner: HWND, pt: POINT, items: &[Item]) -> Option<u32> {
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = w!("Vitrine");
 
+/// The `Run` value that starts `exe` at logon (quoted: the path may contain spaces).
+fn run_command(exe: &std::path::Path) -> String {
+    format!("\"{}\"", exe.display())
+}
+
 pub fn autostart_enabled() -> bool {
     unsafe {
         RegGetValueW(
@@ -226,7 +232,7 @@ pub fn set_autostart(enable: bool) -> windows::core::Result<()> {
         RegCreateKeyW(HKEY_CURRENT_USER, RUN_KEY, &mut key).ok()?;
         let result = if enable {
             let exe = std::env::current_exe().map_err(|_| windows::core::Error::from_thread())?;
-            let value = wide(&format!("\"{}\"", exe.display()));
+            let value = wide(&run_command(&exe));
             let bytes = std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 2);
             RegSetValueExW(key, RUN_VALUE, None, REG_SZ, Some(bytes)).ok()
         } else {
@@ -254,5 +260,209 @@ pub fn open(target: &str) {
             None,
             SW_SHOWNORMAL,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_is_nul_terminated_utf16() {
+        assert_eq!(wide(""), vec![0]);
+        assert_eq!(wide("Ab"), vec![b'A' as u16, b'b' as u16, 0]);
+        // Non-BMP characters take two code units.
+        assert_eq!(wide("é😀").len(), 1 + 2 + 1);
+        assert_eq!(*wide("é😀").last().unwrap(), 0);
+    }
+
+    #[test]
+    fn copy_tip_fits_and_terminates() {
+        let mut buf = [0xFFFFu16; 8];
+        copy_tip(&mut buf, "abc");
+        assert_eq!(&buf[..4], &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+        // The rest is left untouched.
+        assert_eq!(buf[4], 0xFFFF);
+    }
+
+    #[test]
+    fn copy_tip_truncates_long_text() {
+        let mut buf = [0xFFFFu16; 4];
+        copy_tip(&mut buf, "abcdefgh");
+        assert_eq!(buf, [b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+        // Exactly full: the terminator replaces the last character.
+        let mut buf = [0xFFFFu16; 3];
+        copy_tip(&mut buf, "abc");
+        assert_eq!(buf, [b'a' as u16, b'b' as u16, 0]);
+    }
+
+    #[test]
+    fn copy_tip_into_real_tip_buffer() {
+        let mut data = NOTIFYICONDATAW::default();
+        let long = "x".repeat(500);
+        copy_tip(&mut data.szTip, &long);
+        assert_eq!(data.szTip[data.szTip.len() - 1], 0);
+        assert_eq!(data.szTip[0], b'x' as u16);
+        copy_tip(&mut data.szTip, "");
+        assert_eq!(data.szTip[0], 0);
+        // An empty buffer is a no-op, not a panic.
+        copy_tip(&mut [], "abc");
+    }
+
+    #[test]
+    fn item_constructors() {
+        assert_eq!(
+            Item::action(4, "Open"),
+            Item::Action {
+                id: 4,
+                label: "Open".into(),
+                checked: false,
+                enabled: true
+            }
+        );
+        assert_eq!(
+            Item::check(2, "Pause", true),
+            Item::Action {
+                id: 2,
+                label: "Pause".into(),
+                checked: true,
+                enabled: true
+            }
+        );
+        assert_eq!(
+            Item::disabled("None"),
+            Item::Action {
+                id: 0,
+                label: "None".into(),
+                checked: false,
+                enabled: false
+            }
+        );
+    }
+
+    struct Info {
+        id: u32,
+        text: String,
+        checked: bool,
+        grayed: bool,
+        separator: bool,
+        sub: Option<HMENU>,
+    }
+
+    fn info(menu: HMENU, pos: u32) -> Info {
+        let mut buf = [0u16; 128];
+        let mut mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_ID | MIIM_STATE | MIIM_FTYPE | MIIM_SUBMENU | MIIM_STRING,
+            dwTypeData: windows::core::PWSTR(buf.as_mut_ptr()),
+            cch: buf.len() as u32,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(menu, pos, true, &mut mii) }.unwrap();
+        Info {
+            id: mii.wID,
+            text: String::from_utf16_lossy(&buf[..mii.cch as usize]),
+            checked: (mii.fState & MFS_CHECKED).0 != 0,
+            grayed: (mii.fState & MFS_GRAYED).0 != 0,
+            separator: (mii.fType & MFT_SEPARATOR).0 != 0,
+            sub: (!mii.hSubMenu.is_invalid()).then_some(mii.hSubMenu),
+        }
+    }
+
+    fn count(menu: HMENU) -> i32 {
+        unsafe { GetMenuItemCount(Some(menu)) }
+    }
+
+    #[test]
+    fn build_creates_real_menus() {
+        let items = vec![
+            Item::action(9, "Add widgets…"),
+            Item::Sub {
+                label: "Quick add".into(),
+                items: vec![
+                    Item::action(1000, "Clock"),
+                    Item::Separator,
+                    Item::action(1001, "Weather"),
+                ],
+            },
+            Item::check(1, "Edit layout", true),
+            Item::check(2, "Pause widgets", false),
+            Item::Separator,
+            Item::disabled("Nothing here"),
+        ];
+        let menu = build(&items);
+        assert!(!menu.is_invalid());
+        assert_eq!(count(menu), 6);
+
+        let a = info(menu, 0);
+        assert_eq!((a.id, a.text.as_str()), (9, "Add widgets…"));
+        assert!(!a.checked && !a.grayed && !a.separator && a.sub.is_none());
+
+        let sub = info(menu, 1);
+        assert_eq!(sub.text, "Quick add");
+        let sub_menu = sub.sub.expect("submenu");
+        assert_eq!(count(sub_menu), 3);
+        assert_eq!(info(sub_menu, 0).id, 1000);
+        assert_eq!(info(sub_menu, 0).text, "Clock");
+        assert!(info(sub_menu, 1).separator);
+        assert_eq!(info(sub_menu, 2).id, 1001);
+
+        let edit = info(menu, 2);
+        assert_eq!(edit.id, 1);
+        assert!(edit.checked && !edit.grayed);
+        let pause = info(menu, 3);
+        assert_eq!(pause.id, 2);
+        assert!(!pause.checked);
+
+        assert!(info(menu, 4).separator);
+
+        let none = info(menu, 5);
+        assert_eq!((none.id, none.text.as_str()), (0, "Nothing here"));
+        assert!(none.grayed && !none.checked);
+
+        // Destroying the parent destroys the submenu too.
+        unsafe { DestroyMenu(menu) }.unwrap();
+        assert_eq!(count(sub_menu), -1);
+    }
+
+    #[test]
+    fn build_empty_and_nested() {
+        let menu = build(&[]);
+        assert_eq!(count(menu), 0);
+        unsafe { DestroyMenu(menu) }.unwrap();
+
+        let menu = build(&[Item::Sub {
+            label: "a".into(),
+            items: vec![Item::Sub {
+                label: "b".into(),
+                items: vec![Item::action(77, "c")],
+            }],
+        }]);
+        let a = info(menu, 0).sub.unwrap();
+        let b = info(a, 0).sub.unwrap();
+        assert_eq!(info(a, 0).text, "b");
+        assert_eq!(info(b, 0).id, 77);
+        unsafe { DestroyMenu(menu) }.unwrap();
+    }
+
+    #[test]
+    fn run_command_is_quoted() {
+        let p = std::path::Path::new(r"C:\Program Files\Vitrine\vitrine.exe");
+        assert_eq!(
+            run_command(p),
+            "\"C:\\Program Files\\Vitrine\\vitrine.exe\""
+        );
+        let p = std::path::Path::new(r"C:\Users\Zoë Ünïcode\vitrine.exe");
+        let cmd = run_command(p);
+        assert!(cmd.starts_with('"') && cmd.ends_with('"'));
+        assert_eq!(&cmd[1..cmd.len() - 1], p.to_str().unwrap());
+        // The registry value is the NUL-terminated UTF-16 of that string.
+        assert_eq!(wide(&cmd).len(), cmd.encode_utf16().count() + 1);
+    }
+
+    #[test]
+    fn menu_theme_is_available() {
+        assert!(set_menu_theme(true));
+        assert!(set_menu_theme(false));
     }
 }

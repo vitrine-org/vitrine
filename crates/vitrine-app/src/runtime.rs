@@ -280,7 +280,12 @@ impl Runtime {
     }
 
     fn paused(&self) -> bool {
-        self.locked || self.display_off || self.fullscreen || self.user_paused
+        is_paused(
+            self.locked,
+            self.display_off,
+            self.fullscreen,
+            self.user_paused,
+        )
     }
 
     // ── packages and layout ───────────────────────────────────────────
@@ -855,9 +860,7 @@ impl Runtime {
         match msg {
             HostMsg::Pointer(ev) => self.pointer(ev),
             HostMsg::Tray(event, pt) => {
-                if event == WM_CONTEXTMENU || event == WM_LBUTTONUP || event == WM_USER
-                /* NIN_SELECT */
-                {
+                if tray_opens_menu(event) {
                     self.tray_menu(pt);
                 }
             }
@@ -924,16 +927,16 @@ impl Runtime {
     fn check_power(&mut self) {
         let state =
             unsafe { SHQueryUserNotificationState() }.unwrap_or(QUERY_USER_NOTIFICATION_STATE(5));
-        // 2 = busy (full-screen app), 3 = D3D full screen, 4 = presentation mode.
-        let fullscreen = matches!(state.0, 2..=4);
+        let fullscreen = is_fullscreen_state(state.0);
         if fullscreen != self.fullscreen {
             self.fullscreen = fullscreen;
             self.apply_pause();
         }
-        let slow = vitrine_system::power::battery_saver()
-            || (self.config.pause_on_battery_saver && vitrine_system::power::on_battery());
-        self.collector
-            .set_interval_multiplier(if slow { 2.0 } else { 1.0 });
+        self.collector.set_interval_multiplier(interval_multiplier(
+            vitrine_system::power::battery_saver(),
+            self.config.pause_on_battery_saver,
+            vitrine_system::power::on_battery,
+        ));
     }
 
     // ── input ─────────────────────────────────────────────────────────
@@ -1008,68 +1011,20 @@ impl Runtime {
     pub const CMD_GALLERY: u32 = 9;
     const CMD_ADD: u32 = 1000;
 
-    fn add_menu(&self) -> Item {
-        let mut items = Vec::new();
-        let mut n = 0;
-        for p in &self.packages {
-            for w in &p.manifest.widgets {
-                items.push(Item::action(Self::CMD_ADD + n, w.name.clone()));
-                n += 1;
-            }
-            items.push(Item::Separator);
-        }
-        items.pop();
-        if items.is_empty() {
-            items.push(Item::disabled("No widget packages installed"));
-        }
-        Item::Sub {
-            label: "Quick add".into(),
-            items,
-        }
-    }
-
-    fn nth_widget(&self, n: u32) -> Option<(String, String)> {
-        self.packages
-            .iter()
-            .flat_map(|p| {
-                p.manifest
-                    .widgets
-                    .iter()
-                    .map(move |w| (p.manifest.id.clone(), w.id.clone()))
-            })
-            .nth(n as usize)
-    }
-
     fn tray_menu(&mut self, pt: POINT) {
-        let items = vec![
-            Item::action(Self::CMD_GALLERY, "Add widgets…"),
-            self.add_menu(),
-            Item::check(Self::CMD_EDIT, "Edit layout", self.edit.is_some()),
-            Item::action(Self::CMD_PANEL, "Settings…"),
-            Item::Separator,
-            Item::check(Self::CMD_PAUSE, "Pause widgets", self.user_paused),
-            Item::check(
-                Self::CMD_AUTOSTART,
-                "Start with Windows",
-                shellapi::autostart_enabled(),
-            ),
-            Item::action(Self::CMD_FOLDER, "Open data folder"),
-            Item::action(Self::CMD_SITE, "Get more widgets"),
-            Item::Separator,
-            Item::action(Self::CMD_QUIT, "Quit Vitrine"),
-        ];
+        let items = tray_items(
+            &self.packages,
+            self.edit.is_some(),
+            self.user_paused,
+            shellapi::autostart_enabled(),
+        );
         if let Some(cmd) = shellapi::popup(self.host, pt, &items) {
             self.command(cmd, None);
         }
     }
 
     fn widget_menu(&mut self, i: usize, pt: POINT) {
-        let items = vec![
-            Item::action(Self::CMD_PANEL, "Widget settings…"),
-            Item::action(Self::CMD_EDIT, "Edit layout"),
-            Item::Separator,
-            Item::action(Self::CMD_REMOVE, "Remove widget"),
-        ];
+        let items = widget_items();
         if let Some(cmd) = shellapi::popup(self.host, pt, &items) {
             let id = self.widgets.get(i).map(|l| l.entry.id.clone());
             self.command(cmd, id);
@@ -1077,13 +1032,13 @@ impl Runtime {
     }
 
     pub(crate) fn command(&mut self, cmd: u32, instance: Option<String>) {
-        match cmd {
-            Self::CMD_EDIT => self.toggle_edit(),
-            Self::CMD_PAUSE => {
+        match MenuCommand::decode(cmd) {
+            MenuCommand::Edit => self.toggle_edit(),
+            MenuCommand::Pause => {
                 self.user_paused = !self.user_paused;
                 self.apply_pause();
             }
-            Self::CMD_AUTOSTART => {
+            MenuCommand::Autostart => {
                 let on = !shellapi::autostart_enabled();
                 if let Err(e) = shellapi::set_autostart(on) {
                     log::error!("autostart: {e}");
@@ -1091,25 +1046,25 @@ impl Runtime {
                 self.config.start_with_windows = on;
                 let _ = self.config.save(&paths::config_path());
             }
-            Self::CMD_FOLDER => shellapi::open(&paths::data_dir().to_string_lossy()),
-            Self::CMD_SITE => shellapi::open("https://vitrine-widgets.github.io/"),
-            Self::CMD_GALLERY => self.open_gallery(),
-            Self::CMD_PANEL => crate::open_panel(instance.as_deref()),
-            Self::CMD_REMOVE => {
+            MenuCommand::Folder => shellapi::open(&paths::data_dir().to_string_lossy()),
+            MenuCommand::Site => shellapi::open(SITE_URL),
+            MenuCommand::Gallery => self.open_gallery(),
+            MenuCommand::Panel => crate::open_panel(instance.as_deref()),
+            MenuCommand::Remove => {
                 if let Some(id) = instance {
                     self.remove_instance(&id);
                 }
             }
-            Self::CMD_QUIT => {
+            MenuCommand::Quit => {
                 self.quit = true;
                 unsafe { PostQuitMessage(0) };
             }
-            n if n >= Self::CMD_ADD => {
-                if let Some((pkg, wid)) = self.nth_widget(n - Self::CMD_ADD) {
+            MenuCommand::Add(n) => {
+                if let Some((pkg, wid)) = nth_widget(&self.packages, n) {
                     self.add_instance(&pkg, &wid);
                 }
             }
-            _ => {}
+            MenuCommand::Unknown => {}
         }
     }
 
@@ -1364,6 +1319,150 @@ impl Runtime {
     }
 }
 
+// ── pure helpers (menus, commands, pause) ────────────────────────────
+
+const SITE_URL: &str = "https://vitrine-widgets.github.io/";
+
+/// Pausing: the session is locked, the display is off, a full-screen app runs,
+/// or the user paused from the tray.
+fn is_paused(locked: bool, display_off: bool, fullscreen: bool, user_paused: bool) -> bool {
+    locked || display_off || fullscreen || user_paused
+}
+
+/// `QUERY_USER_NOTIFICATION_STATE`: 2 = busy (full-screen app), 3 = D3D full
+/// screen, 4 = presentation mode.
+fn is_fullscreen_state(state: i32) -> bool {
+    matches!(state, 2..=4)
+}
+
+/// Collector interval multiplier: slower in battery saver, or on battery when
+/// the user asked for it (`on_battery` is only queried then).
+fn interval_multiplier(
+    battery_saver: bool,
+    pause_on_battery_saver: bool,
+    on_battery: impl FnOnce() -> bool,
+) -> f32 {
+    if battery_saver || (pause_on_battery_saver && on_battery()) {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+/// Tray callbacks that open the menu (`NIN_SELECT` is `WM_USER`).
+fn tray_opens_menu(event: u32) -> bool {
+    event == WM_CONTEXTMENU || event == WM_LBUTTONUP || event == WM_USER
+}
+
+/// NOTIFYICON_VERSION_4: event in LOWORD(lParam), anchor point in wParam.
+fn decode_tray(wparam: WPARAM, lparam: LPARAM) -> (u32, POINT) {
+    let event = (lparam.0 & 0xFFFF) as u32;
+    let pt = POINT {
+        x: (wparam.0 & 0xFFFF) as i16 as i32,
+        y: ((wparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    (event, pt)
+}
+
+/// What a menu/command id means (see the `Runtime::CMD_*` ids).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuCommand {
+    Edit,
+    Pause,
+    Autostart,
+    Folder,
+    Quit,
+    Panel,
+    Remove,
+    Site,
+    Gallery,
+    /// The n-th widget of the "Quick add" submenu.
+    Add(u32),
+    Unknown,
+}
+
+impl MenuCommand {
+    fn decode(cmd: u32) -> MenuCommand {
+        match cmd {
+            Runtime::CMD_EDIT => MenuCommand::Edit,
+            Runtime::CMD_PAUSE => MenuCommand::Pause,
+            Runtime::CMD_AUTOSTART => MenuCommand::Autostart,
+            Runtime::CMD_FOLDER => MenuCommand::Folder,
+            Runtime::CMD_QUIT => MenuCommand::Quit,
+            Runtime::CMD_PANEL => MenuCommand::Panel,
+            Runtime::CMD_REMOVE => MenuCommand::Remove,
+            Runtime::CMD_SITE => MenuCommand::Site,
+            Runtime::CMD_GALLERY => MenuCommand::Gallery,
+            n if n >= Runtime::CMD_ADD => MenuCommand::Add(n - Runtime::CMD_ADD),
+            _ => MenuCommand::Unknown,
+        }
+    }
+}
+
+/// The "Quick add" submenu: every widget of every package, packages separated.
+fn add_menu(packages: &[InstalledPackage]) -> Item {
+    let mut items = Vec::new();
+    let mut n = 0;
+    for p in packages {
+        for w in &p.manifest.widgets {
+            items.push(Item::action(Runtime::CMD_ADD + n, w.name.clone()));
+            n += 1;
+        }
+        items.push(Item::Separator);
+    }
+    items.pop();
+    if items.is_empty() {
+        items.push(Item::disabled("No widget packages installed"));
+    }
+    Item::Sub {
+        label: "Quick add".into(),
+        items,
+    }
+}
+
+/// `(package id, widget id)` of the n-th "Quick add" entry.
+fn nth_widget(packages: &[InstalledPackage], n: u32) -> Option<(String, String)> {
+    packages
+        .iter()
+        .flat_map(|p| {
+            p.manifest
+                .widgets
+                .iter()
+                .map(move |w| (p.manifest.id.clone(), w.id.clone()))
+        })
+        .nth(n as usize)
+}
+
+fn tray_items(
+    packages: &[InstalledPackage],
+    editing: bool,
+    user_paused: bool,
+    autostart: bool,
+) -> Vec<Item> {
+    vec![
+        Item::action(Runtime::CMD_GALLERY, "Add widgets…"),
+        add_menu(packages),
+        Item::check(Runtime::CMD_EDIT, "Edit layout", editing),
+        Item::action(Runtime::CMD_PANEL, "Settings…"),
+        Item::Separator,
+        Item::check(Runtime::CMD_PAUSE, "Pause widgets", user_paused),
+        Item::check(Runtime::CMD_AUTOSTART, "Start with Windows", autostart),
+        Item::action(Runtime::CMD_FOLDER, "Open data folder"),
+        Item::action(Runtime::CMD_SITE, "Get more widgets"),
+        Item::Separator,
+        Item::action(Runtime::CMD_QUIT, "Quit Vitrine"),
+    ]
+}
+
+fn widget_items() -> Vec<Item> {
+    vec![
+        Item::action(Runtime::CMD_PANEL, "Widget settings…"),
+        Item::action(Runtime::CMD_EDIT, "Edit layout"),
+        Item::Separator,
+        Item::action(Runtime::CMD_REMOVE, "Remove widget"),
+    ]
+}
+
 // ── icon geometry poller ──────────────────────────────────────────────
 
 /// Keeps `RoutingState::icons` current while the pointer is over the desktop.
@@ -1445,12 +1544,7 @@ unsafe extern "system" fn host_proc(
     match msg {
         WM_VITRINE_POINTER => push(HostMsg::Pointer(PointerEvent::decode(wparam, lparam))),
         WM_APP_TRAY => {
-            // NOTIFYICON_VERSION_4: event in LOWORD(lParam), anchor point in wParam.
-            let event = (lparam.0 & 0xFFFF) as u32;
-            let pt = POINT {
-                x: (wparam.0 & 0xFFFF) as i16 as i32,
-                y: ((wparam.0 >> 16) & 0xFFFF) as i16 as i32,
-            };
+            let (event, pt) = decode_tray(wparam, lparam);
             push(HostMsg::Tray(event, pt));
         }
         WM_TIMER => push(HostMsg::Timer(wparam.0)),
@@ -1666,11 +1760,506 @@ pub fn notify_reload() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use vitrine_widgets::manifest::PackageManifest;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn pkg(id: &str, widgets: &[(&str, &str)]) -> InstalledPackage {
+        let widgets: Vec<Value> = widgets
+            .iter()
+            .map(|(id, name)| serde_json::json!({ "id": id, "name": name, "entry": "index.js" }))
+            .collect();
+        let json =
+            serde_json::json!({ "id": id, "name": id, "version": "2.0.0", "widgets": widgets });
+        InstalledPackage {
+            manifest: PackageManifest::parse(&json.to_string()).unwrap(),
+            dir: PathBuf::new(),
+        }
+    }
+
+    fn action(item: &Item) -> (u32, &str, bool, bool) {
+        match item {
+            Item::Action {
+                id,
+                label,
+                checked,
+                enabled,
+            } => (*id, label.as_str(), *checked, *enabled),
+            other => panic!("not an action: {other:?}"),
+        }
+    }
+
+    fn sub(item: &Item) -> (&str, &[Item]) {
+        match item {
+            Item::Sub { label, items } => (label.as_str(), items.as_slice()),
+            other => panic!("not a submenu: {other:?}"),
+        }
+    }
+
+    // ── animation ──
+
+    #[test]
+    fn ease_out_curve() {
+        assert_eq!(ease_out(0.0), 0.0);
+        assert_eq!(ease_out(1.0), 1.0);
+        assert_eq!(ease_out(0.5), 0.875);
+        // Clamped outside 0..1.
+        assert_eq!(ease_out(-3.0), 0.0);
+        assert_eq!(ease_out(7.0), 1.0);
+        // Monotonic and ahead of linear.
+        let mut last = 0.0;
+        for i in 1..=100 {
+            let t = i as f32 / 100.0;
+            let v = ease_out(t);
+            assert!(v >= last && v >= t - 1e-6, "t={t}");
+            last = v;
+        }
+    }
+
+    #[test]
+    fn lerp_rect_endpoints_and_midpoint() {
+        let a = rect(0, 0, 100, 50);
+        let b = rect(200, -100, 400, 250);
+        assert_eq!(lerp_rect(a, b, 0.0), a);
+        assert_eq!(lerp_rect(a, b, 1.0), b);
+        assert_eq!(lerp_rect(a, b, 0.5), rect(100, -50, 250, 150));
+        // Rounds to the nearest pixel.
+        assert_eq!(
+            lerp_rect(rect(0, 0, 0, 0), rect(3, -3, 1, -1), 0.5),
+            rect(2, -2, 1, -1)
+        );
+        assert_eq!(lerp_rect(a, a, 0.37), a);
+    }
+
+    // ── pause decisions ──
+
+    #[test]
+    fn pause_when_any_reason_holds() {
+        assert!(!is_paused(false, false, false, false));
+        for i in 1..16u8 {
+            let f = |bit: u8| i & (1 << bit) != 0;
+            assert!(is_paused(f(0), f(1), f(2), f(3)), "{i:04b}");
+        }
+    }
+
+    #[test]
+    fn fullscreen_states() {
+        let full: Vec<i32> = (0..8).filter(|s| is_fullscreen_state(*s)).collect();
+        assert_eq!(full, vec![2, 3, 4]);
+        // The fallback used when the query fails (QUNS_ACCEPTS_NOTIFICATIONS) is not full screen.
+        assert!(!is_fullscreen_state(5));
+    }
+
+    #[test]
+    fn battery_multiplier() {
+        assert_eq!(interval_multiplier(false, false, || true), 1.0);
+        assert_eq!(interval_multiplier(false, true, || false), 1.0);
+        assert_eq!(interval_multiplier(false, true, || true), 2.0);
+        assert_eq!(interval_multiplier(true, false, || false), 2.0);
+        // The battery is only queried when it matters.
+        assert_eq!(interval_multiplier(false, false, || panic!("queried")), 1.0);
+        assert_eq!(interval_multiplier(true, true, || panic!("queried")), 2.0);
+    }
+
+    // ── tray callback ──
+
+    #[test]
+    fn tray_events_that_open_the_menu() {
+        assert!(tray_opens_menu(WM_CONTEXTMENU));
+        assert!(tray_opens_menu(WM_LBUTTONUP));
+        assert!(tray_opens_menu(WM_USER)); // NIN_SELECT
+        for ev in [
+            WM_MOUSEMOVE,
+            WM_LBUTTONDOWN,
+            WM_RBUTTONUP,
+            WM_USER + 1,
+            WM_USER + 2,
+        ] {
+            assert!(!tray_opens_menu(ev), "{ev:#x}");
+        }
+    }
+
+    #[test]
+    fn tray_callback_decoding() {
+        // Anchor (-5, 1079) in wParam; icon id in HIWORD(lParam) is ignored.
+        let wp = WPARAM(((1079usize) << 16) | (-5i16 as u16 as usize));
+        let lp = LPARAM(((1isize) << 16) | WM_CONTEXTMENU as isize);
+        let (ev, pt) = decode_tray(wp, lp);
+        assert_eq!(ev, WM_CONTEXTMENU);
+        assert_eq!((pt.x, pt.y), (-5, 1079));
+        let wp = WPARAM(((-1440i16 as u16 as usize) << 16) | 3840);
+        let (_, pt) = decode_tray(wp, LPARAM(WM_LBUTTONUP as isize));
+        assert_eq!((pt.x, pt.y), (3840, -1440));
+    }
+
+    // ── command ids ──
+
+    #[test]
+    fn command_ids_decode() {
+        use MenuCommand::*;
+        let table = [
+            (Runtime::CMD_EDIT, Edit),
+            (Runtime::CMD_PAUSE, Pause),
+            (Runtime::CMD_AUTOSTART, Autostart),
+            (Runtime::CMD_FOLDER, Folder),
+            (Runtime::CMD_QUIT, Quit),
+            (Runtime::CMD_PANEL, Panel),
+            (Runtime::CMD_REMOVE, Remove),
+            (Runtime::CMD_SITE, Site),
+            (Runtime::CMD_GALLERY, Gallery),
+            (1000, Add(0)),
+            (1007, Add(7)),
+            (u32::MAX, Add(u32::MAX - 1000)),
+            (0, Unknown),
+            (10, Unknown),
+            (999, Unknown),
+        ];
+        for (id, cmd) in table {
+            assert_eq!(MenuCommand::decode(id), cmd, "id {id}");
+        }
+    }
+
+    #[test]
+    fn command_ids_are_stable() {
+        // `vitrine --edit/--gallery/--quit` post these to a running instance,
+        // possibly of another build: they must not change.
+        assert_eq!(Runtime::CMD_EDIT, 1);
+        assert_eq!(Runtime::CMD_QUIT, 5);
+        assert_eq!(Runtime::CMD_GALLERY, 9);
+        assert_eq!(Runtime::CMD_ADD, 1000);
+    }
+
+    // ── menus ──
+
+    #[test]
+    fn quick_add_without_packages() {
+        let menu = add_menu(&[]);
+        let (label, items) = sub(&menu);
+        assert_eq!(label, "Quick add");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            action(&items[0]),
+            (0, "No widget packages installed", false, false)
+        );
+        // A package without widgets is the same as none.
+        let empty = [pkg("dev.empty", &[])];
+        assert_eq!(sub(&add_menu(&empty)).1.len(), 1);
+        assert_eq!(nth_widget(&empty, 0), None);
+    }
+
+    #[test]
+    fn quick_add_lists_every_widget() {
+        let packages = [
+            pkg("dev.a", &[("clock", "Clock"), ("date", "Date")]),
+            pkg("dev.b", &[("cpu", "CPU")]),
+        ];
+        let menu = add_menu(&packages);
+        let (_, items) = sub(&menu);
+        assert_eq!(items.len(), 4);
+        assert_eq!(action(&items[0]), (1000, "Clock", false, true));
+        assert_eq!(action(&items[1]), (1001, "Date", false, true));
+        assert_eq!(items[2], Item::Separator);
+        assert_eq!(action(&items[3]), (1002, "CPU", false, true));
+        // No trailing separator.
+        assert_ne!(items.last(), Some(&Item::Separator));
+
+        // Every id dispatches to the widget it shows.
+        let ids = |p: &str, w: &str| Some((p.to_string(), w.to_string()));
+        for (item, want) in [
+            (&items[0], ids("dev.a", "clock")),
+            (&items[1], ids("dev.a", "date")),
+            (&items[3], ids("dev.b", "cpu")),
+        ] {
+            let MenuCommand::Add(n) = MenuCommand::decode(action(item).0) else {
+                panic!("not an add command");
+            };
+            assert_eq!(nth_widget(&packages, n), want);
+        }
+        assert_eq!(nth_widget(&packages, 3), None);
+    }
+
+    #[test]
+    fn tray_menu_structure() {
+        let packages = [pkg("dev.a", &[("clock", "Clock")])];
+        let items = tray_items(&packages, false, false, false);
+        assert_eq!(items.len(), 11);
+        assert_eq!(
+            action(&items[0]),
+            (Runtime::CMD_GALLERY, "Add widgets…", false, true)
+        );
+        assert_eq!(sub(&items[1]).0, "Quick add");
+        assert_eq!(
+            action(&items[2]),
+            (Runtime::CMD_EDIT, "Edit layout", false, true)
+        );
+        assert_eq!(
+            action(&items[3]),
+            (Runtime::CMD_PANEL, "Settings…", false, true)
+        );
+        assert_eq!(items[4], Item::Separator);
+        assert_eq!(
+            action(&items[5]),
+            (Runtime::CMD_PAUSE, "Pause widgets", false, true)
+        );
+        assert_eq!(
+            action(&items[6]),
+            (Runtime::CMD_AUTOSTART, "Start with Windows", false, true)
+        );
+        assert_eq!(
+            action(&items[7]),
+            (Runtime::CMD_FOLDER, "Open data folder", false, true)
+        );
+        assert_eq!(
+            action(&items[8]),
+            (Runtime::CMD_SITE, "Get more widgets", false, true)
+        );
+        assert_eq!(items[9], Item::Separator);
+        assert_eq!(
+            action(&items[10]),
+            (Runtime::CMD_QUIT, "Quit Vitrine", false, true)
+        );
+    }
+
+    #[test]
+    fn tray_menu_check_marks_follow_state() {
+        for (editing, paused, autostart) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let items = tray_items(&[], editing, paused, autostart);
+            assert_eq!(action(&items[2]).2, editing);
+            assert_eq!(action(&items[5]).2, paused);
+            assert_eq!(action(&items[6]).2, autostart);
+            // Nothing else is ever checked.
+            for i in [0, 3, 7, 8, 10] {
+                assert!(!action(&items[i]).2);
+            }
+        }
+    }
+
+    #[test]
+    fn every_menu_id_dispatches() {
+        let packages = [pkg("dev.a", &[("clock", "Clock")])];
+        let mut items = tray_items(&packages, false, false, false);
+        items.extend(widget_items());
+        fn walk(items: &[Item], out: &mut Vec<u32>) {
+            for i in items {
+                match i {
+                    Item::Action {
+                        id, enabled: true, ..
+                    } => out.push(*id),
+                    Item::Sub { items, .. } => walk(items, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        walk(&items, &mut ids);
+        assert_eq!(ids.len(), 8 + 1 + 3);
+        for id in ids {
+            assert_ne!(MenuCommand::decode(id), MenuCommand::Unknown, "id {id}");
+        }
+    }
+
+    #[test]
+    fn widget_menu_structure() {
+        let items = widget_items();
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            action(&items[0]),
+            (Runtime::CMD_PANEL, "Widget settings…", false, true)
+        );
+        assert_eq!(
+            action(&items[1]),
+            (Runtime::CMD_EDIT, "Edit layout", false, true)
+        );
+        assert_eq!(items[2], Item::Separator);
+        assert_eq!(
+            action(&items[3]),
+            (Runtime::CMD_REMOVE, "Remove widget", false, true)
+        );
+    }
+
+    // ── window messages → HostMsg ──
+
+    const TASKBAR: u32 = 0xC100;
+    const RELOAD: u32 = 0xC101;
+    const COMMAND: u32 = 0xC102;
+
+    /// Feeds one message to the host procedure and returns what it queued.
+    fn host(msg: u32, wparam: usize, lparam: isize) -> (LRESULT, Vec<HostMsg>) {
+        MESSAGES.with_borrow_mut(|m| *m = (TASKBAR, RELOAD, COMMAND));
+        INBOX.with_borrow_mut(|q| q.clear());
+        let r = unsafe { host_proc(HWND::default(), msg, WPARAM(wparam), LPARAM(lparam)) };
+        (r, INBOX.with_borrow_mut(|q| q.drain(..).collect()))
+    }
+
+    fn one(msg: u32, wparam: usize, lparam: isize) -> HostMsg {
+        let (r, mut q) = host(msg, wparam, lparam);
+        assert_eq!(r, LRESULT(0));
+        assert_eq!(q.len(), 1, "{q:?}");
+        q.remove(0)
+    }
+
+    #[test]
+    fn registered_messages() {
+        // `send_command` posts the id in wParam.
+        assert!(matches!(
+            one(COMMAND, Runtime::CMD_GALLERY as usize, 0),
+            HostMsg::Command(Runtime::CMD_GALLERY)
+        ));
+        assert!(matches!(one(COMMAND, 1003, 0), HostMsg::Command(1003)));
+        assert!(matches!(one(TASKBAR, 0, 0), HostMsg::TaskbarCreated));
+        assert!(matches!(one(RELOAD, 0, 0), HostMsg::Reload));
+    }
+
+    #[test]
+    fn unregistered_messages_never_match() {
+        // Before registration the ids are 0: WM_NULL must not become a command.
+        MESSAGES.with_borrow_mut(|m| *m = (0, 0, 0));
+        INBOX.with_borrow_mut(|q| q.clear());
+        unsafe { host_proc(HWND::default(), WM_NULL, WPARAM(1), LPARAM(0)) };
+        assert!(INBOX.with_borrow(|q| q.is_empty()));
+    }
+
+    #[test]
+    fn hotkey_timer_and_display() {
+        assert!(matches!(
+            one(WM_HOTKEY, HOTKEY_EDIT as usize, 0),
+            HostMsg::Command(Runtime::CMD_EDIT)
+        ));
+        assert!(matches!(
+            one(WM_TIMER, TIMER_POWER, 0),
+            HostMsg::Timer(TIMER_POWER)
+        ));
+        assert!(matches!(
+            one(WM_DISPLAYCHANGE, 0, 0),
+            HostMsg::DisplayChanged
+        ));
+        assert!(matches!(one(WM_DPICHANGED, 0, 0), HostMsg::DisplayChanged));
+        assert!(matches!(
+            one(WM_SETTINGCHANGE, SPI_SETWORKAREA.0 as usize, 0),
+            HostMsg::DisplayChanged
+        ));
+        assert!(host(WM_APP_WAKE, 0, 0).1.is_empty());
+    }
+
+    #[test]
+    fn theme_change() {
+        let area: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
+        assert!(matches!(
+            one(WM_SETTINGCHANGE, 0, area.as_ptr() as isize),
+            HostMsg::AppearanceChanged
+        ));
+        let other: Vec<u16> = "Policy\0".encode_utf16().collect();
+        let (_, q) = host(WM_SETTINGCHANGE, 0, other.as_ptr() as isize);
+        assert!(q.is_empty());
+        assert!(host(WM_SETTINGCHANGE, 0, 0).1.is_empty());
+    }
+
+    #[test]
+    fn session_and_display_power() {
+        assert!(matches!(
+            one(WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK as usize, 0),
+            HostMsg::SessionLocked(true)
+        ));
+        assert!(matches!(
+            one(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK as usize, 0),
+            HostMsg::SessionLocked(false)
+        ));
+        assert!(host(WM_WTSSESSION_CHANGE, 0x1, 0).1.is_empty());
+
+        use windows::Win32::System::Power::POWERBROADCAST_SETTING;
+        use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+        for (data, on) in [(0u8, false), (1, true), (2, true)] {
+            let setting = POWERBROADCAST_SETTING {
+                PowerSetting: GUID_CONSOLE_DISPLAY_STATE,
+                DataLength: 1,
+                Data: [data],
+            };
+            let (r, q) = host(
+                WM_POWERBROADCAST,
+                PBT_POWERSETTINGCHANGE as usize,
+                &setting as *const _ as isize,
+            );
+            assert_eq!(r, LRESULT(1));
+            assert!(matches!(q.as_slice(), [HostMsg::DisplayOn(o)] if *o == on));
+        }
+        // Other power settings are ignored.
+        let setting = POWERBROADCAST_SETTING {
+            PowerSetting: windows::core::GUID::zeroed(),
+            DataLength: 1,
+            Data: [0],
+        };
+        let (r, q) = host(
+            WM_POWERBROADCAST,
+            PBT_POWERSETTINGCHANGE as usize,
+            &setting as *const _ as isize,
+        );
+        assert_eq!(r, LRESULT(1));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn tray_and_pointer_messages() {
+        let wp = ((200usize) << 16) | 100;
+        match one(WM_APP_TRAY, wp, WM_CONTEXTMENU as isize) {
+            HostMsg::Tray(ev, pt) => {
+                assert_eq!(ev, WM_CONTEXTMENU);
+                assert_eq!((pt.x, pt.y), (100, 200));
+            }
+            other => panic!("{other:?}"),
+        }
+        let ev = PointerEvent {
+            kind: PointerKind::RightUp,
+            key: 7,
+            pt: POINT { x: -10, y: 20 },
+            wheel: 0,
+        };
+        let (w, l) = ev.encode();
+        match one(WM_VITRINE_POINTER, w.0, l.0) {
+            HostMsg::Pointer(p) => {
+                assert_eq!(p.kind, PointerKind::RightUp);
+                assert_eq!(p.key, 7);
+                assert_eq!((p.pt.x, p.pt.y), (-10, 20));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn parses_hotkeys() {
         assert_eq!(super::parse_hotkey("Ctrl+Alt+V"), Some((0x3, 'V' as u32)));
         assert_eq!(super::parse_hotkey("win + shift + f9"), Some((0xC, 0x78)));
         assert_eq!(super::parse_hotkey("V"), None);
         assert_eq!(super::parse_hotkey("Ctrl+Nope"), None);
+    }
+
+    #[test]
+    fn parses_more_hotkeys() {
+        assert_eq!(parse_hotkey("Control+1"), Some((0x2, '1' as u32)));
+        assert_eq!(parse_hotkey("alt+F1"), Some((0x1, 0x70)));
+        assert_eq!(parse_hotkey("Ctrl+F24"), Some((0x2, 0x87)));
+        assert_eq!(parse_hotkey("Ctrl+F25"), None);
+        assert_eq!(parse_hotkey("Ctrl+F0"), None);
+        assert_eq!(
+            parse_hotkey("Ctrl+Alt+Shift+Win+z"),
+            Some((0xF, 'Z' as u32))
+        );
+        // Modifiers only, or nothing.
+        assert_eq!(parse_hotkey("Ctrl+Alt"), None);
+        assert_eq!(parse_hotkey(""), None);
+        // The last key wins.
+        assert_eq!(parse_hotkey("Ctrl+A+B"), Some((0x2, 'B' as u32)));
     }
 }

@@ -44,7 +44,7 @@ pub struct PointerEvent {
 }
 
 impl PointerEvent {
-    fn encode(&self) -> (WPARAM, LPARAM) {
+    pub fn encode(&self) -> (WPARAM, LPARAM) {
         let w = (self.kind as usize)
             | ((self.key as usize & 0xFF_FFFF) << 8)
             | ((self.wheel as u16 as usize) << 32);
@@ -268,5 +268,64 @@ mod tests {
         assert_eq!(back.key, 4242);
         assert_eq!((back.pt.x, back.pt.y), (-1920, 1079));
         assert_eq!(back.wheel, -120);
+    }
+
+    #[test]
+    fn every_kind_and_extreme_values_round_trip() {
+        use PointerKind::*;
+        for kind in [Move, Down, Up, Wheel, Leave, RightDown, RightUp] {
+            for (x, y) in [(0, 0), (i32::MIN, i32::MAX), (-1, -1), (7680, -2160)] {
+                for wheel in [0, 1, -1, i16::MAX, i16::MIN] {
+                    for key in [0, 1, 0xFF_FFFF] {
+                        let ev = PointerEvent {
+                            kind,
+                            key,
+                            pt: POINT { x, y },
+                            wheel,
+                        };
+                        let (w, l) = ev.encode();
+                        let back = PointerEvent::decode(w, l);
+                        assert_eq!(back.kind, kind);
+                        assert_eq!(back.key, key);
+                        assert_eq!((back.pt.x, back.pt.y), (x, y));
+                        assert_eq!(back.wheel, wheel);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keys_keep_their_low_24_bits() {
+        let ev = PointerEvent {
+            kind: PointerKind::Down,
+            key: 0x1234_5678,
+            pt: POINT { x: 1, y: 2 },
+            wheel: 0,
+        };
+        let (w, l) = ev.encode();
+        let back = PointerEvent::decode(w, l);
+        assert_eq!(back.key, 0x34_5678);
+        assert_eq!(back.kind, PointerKind::Down);
+    }
+
+    #[test]
+    fn unknown_kinds_decode_as_move() {
+        let back = PointerEvent::decode(WPARAM(0xFF), LPARAM(0));
+        assert_eq!(back.kind, PointerKind::Move);
+    }
+
+    #[test]
+    fn contains_is_half_open() {
+        let r = RECT {
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 10,
+        };
+        assert!(contains(&r, POINT { x: 0, y: 0 }));
+        assert!(contains(&r, POINT { x: 9, y: 9 }));
+        assert!(!contains(&r, POINT { x: 10, y: 5 }));
+        assert!(!contains(&r, POINT { x: 5, y: -1 }));
     }
 }

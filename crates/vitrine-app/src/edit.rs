@@ -224,10 +224,10 @@ fn ease(t: f32) -> f32 {
 const ACCENT: u32 = 0x60CDFF; // Windows 11 default accent (dark theme)
 const DANGER: u32 = 0xFF6B6B;
 
-fn icon_family(gpu: &Gpu) -> PCWSTR {
+fn icon_family(dwrite: &IDWriteFactory5) -> PCWSTR {
     unsafe {
         let mut fonts = None;
-        let base: &IDWriteFactory = &gpu.dwrite;
+        let base: &IDWriteFactory = dwrite;
         if base.GetSystemFontCollection(&mut fonts, false).is_ok()
             && let Some(f) = fonts
         {
@@ -244,9 +244,9 @@ fn icon_family(gpu: &Gpu) -> PCWSTR {
 }
 
 impl Fonts {
-    fn new(gpu: &Gpu, s: f32) -> Result<Fonts> {
+    fn new(dwrite: &IDWriteFactory5, s: f32) -> Result<Fonts> {
         let make = |family: PCWSTR, size: f32, weight: DWRITE_FONT_WEIGHT, center: bool| unsafe {
-            let f = gpu.dwrite.CreateTextFormat(
+            let f = dwrite.CreateTextFormat(
                 family,
                 None,
                 weight,
@@ -273,7 +273,7 @@ impl Fonts {
             label: make(text, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?,
             button: make(text, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?,
             caption: make(text, 13.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
-            icon: make(icon_family(gpu), 14.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
+            icon: make(icon_family(dwrite), 14.0, DWRITE_FONT_WEIGHT_NORMAL, true)?,
         })
     }
 }
@@ -307,7 +307,7 @@ impl EditMode {
             let mut visual = WindowVisual::new(gpu, hwnd)?;
             visual.set_opacity(gpu, 0.0)?;
             visuals.push(visual);
-            let text = Fonts::new(gpu, geo.scale)?;
+            let text = Fonts::new(&gpu.dwrite, geo.scale)?;
             overlays.push(Overlay {
                 hwnd,
                 rect,
@@ -1380,4 +1380,703 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
     LRESULT(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vitrine_widgets::layout::GridConfig;
+    use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    };
+
+    const PRIMARY: &str = "primary";
+    const SECOND: &str = r"\\.\DISPLAY2";
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn center(r: RECT) -> POINT {
+        POINT {
+            x: (r.left + r.right) / 2,
+            y: (r.top + r.bottom) / 2,
+        }
+    }
+
+    fn pt(x: i32, y: i32) -> POINT {
+        POINT { x, y }
+    }
+
+    /// An edit mode without windows or GPU: overlays have no HWND and no visual.
+    fn mode_with(monitors: &[(&str, RECT, f32)], gallery: Vec<GalleryItem>) -> EditMode {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let dwrite: IDWriteFactory5 =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
+        let wic: IWICImagingFactory =
+            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
+                .unwrap();
+        let overlays = monitors
+            .iter()
+            .map(|(name, r, scale)| Overlay {
+                hwnd: HWND::default(),
+                rect: *r,
+                monitor: name.to_string(),
+                geo: Geometry::new(&GridConfig::default(), *r, *scale),
+                text: Fonts::new(&dwrite, *scale).unwrap(),
+                shown: true,
+            })
+            .collect();
+        EditMode {
+            overlays,
+            visuals: Vec::new(),
+            gallery,
+            previews: HashMap::new(),
+            images: ImageCache::new(wic),
+            dwrite,
+            hot: Hot::None,
+            pressed: Hot::None,
+            drag: None,
+            pointer: POINT::default(),
+            gallery_open: false,
+            scroll: 0.0,
+            anim: HashMap::new(),
+            last_frame: Instant::now(),
+            dirty: false,
+            closing: false,
+        }
+    }
+
+    fn mode() -> EditMode {
+        mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery(2))
+    }
+
+    fn gallery(n: usize) -> Vec<GalleryItem> {
+        (0..n)
+            .map(|i| GalleryItem {
+                package: "dev.pack".into(),
+                widget: format!("w{i}"),
+                name: format!("Widget {i}"),
+                size: (2, 2),
+                dir: std::path::PathBuf::new(),
+                preview: None,
+            })
+            .collect()
+    }
+
+    fn item(id: &str, rect: Cells) -> Item {
+        Item {
+            id: id.into(),
+            name: format!("Widget {id}"),
+            monitor: PRIMARY.into(),
+            rect,
+            min: (1, 1),
+            max: (6, 4),
+        }
+    }
+
+    fn items() -> Vec<Item> {
+        vec![item("a", (2, 4, 3, 2)), item("b", (10, 4, 2, 2))]
+    }
+
+    fn pitch(m: &EditMode) -> i32 {
+        let g = m.geometry(PRIMARY).unwrap();
+        ((g.cell + g.gap) * g.scale).round() as i32
+    }
+
+    /// Presses at `from`, moves to `to` in a few steps, releases there.
+    fn drag(m: &mut EditMode, items: &[Item], from: POINT, to: POINT) -> Vec<Action> {
+        assert!(m.input(Input::Down(from), items).is_empty());
+        let mut previews = Vec::new();
+        for k in 1..=4 {
+            let p = pt(
+                from.x + (to.x - from.x) * k / 4,
+                from.y + (to.y - from.y) * k / 4,
+            );
+            previews.extend(m.input(Input::Move(p), items));
+        }
+        assert!(
+            previews.iter().all(|a| matches!(a, Action::Preview { .. })),
+            "{previews:?}"
+        );
+        m.input(Input::Up(to), items)
+    }
+
+    fn click(m: &mut EditMode, items: &[Item], at: POINT) -> Vec<Action> {
+        let mut out = m.input(Input::Down(at), items);
+        out.extend(m.input(Input::Up(at), items));
+        out
+    }
+
+    // ── small helpers ──
+
+    #[test]
+    fn rect_helpers() {
+        let r = rect(10, 20, 30, 40);
+        assert!(contains(&r, pt(10, 20)));
+        assert!(contains(&r, pt(29, 39)));
+        assert!(!contains(&r, pt(30, 20)));
+        assert!(!contains(&r, pt(10, 40)));
+        assert!(!contains(&r, pt(9, 25)));
+        assert_eq!(offset(r, -5, 7), rect(5, 27, 25, 47));
+        assert_eq!(ease(0.0), 0.0);
+        assert_eq!(ease(1.0), 1.0);
+        assert_eq!(ease(2.0), 1.0);
+    }
+
+    #[test]
+    fn overlap_and_collision() {
+        assert!(overlaps((0, 0, 2, 2), (1, 1, 2, 2)));
+        assert!(overlaps((0, 0, 4, 4), (1, 1, 1, 1)));
+        // Touching edges do not overlap.
+        assert!(!overlaps((0, 0, 2, 2), (2, 0, 2, 2)));
+        assert!(!overlaps((0, 0, 2, 2), (0, 2, 2, 2)));
+
+        let items = items();
+        assert!(EditMode::collides(&items, PRIMARY, (3, 5, 1, 1), None));
+        assert!(EditMode::collides(&items, "PRIMARY", (3, 5, 1, 1), None));
+        // Ignoring the dragged item itself.
+        assert!(!EditMode::collides(
+            &items,
+            PRIMARY,
+            (3, 5, 1, 1),
+            Some("a")
+        ));
+        assert!(!EditMode::collides(&items, SECOND, (3, 5, 1, 1), None));
+        assert!(!EditMode::collides(&items, PRIMARY, (5, 4, 5, 2), None));
+    }
+
+    #[test]
+    fn color_helpers() {
+        let c = color(0xFF8000, 0.5);
+        assert_eq!((c.r, c.g, c.a), (1.0, 128.0 / 255.0, 0.5));
+        assert_eq!(c.b, 0.0);
+        let m = mix(color(0x000000, 0.0), color(0xFFFFFF, 1.0), 0.25);
+        assert!((m.r - 0.25).abs() < 1e-6 && (m.a - 0.25).abs() < 1e-6);
+    }
+
+    // ── geometry and hit-testing ──
+
+    #[test]
+    fn toolbar_is_centred_at_the_top() {
+        let m = mode();
+        let (bar, add, done) = m.toolbar();
+        assert_eq!((bar.left + bar.right) / 2, 960);
+        assert_eq!(bar.top, 20);
+        assert!(add.right <= done.left);
+        assert!(contains(&bar, center(add)) && contains(&bar, center(done)));
+    }
+
+    #[test]
+    fn hit_targets() {
+        let mut m = mode();
+        let items = items();
+        let (bar, add, done) = m.toolbar();
+        assert_eq!(m.hit(&items, center(add)), Hot::Add);
+        assert_eq!(m.hit(&items, center(done)), Hot::Done);
+        assert_eq!(m.hit(&items, pt(bar.left + 1, bar.top + 1)), Hot::None);
+
+        let r = m.frame_px(&items[0]).unwrap();
+        assert_eq!(m.hit(&items, center(r)), Hot::Frame("a".into()));
+        assert_eq!(
+            m.hit(&items, pt(r.right - 3, r.bottom - 3)),
+            Hot::Handle("a".into())
+        );
+        // The handle reaches slightly outside the frame.
+        assert_eq!(
+            m.hit(&items, pt(r.right + 2, r.bottom + 2)),
+            Hot::Handle("a".into())
+        );
+        assert_eq!(m.hit(&items, pt(r.left - 20, r.top + 5)), Hot::None);
+
+        // The pill (remove/settings) only reacts once the frame is shown.
+        let (pill, settings, remove, _) = m.chrome(&items[0], r);
+        assert!(pill.bottom <= r.top, "pill above the frame");
+        assert_eq!(m.hit(&items, center(remove)), Hot::None);
+        m.anim.insert("frame:a".into(), 1.0);
+        assert_eq!(m.hit(&items, center(remove)), Hot::Remove("a".into()));
+        assert_eq!(m.hit(&items, center(settings)), Hot::Settings("a".into()));
+        assert_eq!(
+            m.hit(&items, pt(pill.left + 2, pill.top + 2)),
+            Hot::Frame("a".into())
+        );
+    }
+
+    #[test]
+    fn pill_goes_below_at_the_top_edge() {
+        let m = mode();
+        let it = item("t", (0, 0, 2, 2));
+        let r = m.frame_px(&it).unwrap();
+        let (pill, settings, remove, handle) = m.chrome(&it, r);
+        assert!(pill.top >= r.bottom, "{pill:?} vs {r:?}");
+        assert!(contains(&pill, center(settings)) && contains(&pill, center(remove)));
+        assert!(settings.right <= remove.left);
+        assert!(contains(&handle, pt(r.right - 1, r.bottom - 1)));
+    }
+
+    #[test]
+    fn later_items_are_on_top() {
+        let m = mode();
+        let items = vec![item("under", (2, 4, 4, 4)), item("over", (3, 5, 1, 1))];
+        let r = m.frame_px(&items[1]).unwrap();
+        assert_eq!(m.hit(&items, center(r)), Hot::Frame("over".into()));
+    }
+
+    // ── toolbar and keyboard ──
+
+    #[test]
+    fn escape_closes_gallery_then_edit_mode() {
+        let mut m = mode();
+        m.open_gallery();
+        assert!(m.input(Input::Escape, &[]).is_empty());
+        assert!(!m.gallery_open);
+        assert!(matches!(
+            m.input(Input::Escape, &[]).as_slice(),
+            [Action::Close]
+        ));
+    }
+
+    #[test]
+    fn done_and_add_buttons() {
+        let mut m = mode();
+        let (_, add, done) = m.toolbar();
+        assert!(click(&mut m, &[], center(add)).is_empty());
+        assert!(m.gallery_open);
+        assert!(click(&mut m, &[], center(add)).is_empty());
+        assert!(!m.gallery_open);
+        assert!(matches!(
+            click(&mut m, &[], center(done)).as_slice(),
+            [Action::Close]
+        ));
+        // Pressing on one button and releasing on another does nothing.
+        m.input(Input::Down(center(add)), &[]);
+        assert!(m.input(Input::Up(center(done)), &[]).is_empty());
+        assert!(!m.gallery_open);
+    }
+
+    #[test]
+    fn closing_ignores_input() {
+        let mut m = mode();
+        m.closing = true;
+        assert!(m.input(Input::Escape, &[]).is_empty());
+        let (_, _, done) = m.toolbar();
+        assert!(click(&mut m, &[], center(done)).is_empty());
+    }
+
+    #[test]
+    fn remove_and_settings_buttons() {
+        let mut m = mode();
+        let items = items();
+        m.anim.insert("frame:b".into(), 1.0);
+        let r = m.frame_px(&items[1]).unwrap();
+        let (_, settings, remove, _) = m.chrome(&items[1], r);
+        assert!(matches!(
+            click(&mut m, &items, center(remove)).as_slice(),
+            [Action::Remove { id }] if id == "b"
+        ));
+        assert!(matches!(
+            click(&mut m, &items, center(settings)).as_slice(),
+            [Action::Settings { id }] if id == "b"
+        ));
+    }
+
+    #[test]
+    fn right_click_removes() {
+        let mut m = mode();
+        let items = items();
+        let r = m.frame_px(&items[0]).unwrap();
+        assert!(matches!(
+            m.input(Input::RightUp(center(r)), &items).as_slice(),
+            [Action::Remove { id }] if id == "a"
+        ));
+        assert!(m.input(Input::RightUp(pt(5, 1000)), &items).is_empty());
+    }
+
+    // ── moving ──
+
+    #[test]
+    fn click_on_a_frame_does_nothing() {
+        let mut m = mode();
+        let items = items();
+        let c = center(m.frame_px(&items[0]).unwrap());
+        assert!(click(&mut m, &items, c).is_empty());
+        // Jitter under the threshold is not a drag either.
+        m.input(Input::Down(c), &items);
+        assert!(
+            m.input(Input::Move(pt(c.x + 2, c.y - 2)), &items)
+                .is_empty()
+        );
+        assert!(m.input(Input::Up(pt(c.x + 2, c.y - 2)), &items).is_empty());
+    }
+
+    #[test]
+    fn move_snaps_to_cells() {
+        let mut m = mode();
+        let items = items();
+        let r = m.frame_px(&items[0]).unwrap();
+        let p = pitch(&m);
+        let from = center(r);
+        // Two cells right, one down, plus a little less than half a cell.
+        let to = pt(from.x + 2 * p + p / 3, from.y + p + p / 3);
+        let actions = drag(&mut m, &items, from, to);
+        match actions.as_slice() {
+            [
+                Action::Commit {
+                    id,
+                    monitor,
+                    cells,
+                    from,
+                },
+            ] => {
+                assert_eq!(id, "a");
+                assert_eq!(monitor, PRIMARY);
+                assert_eq!(*cells, (4, 5, 3, 2));
+                // Animates from where the pointer left the widget.
+                assert_eq!(*from, offset(r, to.x - center(r).x, to.y - center(r).y));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(m.drag.is_none());
+    }
+
+    #[test]
+    fn move_previews_follow_the_pointer() {
+        let mut m = mode();
+        let items = items();
+        let r = m.frame_px(&items[0]).unwrap();
+        let c = center(r);
+        m.input(Input::Down(c), &items);
+        match m
+            .input(Input::Move(pt(c.x + 37, c.y - 11)), &items)
+            .as_slice()
+        {
+            [Action::Preview { id, rect }] => {
+                assert_eq!(id, "a");
+                assert_eq!(*rect, offset(r, 37, -11));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_is_clamped_to_the_grid() {
+        let mut m = mode();
+        let items = items();
+        let g = m.geometry(PRIMARY).unwrap();
+        let from = center(m.frame_px(&items[0]).unwrap());
+        // Far beyond the bottom-right corner (still on the monitor).
+        let actions = drag(&mut m, &items, from, pt(1915, 1075));
+        match actions.as_slice() {
+            [Action::Commit { cells, .. }] => {
+                assert_eq!(*cells, (g.cols - 3, g.rows - 2, 3, 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        // And beyond the top-left one.
+        let mut m = mode();
+        let actions = drag(&mut m, &items, from, pt(1, 70));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Commit {
+                cells: (0, _, 3, 2),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn drop_on_another_widget_cancels() {
+        let mut m = mode();
+        let items = items();
+        let ra = m.frame_px(&items[0]).unwrap();
+        let rb = m.frame_px(&items[1]).unwrap();
+        // Top-left of "a" onto the top-left of "b".
+        let from = pt(ra.left + 5, ra.top + 5);
+        let to = pt(rb.left + 5, rb.top + 5);
+        match drag(&mut m, &items, from, to).as_slice() {
+            [Action::Cancel { id, from }] => {
+                assert_eq!(id, "a");
+                assert_eq!(from.left, rb.left);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_onto_own_old_place_is_fine() {
+        let mut m = mode();
+        let items = items();
+        let c = center(m.frame_px(&items[0]).unwrap());
+        let p = pitch(&m);
+        // Overlaps its own previous span: not a collision.
+        let actions = drag(&mut m, &items, c, pt(c.x + p, c.y));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Commit {
+                cells: (3, 4, 3, 2),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn move_to_another_monitor() {
+        let mut m = mode_with(
+            &[
+                (PRIMARY, rect(0, 0, 1920, 1080), 1.0),
+                (SECOND, rect(1920, 0, 3840, 1080), 1.0),
+            ],
+            Vec::new(),
+        );
+        let items = items();
+        let c = center(m.frame_px(&items[0]).unwrap());
+        let actions = drag(&mut m, &items, c, pt(c.x + 1920, c.y));
+        match actions.as_slice() {
+            [Action::Commit { monitor, cells, .. }] => {
+                assert_eq!(monitor, SECOND);
+                // Same cell position on an identical monitor.
+                assert_eq!(*cells, items[0].rect);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Items on the second monitor use its geometry.
+        let mut on2 = item("c", (0, 4, 2, 2));
+        on2.monitor = SECOND.into();
+        assert!(m.frame_px(&on2).unwrap().left >= 1920);
+        // Unknown monitors fall back to the primary one.
+        on2.monitor = "gone".into();
+        assert!(m.frame_px(&on2).unwrap().left < 1920);
+    }
+
+    // ── resizing ──
+
+    #[test]
+    fn resize_snaps_and_commits() {
+        let mut m = mode();
+        let items = items();
+        let r = m.frame_px(&items[0]).unwrap();
+        let p = pitch(&m);
+        let from = pt(r.right - 4, r.bottom - 4);
+        let actions = drag(&mut m, &items, from, pt(from.x + p, from.y + p));
+        match actions.as_slice() {
+            [
+                Action::Commit {
+                    id, cells, from, ..
+                },
+            ] => {
+                assert_eq!(id, "a");
+                assert_eq!(*cells, (2, 4, 4, 3));
+                // Top-left stays put while resizing.
+                assert_eq!((from.left, from.top), (r.left, r.top));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_respects_min_and_max() {
+        let items = items();
+        // Much bigger than max (6x4).
+        let mut m = mode();
+        let r = m.frame_px(&items[0]).unwrap();
+        let from = pt(r.right - 4, r.bottom - 4);
+        let actions = drag(&mut m, &items, from, pt(1900, 1070));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Commit {
+                cells: (2, 4, 6, 4),
+                ..
+            }]
+        ));
+        // Much smaller than min (1x1): the preview never gets smaller than one cell.
+        let mut m = mode();
+        m.input(Input::Down(from), &items);
+        let a = m.input(Input::Move(pt(r.left - 300, r.top - 300)), &items);
+        let g = m.geometry(PRIMARY).unwrap();
+        let one = g.rect(0, 0, 1, 1);
+        match a.as_slice() {
+            [Action::Preview { rect, .. }] => {
+                assert_eq!(rect.right - rect.left, one.right - one.left);
+                assert_eq!(rect.bottom - rect.top, one.bottom - one.top);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            m.input(Input::Up(pt(r.left - 300, r.top - 300)), &items)
+                .as_slice(),
+            [Action::Commit {
+                cells: (2, 4, 1, 1),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn resize_into_a_neighbour_cancels() {
+        let mut m = mode();
+        let items = items();
+        let r = m.frame_px(&items[0]).unwrap();
+        let p = pitch(&m);
+        let from = pt(r.right - 4, r.bottom - 4);
+        // "b" right next to "a": growing "a" by two columns runs into it.
+        let items = vec![items[0].clone(), item("b", (5, 4, 2, 2))];
+        let actions = drag(&mut m, &items, from, pt(from.x + 2 * p, from.y));
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Cancel { id, .. }] if id == "a"
+        ));
+    }
+
+    // ── gallery ──
+
+    fn open_sheet(m: &mut EditMode) {
+        m.open_gallery();
+        m.anim.insert("sheet".into(), 1.0);
+    }
+
+    #[test]
+    fn sheet_slides_up_and_holds_cards() {
+        let mut m = mode();
+        let (hidden, _) = m.sheet();
+        open_sheet(&mut m);
+        let (sheet, cards) = m.sheet();
+        assert!(hidden.top > sheet.top);
+        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().all(|c| contains(&sheet, center(*c))));
+        assert_eq!(m.hit(&[], center(cards[1])), Hot::Card(1));
+        assert_eq!(m.hit(&[], pt(sheet.left + 3, sheet.top + 3)), Hot::Sheet);
+        // The sheet is only hit while the gallery is open.
+        m.gallery_open = false;
+        assert_ne!(m.hit(&[], center(cards[1])), Hot::Card(1));
+    }
+
+    #[test]
+    fn click_on_a_card_adds_at_first_free_spot() {
+        let mut m = mode();
+        open_sheet(&mut m);
+        let card = m.sheet().1[1];
+        match click(&mut m, &[], center(card)).as_slice() {
+            [
+                Action::Add {
+                    package,
+                    widget,
+                    at: None,
+                },
+            ] => {
+                assert_eq!(package, "dev.pack");
+                assert_eq!(widget, "w1");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn drag_a_card_onto_the_desktop() {
+        let mut m = mode();
+        open_sheet(&mut m);
+        let items = items();
+        let card = m.sheet().1[0];
+        let g = m.geometry(PRIMARY).unwrap();
+        // Centre of a free 2x2 span at (16, 2).
+        let target = center(g.rect(16, 2, 2, 2));
+        let actions = drag(&mut m, &items, center(card), target);
+        match actions.as_slice() {
+            [
+                Action::Add {
+                    package,
+                    widget,
+                    at: Some((monitor, cells)),
+                },
+            ] => {
+                assert_eq!((package.as_str(), widget.as_str()), ("dev.pack", "w0"));
+                assert_eq!(monitor, PRIMARY);
+                assert_eq!(*cells, (16, 2, 2, 2));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!m.gallery_open, "the sheet closes after a drop");
+    }
+
+    #[test]
+    fn card_dropped_on_a_widget_or_the_sheet_is_dropped() {
+        let items = items();
+        let mut m = mode();
+        open_sheet(&mut m);
+        let card = m.sheet().1[0];
+        let onto = center(m.frame_px(&items[0]).unwrap());
+        assert!(drag(&mut m, &items, center(card), onto).is_empty());
+        assert!(m.gallery_open);
+
+        let mut m = mode();
+        open_sheet(&mut m);
+        let (sheet, cards) = m.sheet();
+        let back = pt(sheet.right - 5, sheet.top + 5);
+        assert!(drag(&mut m, &items, center(cards[0]), back).is_empty());
+    }
+
+    #[test]
+    fn wheel_scrolls_a_long_gallery() {
+        let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery(20));
+        open_sheet(&mut m);
+        let (sheet, _) = m.sheet();
+        m.pointer = pt(sheet.left + 30, sheet.bottom - 30);
+        m.input(Input::Wheel(-120), &[]);
+        assert_eq!(m.scroll, 96.0);
+        // Scrolling back past the start clamps at 0.
+        m.input(Input::Wheel(600), &[]);
+        assert_eq!(m.scroll, 0.0);
+        // And past the end clamps at the content width.
+        for _ in 0..100 {
+            m.input(Input::Wheel(-120), &[]);
+        }
+        let (sheet, cards) = m.sheet();
+        let last = cards.last().unwrap();
+        assert!(last.right <= sheet.right && last.right > sheet.right - 64);
+        // Off the sheet the wheel does nothing.
+        let before = m.scroll;
+        m.pointer = pt(5, 500);
+        m.input(Input::Wheel(120), &[]);
+        assert_eq!(m.scroll, before);
+    }
+
+    #[test]
+    fn short_gallery_does_not_scroll() {
+        let mut m = mode();
+        open_sheet(&mut m);
+        m.pointer = center(m.sheet().1[0]);
+        m.input(Input::Wheel(-120), &[]);
+        assert_eq!(m.scroll, 0.0);
+    }
+
+    // ── transitions ──
+
+    #[test]
+    fn step_settles_and_forgets_transients() {
+        let mut m = mode();
+        m.hot = Hot::Frame("a".into());
+        m.last_frame = Instant::now() - std::time::Duration::from_millis(100);
+        assert!(m.step());
+        assert!(m.a("frame:a") > 0.0);
+        for _ in 0..200 {
+            m.last_frame = Instant::now() - std::time::Duration::from_millis(100);
+            m.step();
+        }
+        assert_eq!(m.a("frame:a"), 1.0);
+        m.hot = Hot::None;
+        for _ in 0..200 {
+            m.last_frame = Instant::now() - std::time::Duration::from_millis(100);
+            m.step();
+        }
+        assert!(!m.anim.contains_key("frame:a"));
+        assert_eq!(m.a("sheet"), 0.0);
+        assert!(!m.step());
+    }
 }

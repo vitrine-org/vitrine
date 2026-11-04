@@ -97,21 +97,37 @@ fn install(path: &str) -> i32 {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+enum Cmd {
+    Version,
+    Help,
+    Render(headless::RenderArgs),
+    Install(String),
+    /// `--edit`, `--gallery`, `--quit`: a command for the running instance.
+    Send(u32),
+    Panel {
+        instance: Option<String>,
+    },
+    /// `--dev <dir>` (not canonicalized yet).
+    Dev(PathBuf),
+    /// No arguments or `--background`: run Vitrine.
+    Run,
+    /// A double-clicked package (file association).
+    Open(String),
+    /// A required argument is missing: usage on stderr, exit code 2.
+    MissingArgs,
+    /// Unknown arguments: usage on stderr.
+    Unknown,
+}
+
+/// Parses the arguments after the program name.
+fn parse_args(args: &[String]) -> Cmd {
     let cmd = args.first().map(String::as_str);
     match cmd {
-        Some("--version") | Some("-V") => {
-            attach_console();
-            println!("vitrine {}", env!("CARGO_PKG_VERSION"));
-        }
-        Some("--help") | Some("-h") => {
-            attach_console();
-            println!("{}", usage());
-        }
+        Some("--version") | Some("-V") => Cmd::Version,
+        Some("--help") | Some("-h") => Cmd::Help,
         Some("render") => {
-            attach_console();
-            logger::init_stderr();
             let positional: Vec<&String> = args[1..]
                 .iter()
                 .enumerate()
@@ -119,76 +135,100 @@ fn main() {
                 .map(|(_, a)| a)
                 .collect();
             let (Some(pkg), Some(widget)) = (positional.first(), positional.get(1)) else {
-                eprintln!("{}", usage());
-                std::process::exit(2);
+                return Cmd::MissingArgs;
             };
-            let size = if let Some(c) = flag(&args, "--cells").and_then(parse_pair) {
+            let size = if let Some(c) = flag(args, "--cells").and_then(parse_pair) {
                 headless::cells_to_dips(c.0 as u32, c.1 as u32)
             } else {
-                flag(&args, "--size")
+                flag(args, "--size")
                     .and_then(parse_pair)
                     .unwrap_or(headless::cells_to_dips(4, 2))
             };
-            let result = headless::run(headless::RenderArgs {
+            Cmd::Render(headless::RenderArgs {
                 package: PathBuf::from(pkg),
                 widget: widget.to_string(),
                 size,
-                scale: flag(&args, "--scale")
+                scale: flag(args, "--scale")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2.0),
-                settings: flag(&args, "--settings").map(str::to_string),
-                out: PathBuf::from(flag(&args, "--out").unwrap_or("widget.png")),
-                wait_ms: flag(&args, "--wait")
+                settings: flag(args, "--settings").map(str::to_string),
+                out: PathBuf::from(flag(args, "--out").unwrap_or("widget.png")),
+                wait_ms: flag(args, "--wait")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(300),
                 network: args.iter().any(|a| a == "--network"),
-            });
-            if let Err(e) = result {
+            })
+        }
+        Some("install") => match args.get(1) {
+            Some(path) => Cmd::Install(path.clone()),
+            None => Cmd::MissingArgs,
+        },
+        Some("--edit") => Cmd::Send(runtime::Runtime::CMD_EDIT),
+        Some("--gallery") => Cmd::Send(runtime::Runtime::CMD_GALLERY),
+        Some("--quit") => Cmd::Send(runtime::Runtime::CMD_QUIT),
+        Some("--panel") => Cmd::Panel {
+            instance: flag(args, "--instance").map(str::to_string),
+        },
+        Some("--dev") => match args.get(1) {
+            Some(dir) => Cmd::Dev(PathBuf::from(dir)),
+            None => Cmd::MissingArgs,
+        },
+        None | Some("--background") => Cmd::Run,
+        Some(path) if path.ends_with(".vitrine") => Cmd::Open(path.to_string()),
+        _ => Cmd::Unknown,
+    }
+}
+
+/// Drops the verbatim prefix (`\\?\`) of a canonical path so it matches the
+/// paths Windows reports.
+fn strip_verbatim(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args(&args) {
+        Cmd::Version => {
+            attach_console();
+            println!("vitrine {}", env!("CARGO_PKG_VERSION"));
+        }
+        Cmd::Help => {
+            attach_console();
+            println!("{}", usage());
+        }
+        Cmd::Render(render) => {
+            attach_console();
+            logger::init_stderr();
+            if let Err(e) = headless::run(render) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
-        Some("install") => {
+        Cmd::Install(path) => {
             attach_console();
-            let Some(path) = args.get(1) else {
-                eprintln!("{}", usage());
-                std::process::exit(2);
-            };
-            std::process::exit(install(path));
+            std::process::exit(install(&path));
         }
-        Some("--edit") | Some("--quit") | Some("--gallery") => {
-            let cmd = match cmd {
-                Some("--edit") => runtime::Runtime::CMD_EDIT,
-                Some("--gallery") => runtime::Runtime::CMD_GALLERY,
-                _ => runtime::Runtime::CMD_QUIT,
-            };
+        Cmd::Send(cmd) => {
             if !runtime::send_command(cmd) {
                 attach_console();
                 eprintln!("Vitrine is not running");
                 std::process::exit(1);
             }
         }
-        Some("--panel") => {
+        Cmd::Panel { instance } => {
             logger::init_file();
-            if let Err(e) = panel::run(flag(&args, "--instance").map(str::to_string)) {
+            if let Err(e) = panel::run(instance) {
                 log::error!("control panel: {e}");
                 std::process::exit(1);
             }
         }
-        Some("--dev") => {
+        Cmd::Dev(dir) => {
             attach_console();
             logger::init_stderr();
-            let Some(dir) = args.get(1).map(PathBuf::from) else {
-                eprintln!("{}", usage());
-                std::process::exit(2);
-            };
             let dir = dir
                 .canonicalize()
-                .map(|p| {
-                    // Drop the verbatim prefix so paths match the ones Windows reports.
-                    let s = p.to_string_lossy();
-                    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-                })
+                .map(|p| strip_verbatim(&p))
                 .unwrap_or(dir);
             if let Err(e) = vitrine_widgets::package::open_dir(&dir) {
                 eprintln!("error: {}: {e}", dir.display());
@@ -208,7 +248,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        None | Some("--background") => {
+        Cmd::Run => {
             logger::init_file();
             if !single_instance() {
                 log::info!("already running; asking it to reload");
@@ -222,17 +262,207 @@ fn main() {
             }
             log::info!("Vitrine stopped");
         }
-        Some(path) if path.ends_with(".vitrine") => {
-            // Double-clicked package (file association).
+        Cmd::Open(path) => {
             logger::init_file();
-            let code = install(path);
+            let code = install(&path);
             if code == 0 && !runtime::notify_reload() {
                 let _ = std::process::Command::new(std::env::current_exe().unwrap()).spawn();
             }
         }
-        _ => {
+        Cmd::MissingArgs => {
+            attach_console();
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
+        Cmd::Unknown => {
             attach_console();
             eprintln!("{}", usage());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cmd {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&args)
+    }
+
+    fn render(args: &[&str]) -> headless::RenderArgs {
+        match parse(args) {
+            Cmd::Render(r) => r,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_by_default() {
+        assert_eq!(parse(&[]), Cmd::Run);
+        assert_eq!(parse(&["--background"]), Cmd::Run);
+    }
+
+    #[test]
+    fn info_flags() {
+        assert_eq!(parse(&["--version"]), Cmd::Version);
+        assert_eq!(parse(&["-V"]), Cmd::Version);
+        assert_eq!(parse(&["--help"]), Cmd::Help);
+        assert_eq!(parse(&["-h"]), Cmd::Help);
+        assert_eq!(parse(&["--nope"]), Cmd::Unknown);
+        assert_eq!(parse(&["widget.zip"]), Cmd::Unknown);
+    }
+
+    #[test]
+    fn commands_for_the_running_instance() {
+        use runtime::Runtime;
+        assert_eq!(parse(&["--edit"]), Cmd::Send(Runtime::CMD_EDIT));
+        assert_eq!(parse(&["--gallery"]), Cmd::Send(Runtime::CMD_GALLERY));
+        assert_eq!(parse(&["--quit"]), Cmd::Send(Runtime::CMD_QUIT));
+    }
+
+    #[test]
+    fn panel() {
+        assert_eq!(parse(&["--panel"]), Cmd::Panel { instance: None });
+        assert_eq!(
+            parse(&["--panel", "--instance", "a1b2"]),
+            Cmd::Panel {
+                instance: Some("a1b2".into())
+            }
+        );
+        // `--instance` without a value.
+        assert_eq!(
+            parse(&["--panel", "--instance"]),
+            Cmd::Panel { instance: None }
+        );
+    }
+
+    #[test]
+    fn install_and_open() {
+        assert_eq!(
+            parse(&["install", r"C:\x\pack.vitrine"]),
+            Cmd::Install(r"C:\x\pack.vitrine".into())
+        );
+        assert_eq!(parse(&["install"]), Cmd::MissingArgs);
+        assert_eq!(
+            parse(&[r"C:\Users\me\Downloads\Weather Pack.vitrine"]),
+            Cmd::Open(r"C:\Users\me\Downloads\Weather Pack.vitrine".into())
+        );
+    }
+
+    #[test]
+    fn dev() {
+        assert_eq!(
+            parse(&["--dev", r"widgets\clock"]),
+            Cmd::Dev(PathBuf::from(r"widgets\clock"))
+        );
+        assert_eq!(parse(&["--dev"]), Cmd::MissingArgs);
+    }
+
+    #[test]
+    fn strips_the_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim(std::path::Path::new(r"\\?\C:\dev\clock")),
+            PathBuf::from(r"C:\dev\clock")
+        );
+        assert_eq!(
+            strip_verbatim(std::path::Path::new(r"C:\dev\clock")),
+            PathBuf::from(r"C:\dev\clock")
+        );
+        // Only a leading prefix is removed.
+        assert_eq!(
+            strip_verbatim(std::path::Path::new(r"C:\a\\?\b")),
+            PathBuf::from(r"C:\a\\?\b")
+        );
+        // A canonicalized directory loses it.
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let s = strip_verbatim(&here);
+        assert!(!s.to_string_lossy().starts_with(r"\\?\"), "{s:?}");
+        assert!(s.is_dir());
+    }
+
+    #[test]
+    fn render_defaults() {
+        let r = render(&["render", "pkg", "clock"]);
+        assert_eq!(
+            r,
+            headless::RenderArgs {
+                package: PathBuf::from("pkg"),
+                widget: "clock".into(),
+                size: headless::cells_to_dips(4, 2),
+                scale: 2.0,
+                settings: None,
+                out: PathBuf::from("widget.png"),
+                wait_ms: 300,
+                network: false,
+            }
+        );
+    }
+
+    #[test]
+    fn render_options() {
+        let r = render(&[
+            "render",
+            "--scale",
+            "1.5",
+            "pkg",
+            "--cells",
+            "3x2",
+            "clock",
+            "--settings",
+            r#"{"a":1}"#,
+            "--wait",
+            "50",
+            "--network",
+            "--out",
+            "o.png",
+        ]);
+        assert_eq!(r.package, PathBuf::from("pkg"));
+        assert_eq!(r.widget, "clock");
+        assert_eq!(r.size, headless::cells_to_dips(3, 2));
+        assert_eq!(r.scale, 1.5);
+        assert_eq!(r.settings.as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(r.wait_ms, 50);
+        assert!(r.network);
+        assert_eq!(r.out, PathBuf::from("o.png"));
+    }
+
+    #[test]
+    fn render_size_and_bad_values() {
+        let r = render(&["render", "p", "w", "--size", "300 X 150.5"]);
+        assert_eq!(r.size, (300.0, 150.5));
+        // `--cells` wins over `--size`.
+        let r = render(&["render", "p", "w", "--size", "1x1", "--cells", "2x2"]);
+        assert_eq!(r.size, headless::cells_to_dips(2, 2));
+        // Unparsable values fall back to the defaults.
+        let r = render(&[
+            "render", "p", "w", "--cells", "big", "--scale", "x", "--wait", "-1",
+        ]);
+        assert_eq!(r.size, headless::cells_to_dips(4, 2));
+        assert_eq!(r.scale, 2.0);
+        assert_eq!(r.wait_ms, 300);
+    }
+
+    #[test]
+    fn render_needs_package_and_widget() {
+        assert_eq!(parse(&["render"]), Cmd::MissingArgs);
+        assert_eq!(parse(&["render", "pkg"]), Cmd::MissingArgs);
+        // Flag values are not positional.
+        assert_eq!(
+            parse(&["render", "pkg", "--out", "x.png"]),
+            Cmd::MissingArgs
+        );
+    }
+
+    #[test]
+    fn pairs_and_flags() {
+        assert_eq!(parse_pair("4x2"), Some((4.0, 2.0)));
+        assert_eq!(parse_pair(" 4 X 2 "), Some((4.0, 2.0)));
+        assert_eq!(parse_pair("4"), None);
+        assert_eq!(parse_pair("ax2"), None);
+        let args: Vec<String> = ["a", "--k", "v", "--last"].map(String::from).to_vec();
+        assert_eq!(flag(&args, "--k"), Some("v"));
+        assert_eq!(flag(&args, "--last"), None);
+        assert_eq!(flag(&args, "--missing"), None);
     }
 }

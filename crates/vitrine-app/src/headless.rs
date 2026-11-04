@@ -12,6 +12,7 @@ use vitrine_widgets::package::{self, InstalledPackage};
 
 use crate::instance::{Effect, WidgetInstance};
 
+#[derive(Debug, PartialEq)]
 pub struct RenderArgs {
     pub package: PathBuf,
     pub widget: String,
@@ -174,4 +175,21 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
         args.out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cells_to_dips_counts_gaps_between_cells() {
+        assert_eq!(cells_to_dips(1, 1), (CELL, CELL));
+        assert_eq!(
+            cells_to_dips(4, 2),
+            (4.0 * 64.0 + 3.0 * 8.0, 2.0 * 64.0 + 8.0)
+        );
+        assert_eq!(cells_to_dips(2, 3), (136.0, 208.0));
+        // Zero cells is empty, not negative.
+        assert_eq!(cells_to_dips(0, 0), (0.0, 0.0));
+    }
 }

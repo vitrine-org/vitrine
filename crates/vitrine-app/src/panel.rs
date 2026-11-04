@@ -841,3 +841,262 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
 
     ui.run().map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slint::Model;
+    use vitrine_widgets::layout::Instance;
+    use vitrine_widgets::manifest::{PackageManifest, WidgetManifest};
+
+    fn widget(default: [u32; 2], min: [u32; 2], max: [u32; 2]) -> WidgetManifest {
+        serde_json::from_value(serde_json::json!({
+            "id": "w", "name": "W", "entry": "index.js",
+            "size": { "default": default, "min": min, "max": max }
+        }))
+        .unwrap()
+    }
+
+    fn def(json: Value) -> SettingDef {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn state(packages: Vec<InstalledPackage>, instances: Vec<Instance>) -> State {
+        State {
+            packages,
+            layout: Layout {
+                instances,
+                ..Default::default()
+            },
+            layout_stamp: None,
+            config: Config::default(),
+            editing: None,
+            schema: None,
+            values: Map::new(),
+            shown: Vec::new(),
+            detail: None,
+            preview_gen: Arc::new(AtomicU64::new(0)),
+            preview_timer: Rc::new(slint::Timer::default()),
+        }
+    }
+
+    fn package(json: Value) -> InstalledPackage {
+        InstalledPackage {
+            manifest: PackageManifest::parse(&json.to_string()).unwrap(),
+            dir: std::path::PathBuf::from(r"C:\nowhere"),
+        }
+    }
+
+    fn instance(id: &str, package: &str, widget: &str, monitor: &str) -> Instance {
+        Instance {
+            id: id.into(),
+            package: package.into(),
+            widget: widget.into(),
+            monitor: monitor.into(),
+            x: 0,
+            y: 0,
+            w: 3,
+            h: 2,
+            settings: Map::new(),
+        }
+    }
+
+    #[test]
+    fn size_choices_cover_min_default_and_bigger() {
+        let w = widget([4, 2], [2, 2], [8, 4]);
+        assert_eq!(size_choices(&w), vec![(2, 2), (4, 2), (5, 3), (8, 4)]);
+    }
+
+    #[test]
+    fn size_choices_are_deduplicated_and_capped() {
+        // Fixed size: one choice.
+        let w = widget([3, 3], [3, 3], [3, 3]);
+        assert_eq!(size_choices(&w), vec![(3, 3)]);
+        // Max right above default: mid and big coincide.
+        let w = widget([2, 2], [1, 1], [3, 3]);
+        assert_eq!(size_choices(&w), vec![(1, 1), (2, 2), (3, 3)]);
+        // Sorted by area.
+        let w = widget([4, 1], [1, 1], [12, 1]);
+        let c = size_choices(&w);
+        assert!(c.windows(2).all(|p| p[0].0 * p[0].1 <= p[1].0 * p[1].1));
+        assert_eq!(c, vec![(1, 1), (4, 1), (5, 1), (8, 1)]);
+    }
+
+    #[test]
+    fn integral_numbers() {
+        assert!(is_integral(&def(serde_json::json!({ "type": "number" }))));
+        assert!(is_integral(&def(
+            serde_json::json!({ "type": "number", "min": 0, "max": 10, "step": 2 })
+        )));
+        assert!(!is_integral(&def(
+            serde_json::json!({ "type": "number", "min": 0, "max": 1, "step": 0.1 })
+        )));
+        assert!(!is_integral(&def(
+            serde_json::json!({ "type": "number", "min": 0.5 })
+        )));
+    }
+
+    #[test]
+    fn boolean_row() {
+        let d =
+            def(serde_json::json!({ "type": "boolean", "label": "Seconds", "description": "d" }));
+        let row = setting_row("seconds", &d, &Value::Bool(true), "Clock", false);
+        assert_eq!(row.kind, 0);
+        assert!(row.bool_value);
+        assert_eq!(row.key, "seconds");
+        assert_eq!(row.label, "Seconds");
+        assert_eq!(row.section, "Clock");
+        assert_eq!(row.description, "d");
+        assert!(!row.enabled);
+        // A non-boolean value reads as false; a missing label falls back to the key.
+        let d = def(serde_json::json!({ "type": "boolean" }));
+        let row = setting_row("flag", &d, &Value::from(3), "", true);
+        assert!(!row.bool_value);
+        assert_eq!(row.label, "flag");
+    }
+
+    #[test]
+    fn integer_row() {
+        let d = def(serde_json::json!({ "type": "number", "min": 1, "max": 60, "step": 5 }));
+        let row = setting_row("n", &d, &Value::from(14.6), "", true);
+        assert_eq!(row.kind, 1);
+        assert_eq!(row.int_value, 15);
+        assert_eq!((row.min, row.max, row.step), (1, 60, 5));
+        // Unbounded, step defaults to 1 (and never below 1).
+        let d = def(serde_json::json!({ "type": "number", "step": 0 }));
+        let row = setting_row("n", &d, &Value::Null, "", true);
+        assert_eq!(row.int_value, 0);
+        assert_eq!((row.min, row.max, row.step), (-1_000_000, 1_000_000, 1));
+    }
+
+    #[test]
+    fn decimal_and_text_rows() {
+        let d = def(serde_json::json!({ "type": "number", "step": 0.25 }));
+        let row = setting_row("x", &d, &Value::from(1.5), "", true);
+        assert_eq!(row.kind, 4);
+        assert_eq!(row.text_value, "1.5");
+        let d = def(serde_json::json!({ "type": "string" }));
+        let row = setting_row("city", &d, &Value::from("Rome"), "", true);
+        assert_eq!(row.kind, 2);
+        assert_eq!(row.text_value, "Rome");
+        let row = setting_row("city", &d, &Value::Null, "", true);
+        assert_eq!(row.text_value, "");
+    }
+
+    #[test]
+    fn option_rows() {
+        let d = def(serde_json::json!({
+            "type": "string",
+            "options": [ { "value": "c", "label": "Celsius" }, { "value": "f" } ]
+        }));
+        let row = setting_row("unit", &d, &Value::from("f"), "", true);
+        assert_eq!(row.kind, 3);
+        assert_eq!(row.options.row_count(), 2);
+        assert_eq!(row.options.row_data(0).unwrap(), "Celsius");
+        // Without a label the value is shown, unquoted.
+        assert_eq!(row.options.row_data(1).unwrap(), "f");
+        assert_eq!(row.selected, 1);
+        // Unknown values select the first option.
+        let row = setting_row("unit", &d, &Value::from("k"), "", true);
+        assert_eq!(row.selected, 0);
+        // Numeric options.
+        let d = def(
+            serde_json::json!({ "type": "number", "options": [ { "value": 1 }, { "value": 2 } ] }),
+        );
+        let row = setting_row("n", &d, &Value::from(2), "", true);
+        assert_eq!((row.kind, row.selected), (3, 1));
+        assert_eq!(row.options.row_data(0).unwrap(), "1");
+    }
+
+    #[test]
+    fn settings_rows_follow_visibility() {
+        let mut st = state(Vec::new(), Vec::new());
+        assert!(settings_rows(&mut st).is_empty());
+        st.schema = Some(
+            SettingsSchema::parse(
+                r#"[
+                  { "title": "Look", "settings": {
+                      "custom": { "type": "boolean", "default": false },
+                      "color": { "type": "string", "default": "red",
+                                 "visibleWhen": { "key": "custom", "value": true } } } },
+                  { "title": "More", "settings": {
+                      "size": { "type": "number", "default": 3,
+                                "disabledWhen": { "key": "custom", "value": false } } } }
+                ]"#,
+            )
+            .unwrap(),
+        );
+        let rows = settings_rows(&mut st);
+        assert_eq!(st.shown, vec!["custom".to_string(), "size".to_string()]);
+        // The section title is only on the first row of each section.
+        assert_eq!(rows[0].section, "Look");
+        assert_eq!(rows[1].section, "More");
+        assert!(!rows[1].enabled);
+        assert_eq!(rows[1].int_value, 3);
+
+        st.values.insert("custom".into(), Value::Bool(true));
+        let rows = settings_rows(&mut st);
+        assert_eq!(st.shown, vec!["custom", "color", "size"]);
+        assert_eq!(rows[1].section, "");
+        assert_eq!(rows[1].text_value, "red");
+        assert!(rows[2].enabled);
+    }
+
+    #[test]
+    fn package_rows_describe_packages() {
+        let st = state(
+            vec![
+                package(
+                    serde_json::json!({ "id": "dev.a", "name": "A", "version": "2.1.0",
+                    "author": "me", "widgets": [ { "id": "x", "name": "X", "entry": "i.js" } ] }),
+                ),
+                package(
+                    serde_json::json!({ "id": "dev.b", "name": "B", "version": "1.0.0",
+                    "widgets": [ { "id": "x", "name": "X", "entry": "i.js" },
+                                 { "id": "y", "name": "Y", "entry": "i.js" } ] }),
+                ),
+            ],
+            Vec::new(),
+        );
+        let rows = package_rows(&st);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "dev.a");
+        assert_eq!(rows[0].detail, "Version 2.1.0 · 1 widget · me");
+        assert_eq!(rows[1].detail, "Version 1.0.0 · 2 widgets");
+
+        let lib = library_rows(&st);
+        assert_eq!(lib.len(), 3);
+        assert_eq!(
+            (lib[2].package.as_str(), lib[2].widget.as_str()),
+            ("dev.b", "y")
+        );
+        assert_eq!(lib[2].pack, "B");
+    }
+
+    #[test]
+    fn instance_rows_describe_placed_widgets() {
+        let st = state(
+            vec![package(
+                serde_json::json!({ "id": "dev.a", "name": "Pack A", "version": "2.0.0",
+                "widgets": [ { "id": "clock", "name": "Clock", "entry": "i.js",
+                               "settings": "settings.json" },
+                             { "id": "plain", "name": "Plain", "entry": "i.js" } ] }),
+            )],
+            vec![
+                instance("1", "dev.a", "clock", "primary"),
+                instance("2", "dev.a", "plain", r"\\.\DISPLAY2"),
+                instance("3", "dev.gone", "old", "primary"),
+            ],
+        );
+        let rows = instance_rows(&st);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "Clock");
+        assert_eq!(rows[0].detail, "Pack A · 3×2 · main monitor");
+        assert!(rows[0].has_settings);
+        assert_eq!(rows[1].detail, "Pack A · 3×2 · DISPLAY2");
+        assert!(!rows[1].has_settings);
+        // A missing package keeps the widget id as its name.
+        assert_eq!(rows[2].name, "old");
+        assert_eq!(rows[2].detail, "Missing package dev.gone");
+    }
+}
