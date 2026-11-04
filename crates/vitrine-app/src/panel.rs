@@ -4,6 +4,8 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde_json::{Map, Value};
@@ -31,6 +33,12 @@ struct State {
     values: Map<String, Value>,
     /// Keys shown on the settings page, in order (to detect visibility changes).
     shown: Vec<String>,
+    /// Widget shown on the detail page and its size choices (cells).
+    detail: Option<Detail>,
+    /// Latest preview request; older renders are discarded.
+    preview_gen: Arc<AtomicU64>,
+    /// Debounces settings-page previews while the user types.
+    preview_timer: Rc<slint::Timer>,
 }
 
 fn layout_stamp() -> Option<SystemTime> {
@@ -39,7 +47,26 @@ fn layout_stamp() -> Option<SystemTime> {
         .ok()
 }
 
+/// Package id, widget id and size choices (cells) of the detail page.
+type Detail = (String, String, Vec<(i32, i32)>);
+
 impl State {
+    fn empty() -> State {
+        State {
+            packages: Vec::new(),
+            layout: Layout::default(),
+            layout_stamp: None,
+            config: Config::default(),
+            editing: None,
+            schema: None,
+            values: Map::new(),
+            shown: Vec::new(),
+            detail: None,
+            preview_gen: Arc::new(AtomicU64::new(0)),
+            preview_timer: Rc::new(slint::Timer::default()),
+        }
+    }
+
     fn load() -> State {
         State {
             packages: package::scan(&paths::packages_dir()),
@@ -50,6 +77,9 @@ impl State {
             schema: None,
             values: Map::new(),
             shown: Vec::new(),
+            detail: None,
+            preview_gen: Arc::new(AtomicU64::new(0)),
+            preview_timer: Rc::new(slint::Timer::default()),
         }
     }
 
@@ -88,6 +118,184 @@ fn s(v: impl Into<SharedString>) -> SharedString {
     v.into()
 }
 
+fn preview_image(
+    pkg: &InstalledPackage,
+    w: &vitrine_widgets::manifest::WidgetManifest,
+) -> slint::Image {
+    w.preview
+        .as_ref()
+        .filter(|rel| vitrine_widgets::manifest::is_safe_relative_path(rel))
+        .and_then(|rel| slint::Image::load_from_path(&pkg.resolve(rel)).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy)]
+enum PreviewTarget {
+    Detail,
+    Settings,
+}
+
+/// Renders a widget off the UI thread (scripts need a big stack and their own
+/// graphics device) and shows it when done, unless a newer request came in.
+fn request_preview(
+    ui: &PanelWindow,
+    st: &State,
+    pkg: InstalledPackage,
+    widget: String,
+    cells: (i32, i32),
+    settings: Option<String>,
+    target: PreviewTarget,
+) {
+    let generation = st.preview_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let latest = st.preview_gen.clone();
+    match target {
+        PreviewTarget::Detail => ui.set_detail_busy(true),
+        PreviewTarget::Settings => ui.set_settings_preview_busy(true),
+    }
+    let weak = ui.as_weak();
+    let _ = std::thread::Builder::new()
+        .name("vitrine-preview".into())
+        .stack_size(8 << 20)
+        .spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                );
+            }
+            let size = crate::headless::cells_to_dips(cells.0.max(1) as u32, cells.1.max(1) as u32);
+            let result = crate::headless::render_rgba(
+                &pkg,
+                &widget,
+                size,
+                1.5,
+                settings.as_deref(),
+                700,
+                true,
+            );
+            if latest.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                let image = match result {
+                    Ok((w, h, rgba)) => {
+                        let buffer =
+                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                                &rgba, w, h,
+                            );
+                        slint::Image::from_rgba8(buffer)
+                    }
+                    Err(e) => {
+                        log::warn!("preview: {e}");
+                        slint::Image::default()
+                    }
+                };
+                match target {
+                    PreviewTarget::Detail => {
+                        ui.set_detail_preview(image);
+                        ui.set_detail_busy(false);
+                    }
+                    PreviewTarget::Settings => {
+                        ui.set_settings_preview(image);
+                        ui.set_settings_preview_busy(false);
+                    }
+                }
+            });
+        });
+}
+
+/// Size choices for a widget: its minimum, default and maximum, plus one step
+/// between default and maximum.
+fn size_choices(w: &vitrine_widgets::manifest::WidgetManifest) -> Vec<(i32, i32)> {
+    let c = |a: [u32; 2]| (a[0] as i32, a[1] as i32);
+    let (min, def, max) = (c(w.size.min), c(w.size.default), c(w.size.max));
+    let mid = ((def.0 + 1).min(max.0), (def.1 + 1).min(max.1));
+    let big = ((def.0 * 2).min(max.0), (def.1 * 2).min(max.1));
+    let mut out = Vec::new();
+    for v in [min, def, mid, big] {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out.sort_by_key(|(w, h)| w * h);
+    out
+}
+
+fn open_detail(ui: &PanelWindow, st: &mut State, package: &str, widget: &str) {
+    let Some(pkg) = st.package(package).cloned() else {
+        return;
+    };
+    let Some(w) = pkg.widget(widget).cloned() else {
+        return;
+    };
+    let sizes = size_choices(&w);
+    let def = (w.size.default[0] as i32, w.size.default[1] as i32);
+    let index = sizes.iter().position(|s| *s == def).unwrap_or(0);
+    ui.set_detail(LibraryRow {
+        package: s(package),
+        widget: s(widget),
+        name: s(w.name.as_str()),
+        description: s(w.description.as_str()),
+        pack: s(pkg.manifest.name.as_str()),
+        size: s(format!("{}×{}", def.0, def.1)),
+        preview: preview_image(&pkg, &w),
+    });
+    ui.set_detail_preview(preview_image(&pkg, &w));
+    ui.set_detail_sizes(ModelRc::new(VecModel::from(
+        sizes
+            .iter()
+            .map(|(w, h)| s(format!("{w} × {h}")))
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_detail_size(index as i32);
+    ui.set_page(5);
+    st.detail = Some((package.to_string(), widget.to_string(), sizes.clone()));
+    request_preview(
+        ui,
+        st,
+        pkg,
+        widget.to_string(),
+        sizes[index],
+        None,
+        PreviewTarget::Detail,
+    );
+}
+
+/// Re-renders the settings-page preview shortly after the last change.
+fn schedule_settings_preview(ui: &PanelWindow, st: &State) {
+    let Some(id) = st.editing.clone() else { return };
+    let Some(inst) = st.layout.instance(&id).cloned() else {
+        return;
+    };
+    let Some(pkg) = st.package(&inst.package).cloned() else {
+        return;
+    };
+    let settings = Value::Object(st.values.clone()).to_string();
+    let weak = ui.as_weak();
+    let counter = st.preview_gen.clone();
+    st.preview_timer.start(
+        slint::TimerMode::SingleShot,
+        std::time::Duration::from_millis(250),
+        move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // A throwaway State just to reach `request_preview` with the shared counter.
+            let probe = State {
+                preview_gen: counter.clone(),
+                ..State::empty()
+            };
+            request_preview(
+                &ui,
+                &probe,
+                pkg.clone(),
+                inst.widget.clone(),
+                (inst.w, inst.h),
+                Some(settings.clone()),
+                PreviewTarget::Settings,
+            );
+        },
+    );
+}
+
 fn instance_rows(st: &State) -> Vec<InstanceRow> {
     st.layout
         .instances
@@ -110,6 +318,10 @@ fn instance_rows(st: &State) -> Vec<InstanceRow> {
                     None => format!("Missing package {}", i.package),
                 }),
                 has_settings: w.is_some_and(|w| w.settings.is_some()),
+                preview: match (pkg, w) {
+                    (Some(p), Some(w)) => preview_image(p, w),
+                    _ => slint::Image::default(),
+                },
             }
         })
         .collect()
@@ -126,6 +338,7 @@ fn library_rows(st: &State) -> Vec<LibraryRow> {
                 description: s(w.description.as_str()),
                 pack: s(p.manifest.name.as_str()),
                 size: s(format!("{}×{}", w.size.default[0], w.size.default[1])),
+                preview: preview_image(p, w),
             })
         })
         .collect()
@@ -276,7 +489,9 @@ fn open_settings(ui: &PanelWindow, st: &mut State, id: &str) {
         pkg.manifest.name
     )));
     ui.set_settings(ModelRc::new(VecModel::from(settings_rows(st))));
+    ui.set_settings_preview(preview_image(&pkg, &w));
     ui.set_page(4);
+    schedule_settings_preview(ui, st);
 }
 
 /// Validates `key = value`; on success saves the instance settings and returns true.
@@ -313,6 +528,9 @@ fn apply_setting(ui: &PanelWindow, st: &mut State, key: &str, value: Value) {
                 .unwrap_or_default()
         }
     };
+    if error.is_empty() {
+        schedule_settings_preview(ui, st);
+    }
     // Rebuild when visibility changed; otherwise update rows in place (keeps focus while typing).
     let before = st.shown.clone();
     let rows = settings_rows(st);
@@ -339,7 +557,12 @@ fn refresh(ui: &PanelWindow, st: &State) {
     ui.set_packages(ModelRc::new(VecModel::from(package_rows(st))));
 }
 
-fn add_widget(st: &mut State, package: &str, widget: &str) -> Result<String, String> {
+fn add_widget(
+    st: &mut State,
+    package: &str,
+    widget: &str,
+    size: Option<(i32, i32)>,
+) -> Result<String, String> {
     let w = st
         .package(package)
         .and_then(|p| p.widget(widget))
@@ -352,7 +575,7 @@ fn add_widget(st: &mut State, package: &str, widget: &str) -> Result<String, Str
         .or(monitors.first())
         .ok_or("no monitor")?;
     let g = Geometry::for_monitor(&st.layout.grid, primary);
-    let (cw, ch) = (w.size.default[0] as i32, w.size.default[1] as i32);
+    let (cw, ch) = size.unwrap_or((w.size.default[0] as i32, w.size.default[1] as i32));
     let mut placed = Err(format!(
         "No free space for {} ({cw}×{ch}). Make room in Edit layout.",
         w.name
@@ -456,9 +679,47 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
                             st,
                             package: SharedString,
                             widget: SharedString| {
-        let msg = add_widget(st, &package, &widget).unwrap_or_else(|e| e);
+        let msg = add_widget(st, &package, &widget, None).unwrap_or_else(|e| e);
         ui.set_status(s(msg));
         refresh(&ui, st);
+    }));
+    ui.on_open_detail(with!(|ui,
+                             st,
+                             package: SharedString,
+                             widget: SharedString| {
+        open_detail(&ui, st, &package, &widget)
+    }));
+    ui.on_choose_size(with!(|ui, st, index: i32| {
+        let Some((package, widget, sizes)) = st.detail.clone() else {
+            return;
+        };
+        let Some(pkg) = st.package(&package).cloned() else {
+            return;
+        };
+        if let Some(size) = sizes.get(index.max(0) as usize) {
+            request_preview(&ui, st, pkg, widget, *size, None, PreviewTarget::Detail);
+        }
+    }));
+    ui.on_add_detail(with!(|ui, st| {
+        let Some((package, widget, sizes)) = st.detail.clone() else {
+            return;
+        };
+        let size = sizes.get(ui.get_detail_size().max(0) as usize).copied();
+        match add_widget(st, &package, &widget, size) {
+            Ok(msg) => {
+                ui.set_status(s(msg));
+                refresh(&ui, st);
+                ui.set_page(0);
+            }
+            Err(e) => ui.set_status(s(e)),
+        }
+    }));
+    ui.on_place_detail(with!(|ui, _st| {
+        if runtime::send_command(runtime::Runtime::CMD_GALLERY) {
+            ui.set_status(s("Drag the widget from the gallery onto your desktop"));
+        } else {
+            ui.set_status(s("Vitrine is not running"));
+        }
     }));
     ui.on_uninstall(with!(|ui, st, id: SharedString| {
         let id = id.to_string();

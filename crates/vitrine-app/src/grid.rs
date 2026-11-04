@@ -17,21 +17,28 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// The grid fills the work area edge to edge: cells (nominally `grid.cell`)
+    /// stretch slightly so the columns exactly span the width between the
+    /// margins, and the rows are centred vertically. Margins are therefore equal
+    /// on all sides (up to less than one cell vertically).
     pub fn new(grid: &GridConfig, work: RECT, scale: f32) -> Geometry {
-        let fit = |px: i32| {
-            let dips = px as f32 / scale - 2.0 * grid.margin;
-            (((dips + grid.gap) / (grid.cell + grid.gap)).floor() as i32).max(1)
-        };
+        let avail_w = (work.right - work.left) as f32 / scale - 2.0 * grid.margin;
+        let avail_h = (work.bottom - work.top) as f32 / scale - 2.0 * grid.margin;
+        let cols = (((avail_w + grid.gap) / (grid.cell + grid.gap)).floor() as i32).max(1);
+        let cell = ((avail_w + grid.gap) / cols as f32 - grid.gap).max(grid.cell * 0.5);
+        let rows = (((avail_h + grid.gap) / (cell + grid.gap)).floor() as i32).max(1);
+        let used_h = rows as f32 * (cell + grid.gap) - grid.gap;
+        let top = grid.margin + ((avail_h - used_h) / 2.0).max(0.0);
         Geometry {
             origin: (
                 work.left as f32 + grid.margin * scale,
-                work.top as f32 + grid.margin * scale,
+                work.top as f32 + top * scale,
             ),
-            cell: grid.cell,
+            cell,
             gap: grid.gap,
             scale,
-            cols: fit(work.right - work.left),
-            rows: fit(work.bottom - work.top),
+            cols,
+            rows,
         }
     }
 
@@ -100,20 +107,29 @@ mod tests {
     }
 
     #[test]
-    fn fits_cells_in_work_area() {
-        let g = geo(1.0);
-        // (1920 - 48 + 8) / 72 = 26.1
-        assert_eq!(g.cols, 26);
-        assert_eq!(g.rows, 13);
-        assert_eq!(geo(1.5).cols, 26);
+    fn fills_the_work_area_evenly() {
+        for scale in [1.0, 1.25, 1.5] {
+            let g = geo(scale);
+            assert_eq!(g.cols, 26);
+            assert!(g.cell >= 64.0 && g.cell < 64.0 + 72.0 / 26.0);
+            // Last column ends exactly at the right margin.
+            let last = g.rect(g.cols - 1, 0, 1, 1);
+            assert!(((1920.0 - 24.0) * scale - last.right as f32).abs() <= 1.0);
+            // Vertical margins are equal.
+            let bottom = g.rect(0, g.rows - 1, 1, 1).bottom as f32;
+            let top_margin = g.origin.1;
+            let bottom_margin = 1032.0 * scale - bottom;
+            assert!(
+                (top_margin - bottom_margin).abs() <= 1.5,
+                "{top_margin} vs {bottom_margin}"
+            );
+        }
     }
 
     #[test]
     fn rect_and_snap_agree() {
         let g = geo(1.5);
         let r = g.rect(3, 2, 4, 2);
-        assert_eq!(r.left, (36.0 + 3.0 * 108.0) as i32);
-        assert_eq!(r.right - r.left, ((4.0 * 64.0 + 3.0 * 8.0) * 1.5) as i32);
         assert_eq!(g.snap(r.left as f32 + 10.0, r.top as f32 - 10.0), (3, 2));
         assert_eq!(g.span((r.right - r.left) as f32), 4);
         assert_eq!(g.clamp(30, -1, 4, 2), (22, 0, 4, 2));
