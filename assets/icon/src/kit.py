@@ -124,3 +124,60 @@ def inner_highlight(sv, d, w, top='#FFFFFF', a=0.6, y0=0, y1=48, bottom=None, ab
     return f'<g clip-path="{cp}">{stroke(d, g, 2 * w)}</g>'
 
 
+
+
+# ---------------------------------------------------------------- polygons (used by lastre.py)
+def vsub(a, b):
+    return (a[0] - b[0], a[1] - b[1])
+
+
+def vadd(a, b):
+    return (a[0] + b[0], a[1] + b[1])
+
+
+def vmul(a, k):
+    return (a[0] * k, a[1] * k)
+
+
+def vnorm(a):
+    L = math.hypot(*a)
+    return (a[0] / L, a[1] / L)
+
+
+def rpoly(pts, radii):
+    """Closed polygon with a rounded corner of radius radii[i] at vertex i (0 = sharp)."""
+    n = len(pts)
+    if not isinstance(radii, (list, tuple)):
+        radii = [radii] * n
+    segs = []
+    for i in range(n):
+        p0, p1, p2 = pts[i - 1], pts[i], pts[(i + 1) % n]
+        r = radii[i]
+        if r <= 0:
+            segs.append(('P', p1))
+            continue
+        u1, u2 = vnorm(vsub(p0, p1)), vnorm(vsub(p2, p1))
+        th = math.acos(max(-1.0, min(1.0, u1[0] * u2[0] + u1[1] * u2[1])))
+        d = r / math.tan(th / 2)
+        e1, e2 = vsub(p1, p0), vsub(p2, p1)
+        sweep = 1 if e1[0] * e2[1] - e1[1] * e2[0] > 0 else 0
+        segs.append(('A', vadd(p1, vmul(u1, d)), vadd(p1, vmul(u2, d)), r, sweep))
+    pt = lambda p: f'{f(p[0])} {f(p[1])}'
+    d = ''
+    for j, s in enumerate(segs):
+        cmd = 'M' if j == 0 else 'L'
+        d += f'{cmd}{pt(s[1])}' if s[0] == 'P' else f'{cmd}{pt(s[1])}A{f(s[3])} {f(s[3])} 0 0 {s[4]} {pt(s[2])}'
+    return d + 'Z'
+
+
+def line_x(p, q, y):
+    """x of line pq at height y."""
+    return p[0] + (q[0] - p[0]) * (y - p[1]) / (q[1] - p[1])
+
+
+def intersect(p1, p2, p3, p4):
+    """Intersection of line p1p2 with line p3p4."""
+    (x1, y1), (x2, y2), (x3, y3), (x4, y4) = p1, p2, p3, p4
+    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den
+    return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))

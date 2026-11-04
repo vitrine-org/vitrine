@@ -16,6 +16,15 @@ Use the **frontend-design** skill (plugin `frontend-design@claude-plugins-offici
 Follow Windows 11 Fluent conventions for anything that lives on the desktop or in the panel, and
 keep the website minimal (icon, a few concepts, links).
 
+## App icon
+
+The icon is "Lastre": an abstract V of two panes (lit lagoon behind, deep lagoon in front, an ember
+orb between them) on the 48-unit Fluent grid. It replaced the earlier "Acrylic" icon. Sources, build
+and design rules (keyline, 1:2 construction, radii, pixel-fitted small frames, contrast) are in
+`assets/icon/src/README.md`; never edit the generated files in `assets/icon/` by hand, change
+`assets/icon/src/lastre.py` and run `npm run build` there. Wherever the app or the website shows the
+icon, use `assets/icon/vitrine.svg` (or the generated PNG/ICO), never a redrawn copy.
+
 ## Conventions
 
 - Release line is 2.x (first release 2.0.0); Vitrine 1 history lives on branch `v1`.
