@@ -9,8 +9,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::manifest::{
-    ENGINE_VERSION, MANIFEST_FILE, PackageManifest, WidgetManifest, is_safe_relative_path,
-    is_valid_package_id,
+    ENGINE_VERSION, MANIFEST_FILE, PackageManifest, WidgetManifest, compare_versions,
+    is_safe_relative_path, is_valid_package_id,
 };
 use crate::settings::SettingsSchema;
 use crate::{Error, Result};
@@ -189,6 +189,36 @@ pub fn install(archive: &Path, packages_dir: &Path) -> Result<InstalledPackage> 
         manifest,
         dir: target,
     })
+}
+
+/// Reads the manifest inside a `.vitrine` archive without extracting it.
+pub fn read_archive_manifest(archive: &Path) -> Result<PackageManifest> {
+    let mut zip = ZipArchive::new(File::open(archive)?)?;
+    let entry = zip
+        .by_name(MANIFEST_FILE)
+        .map_err(|_| Error::Manifest(format!("{MANIFEST_FILE} not found at package root")))?;
+    if entry.size() > MAX_MANIFEST_BYTES {
+        return Err(Error::Manifest(format!("{MANIFEST_FILE} is too large")));
+    }
+    let mut text = String::new();
+    entry.take(MAX_MANIFEST_BYTES).read_to_string(&mut text)?;
+    PackageManifest::parse_validated(&text)
+}
+
+/// Installs `archive` unless the same package is already installed at the
+/// same or a newer version (e.g. updated from the Store since). Returns the
+/// installed package, or None when it was skipped.
+pub fn install_unless_older(
+    archive: &Path,
+    packages_dir: &Path,
+) -> Result<Option<InstalledPackage>> {
+    let bundled = read_archive_manifest(archive)?;
+    if let Ok(current) = load_and_verify(&packages_dir.join(&bundled.id))
+        && compare_versions(&current.version, &bundled.version) != std::cmp::Ordering::Less
+    {
+        return Ok(None);
+    }
+    install(archive, packages_dir).map(Some)
 }
 
 /// Removes `packages_dir/<id>/`. Missing packages are not an error.
@@ -414,6 +444,32 @@ mod tests {
         assert!(scan(&sb.pkgs()).is_empty());
         uninstall("dev.vitrine.t", &sb.pkgs()).unwrap();
         assert!(uninstall("../x", &sb.pkgs()).is_err());
+    }
+
+    #[test]
+    fn bundled_packs_never_downgrade() {
+        let sb = Sandbox::new("bundled");
+        let v1 = sb.zip("v1.vitrine", &base_files("dev.vitrine.t", "2.1.0"));
+        let v2 = sb.zip("v2.vitrine", &base_files("dev.vitrine.t", "2.1.10"));
+        assert_eq!(read_archive_manifest(&v1).unwrap().version, "2.1.0");
+
+        // Nothing installed: installs.
+        let p = install_unless_older(&v1, &sb.pkgs()).unwrap().unwrap();
+        assert_eq!(p.manifest.version, "2.1.0");
+        // Same version: skipped.
+        assert!(install_unless_older(&v1, &sb.pkgs()).unwrap().is_none());
+        // Newer bundle (semver, not string order): upgrades.
+        let p = install_unless_older(&v2, &sb.pkgs()).unwrap().unwrap();
+        assert_eq!(p.manifest.version, "2.1.10");
+        // Older bundle after a Store update: the newer pack stays.
+        assert!(install_unless_older(&v1, &sb.pkgs()).unwrap().is_none());
+        let found = scan(&sb.pkgs());
+        assert_eq!(found[0].manifest.version, "2.1.10");
+        assert_eq!(
+            std::fs::read_to_string(found[0].dir.join("widgets/clock/index.js")).unwrap(),
+            "// 2.1.10"
+        );
+        assert!(leftovers(&sb.pkgs()).is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 //! Vitrine — desktop widgets for Windows, drawn beneath the desktop icons.
 
+mod bridge;
 mod edit;
 mod flyout;
 mod glass;
@@ -68,6 +69,21 @@ pub fn open_panel_page(page: &str) {
 }
 
 fn spawn_panel(args: Option<[&str; 2]>) {
+    // A panel is already open: switch it to the request and bring it forward.
+    let req = match args {
+        Some(["--page", p]) => bridge::Request {
+            page: Some(p.to_string()),
+            instance: None,
+        },
+        Some([_, id]) => bridge::Request {
+            page: None,
+            instance: Some(id.to_string()),
+        },
+        None => bridge::Request::default(),
+    };
+    if bridge::forward(&req) {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -76,8 +92,9 @@ fn spawn_panel(args: Option<[&str; 2]>) {
     if let Some(a) = args {
         cmd.args(a);
     }
-    if let Err(e) = cmd.spawn() {
-        log::error!("cannot open the control panel: {e}");
+    match cmd.spawn() {
+        Ok(child) => bridge::allow_foreground(child.id()),
+        Err(e) => log::error!("cannot open the control panel: {e}"),
     }
 }
 

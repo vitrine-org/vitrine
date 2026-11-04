@@ -340,12 +340,14 @@ impl Runtime {
             if seen.get(&name).and_then(Value::as_u64) == Some(stamp) {
                 continue;
             }
-            match package::install(&path, &paths::packages_dir()) {
-                Ok(p) => log::info!(
+            // Never replace a newer copy (e.g. one updated from the Store).
+            match package::install_unless_older(&path, &paths::packages_dir()) {
+                Ok(Some(p)) => log::info!(
                     "installed bundled pack {} {}",
                     p.manifest.id,
                     p.manifest.version
                 ),
+                Ok(None) => log::info!("bundled pack {name}: a same or newer version is installed"),
                 Err(e) => log::error!("bundled pack {name}: {e}"),
             }
             seen.insert(name, stamp.into());
@@ -1225,9 +1227,12 @@ impl Runtime {
             shellapi::autostart_enabled(),
         );
         let anchor = crate::flyout::Anchor::Above(pt);
-        if let Some(cmd) =
-            crate::flyout::show(&self.gpu, &self.dc, self.hinst, anchor, &items, &menu_decor)
-        {
+        let cmd = crate::flyout::show(&self.gpu, &self.dc, self.hinst, anchor, &items, &menu_decor);
+        // Tray clicks that arrived while the menu was open (the shell's own
+        // follow-up notifications, or a click on the icon that closed it) must
+        // not reopen it on top of whatever the command opens.
+        drop_queued_tray_events();
+        if let Some(cmd) = cmd {
             self.command(cmd, None);
         }
     }
@@ -1569,9 +1574,20 @@ fn interval_multiplier(
     }
 }
 
-/// Tray callbacks that open the menu (`NIN_SELECT` is `WM_USER`).
+/// `NIN_SELECT` (mouse) and `NIN_KEYSELECT` (keyboard) with NOTIFYICON_VERSION_4.
+const NIN_SELECT: u32 = WM_USER;
+const NIN_KEYSELECT: u32 = WM_USER + 1;
+
+/// Tray callbacks that open the menu. A left click also delivers
+/// `WM_LBUTTONUP` before `NIN_SELECT`: reacting to both opened the menu twice,
+/// so the second copy popped up right after an item was chosen.
 fn tray_opens_menu(event: u32) -> bool {
-    event == WM_CONTEXTMENU || event == WM_LBUTTONUP || event == WM_USER
+    matches!(event, WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT)
+}
+
+/// Discards tray notifications queued while a tray menu was open.
+fn drop_queued_tray_events() {
+    INBOX.with_borrow_mut(|q| q.retain(|m| !matches!(m, HostMsg::Tray(..))));
 }
 
 /// NOTIFYICON_VERSION_4: event in LOWORD(lParam), anchor point in wParam.
@@ -2124,17 +2140,29 @@ mod tests {
     #[test]
     fn tray_events_that_open_the_menu() {
         assert!(tray_opens_menu(WM_CONTEXTMENU));
-        assert!(tray_opens_menu(WM_LBUTTONUP));
         assert!(tray_opens_menu(WM_USER)); // NIN_SELECT
+        assert!(tray_opens_menu(WM_USER + 1)); // NIN_KEYSELECT
+        // A left click sends WM_LBUTTONUP and then NIN_SELECT: only one opens.
         for ev in [
             WM_MOUSEMOVE,
             WM_LBUTTONDOWN,
+            WM_LBUTTONUP,
             WM_RBUTTONUP,
-            WM_USER + 1,
             WM_USER + 2,
         ] {
             assert!(!tray_opens_menu(ev), "{ev:#x}");
         }
+    }
+
+    #[test]
+    fn tray_events_queued_during_the_menu_are_dropped() {
+        INBOX.with_borrow_mut(|q| q.clear());
+        push(HostMsg::Tray(WM_LBUTTONUP, POINT::default()));
+        push(HostMsg::Timer(7));
+        push(HostMsg::Tray(WM_USER, POINT::default()));
+        drop_queued_tray_events();
+        let left: Vec<HostMsg> = INBOX.with_borrow_mut(|q| q.drain(..).collect());
+        assert!(matches!(left.as_slice(), [HostMsg::Timer(7)]), "{left:?}");
     }
 
     #[test]

@@ -10,5 +10,5 @@ repository.workspace = true
 log = "0.4.35"
 rquickjs = { version = "0.14.0", features = ["loader", "array-buffer", "classes", "properties"] }
 serde_json = "1.0.154"
-vitrine-render = { version = "2.0.0", path = "../vitrine-render" }
+vitrine-render = { version = "2.0.1", path = "../vitrine-render" }
 windows = { version = "0.62.2", features = ["Win32_Globalization", "Win32_Foundation", "Win32_System_Registry"] }

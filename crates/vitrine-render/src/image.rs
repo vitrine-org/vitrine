@@ -74,11 +74,18 @@ impl ImageCache {
     }
 
     pub fn get(&mut self, src: &str, assets: &dyn Assets) -> Option<IWICBitmap> {
-        if let Some(v) = self.images.get(src) {
+        self.get_keyed(src, src, assets)
+    }
+
+    /// Like [`get`](Self::get), cached under `key`: a cache shared by several
+    /// asset roots (packages) needs a key that names the root as well, since
+    /// relative paths such as `src/weather/preview.png` repeat across them.
+    pub fn get_keyed(&mut self, key: &str, src: &str, assets: &dyn Assets) -> Option<IWICBitmap> {
+        if let Some(v) = self.images.get(key) {
             return v.clone();
         }
         let decoded = assets.read(src).and_then(|bytes| self.decode(&bytes).ok());
-        self.images.insert(src.to_string(), decoded.clone());
+        self.images.insert(key.to_string(), decoded.clone());
         decoded
     }
 

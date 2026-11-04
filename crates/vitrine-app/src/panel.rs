@@ -1464,7 +1464,33 @@ fn pick_package() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Shows the page a launch asked for (`store`, `gallery`, ...) and, with an
+/// instance id, that widget's settings.
+fn navigate(ui: &PanelWindow, st: &mut State, page: Option<&str>, instance: Option<&str>) {
+    match page {
+        Some("gallery" | "add") => ui.set_page(1),
+        Some("packages") => ui.set_page(2),
+        Some("general") => ui.set_page(3),
+        Some("store") => {
+            ui.set_page(6);
+            open_store(ui, st);
+        }
+        _ => {}
+    }
+    if let Some(id) = instance {
+        open_settings(ui, st, id);
+    }
+}
+
 pub fn run(instance: Option<String>, page: Option<String>) -> Result<(), String> {
+    let req = crate::bridge::Request {
+        page: page.clone(),
+        instance: instance.clone(),
+    };
+    if !crate::bridge::claim_or_forward(&req) {
+        // Another panel took the request and came to the front.
+        return Ok(());
+    }
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(
             None,
@@ -1490,19 +1516,22 @@ pub fn run(instance: Option<String>, page: Option<String>) -> Result<(), String>
         ui.set_hotkey(s(st.config.edit_hotkey.as_str()));
         refresh(&ui, st);
         check_updates(&ui, st);
-        match page.as_deref() {
-            Some("gallery" | "add") => ui.set_page(1),
-            Some("packages") => ui.set_page(2),
-            Some("general") => ui.set_page(3),
-            Some("store") => {
-                ui.set_page(6);
-                open_store(&ui, st);
-            }
-            _ => {}
-        }
+        navigate(&ui, st, page.as_deref(), instance.as_deref());
     }
-    if let Some(id) = instance {
-        open_settings(&ui, &mut st.borrow_mut(), &id);
+    {
+        let weak = ui.as_weak();
+        let st = st.clone();
+        crate::bridge::listen(move |req| {
+            if let Some(ui) = weak.upgrade() {
+                navigate(
+                    &ui,
+                    &mut st.borrow_mut(),
+                    req.page.as_deref(),
+                    req.instance.as_deref(),
+                );
+                crate::bridge::bring_to_front();
+            }
+        });
     }
 
     let weak = ui.as_weak();

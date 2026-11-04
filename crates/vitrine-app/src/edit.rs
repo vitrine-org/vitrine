@@ -30,6 +30,7 @@ use crate::runtime::HostMsg;
 use vitrine_render::compose::WindowVisual;
 use vitrine_render::gpu::Gpu;
 use vitrine_render::image::{DirAssets, ImageCache};
+use windows::Win32::Graphics::Imaging::IWICBitmap;
 
 const CLASS: PCWSTR = w!("VitrineEditOverlay");
 
@@ -1509,18 +1510,25 @@ impl EditMode {
         *self.anim.get(key).unwrap_or(&0.0)
     }
 
+    /// The decoded preview of gallery card `i`. Cached per (package, widget):
+    /// packs reuse paths like `src/weather/preview.png`, and keying by that path
+    /// alone showed one pack's preview on every pack's card.
+    fn preview_image(&mut self, i: usize) -> Option<IWICBitmap> {
+        let item = &self.gallery[i];
+        let rel = item.preview.as_ref()?;
+        let key = format!("{}|{}|{rel}", item.package, item.widget);
+        self.images
+            .get_keyed(&key, rel, &DirAssets(item.dir.clone()))
+    }
+
     fn preview_bitmap(&mut self, dc: &ID2D1DeviceContext, i: usize) -> Option<ID2D1Bitmap> {
         if let Some(b) = self.previews.get(&i) {
             return b.clone();
         }
-        let item = &self.gallery[i];
-        let bmp = item.preview.as_ref().and_then(|rel| {
-            let wic = self.images.get(rel, &DirAssets(item.dir.clone()))?;
-            unsafe {
-                dc.CreateBitmapFromWicBitmap(&wic, None)
-                    .ok()
-                    .and_then(|b| b.cast().ok())
-            }
+        let bmp = self.preview_image(i).and_then(|wic| unsafe {
+            dc.CreateBitmapFromWicBitmap(&wic, None)
+                .ok()
+                .and_then(|b| b.cast().ok())
         });
         self.previews.insert(i, bmp.clone());
         bmp
@@ -3072,6 +3080,59 @@ mod tests {
             m.last_frame = Instant::now() - std::time::Duration::from_millis(100);
             m.step();
         }
+    }
+
+    /// A w×h 24-bit BMP (WIC decodes it like a PNG).
+    fn bmp(w: u32, h: u32) -> Vec<u8> {
+        let row = (w * 3).div_ceil(4) * 4;
+        let size = 54 + row * h;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"BM");
+        for v in [size, 0, 54, 40] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&(w as i32).to_le_bytes());
+        b.extend_from_slice(&(h as i32).to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        for v in [0u32, row * h, 2835, 2835, 0, 0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.resize(size as usize, 0x80);
+        b
+    }
+
+    #[test]
+    fn previews_with_the_same_path_stay_per_package() {
+        // Two packs both ship `src/weather/preview.bmp`, with different images.
+        let root = std::env::temp_dir().join(format!("vitrine-previews-{}", std::process::id()));
+        let item = |pack: &str, w: u32| {
+            let dir = root.join(pack);
+            std::fs::create_dir_all(dir.join("src/weather")).unwrap();
+            std::fs::write(dir.join("src/weather/preview.bmp"), bmp(w, 2)).unwrap();
+            GalleryItem {
+                package: format!("dev.vitrine.{pack}"),
+                pack_name: pack.into(),
+                widget: "weather".into(),
+                name: "Weather".into(),
+                description: String::new(),
+                size: (2, 2),
+                dir,
+                preview: Some("src/weather/preview.bmp".into()),
+            }
+        };
+        let gallery = vec![item("mond", 3), item("sargas", 5), item("mond2", 7)];
+        let mut m = mode_with(&[(PRIMARY, rect(0, 0, 1920, 1080), 1.0)], gallery);
+        let widths: Vec<u32> = (0..3)
+            .map(|i| {
+                let img = m.preview_image(i).expect("decoded");
+                let (mut w, mut h) = (0, 0);
+                unsafe { img.GetSize(&mut w, &mut h) }.unwrap();
+                w
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(widths, [3, 5, 7]);
     }
 
     fn packs_gallery() -> Vec<GalleryItem> {

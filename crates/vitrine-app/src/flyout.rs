@@ -959,6 +959,35 @@ fn buttons_down() -> bool {
     }
 }
 
+/// Pumps messages until the mouse buttons are up (and a little after), so a
+/// click that closed the menu is fully delivered. Returns a WM_QUIT exit code.
+fn drain_click() -> Option<i32> {
+    let start = Instant::now();
+    let mut released: Option<Instant> = None;
+    loop {
+        let mut msg = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    return Some(msg.wParam.0 as i32);
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if released.is_none() && !buttons_down() {
+            released = Some(Instant::now());
+        }
+        let settled = released.is_some_and(|t| t.elapsed() >= Duration::from_millis(120));
+        if settled || start.elapsed() >= Duration::from_secs(3) {
+            return None;
+        }
+        unsafe {
+            MsgWaitForMultipleObjects(None, false, 15, QS_ALLINPUT);
+        }
+    }
+}
+
 /// Shows a menu and returns the chosen command id. Runs a modal loop until the
 /// user picks an item, presses Esc or clicks elsewhere.
 pub fn show(
@@ -1001,6 +1030,7 @@ pub fn show(
     // A click outside closes the menu, once the button that opened it is up.
     let mut armed = !buttons_down();
     let mut quit = None;
+    let mut outside = false;
     while menu.result.is_none() {
         let mut msg = MSG::default();
         unsafe {
@@ -1028,6 +1058,7 @@ pub fn show(
             armed = true;
         } else if armed && !menu.cursor_inside() {
             menu.result = Some(None);
+            outside = true;
             break;
         }
         menu.settle_hover();
@@ -1042,6 +1073,12 @@ pub fn show(
         }
     }
     menu.close_from(0);
+    if outside && quit.is_none() {
+        // Let the click that closed the menu finish here, so its release (and
+        // the shell's notification when it landed on the tray icon) arrives
+        // while the menu is still "open" instead of reopening it.
+        quit = drain_click();
+    }
     if let Some(code) = quit {
         unsafe { PostQuitMessage(code) };
     }
