@@ -9,9 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://vitrine-widgets.github.io/">Website</a> ·
-  <a href="https://vitrine-widgets.github.io/docs/introduction/">Docs</a> ·
-  <a href="https://vitrine-widgets.github.io/it/">Italiano</a>
+  <a href="https://vitrine-org.github.io/">Website</a> ·
+  <a href="https://vitrine-org.github.io/docs/introduction/">Docs</a> ·
+  <a href="https://vitrine-org.github.io/it/">Italiano</a>
 </p>
 
 > Vitrine 2 is a ground-up rewrite of Vitrine 1 (C#/WebView2, on branch [`v1`](../../tree/v1)).
@@ -30,7 +30,7 @@ wallpaper, while staying clickable.
 - **Widgets, not themes** — each widget is a small package (`.vitrine`) with its own settings,
   permissions and size on the grid. Run as many instances as you like, on every monitor.
 - **Write widgets in JSX** — powered by SolidJS fine-grained reactivity through
-  [`@vitrine/sdk`](https://github.com/vitrine-widgets/sdk).
+  [`@vitrine/sdk`](https://github.com/vitrine-org/sdk).
 
 ## Use
 
@@ -68,8 +68,8 @@ cargo test
 | `crates/vitrine-system` | System metrics collector and power state |
 | `crates/vitrine-widgets` | Package format, safe install, layout and settings schema |
 | `installer/` | NSIS installer |
-| — | SDK: [vitrine-widgets/sdk](https://github.com/vitrine-widgets/sdk) · Widget packs: [vitrine-widgets](https://github.com/vitrine-widgets) |
-| — | Website: [vitrine-widgets.github.io](https://github.com/vitrine-widgets/vitrine-widgets.github.io) |
+| — | SDK: [vitrine-org/sdk](https://github.com/vitrine-org/sdk) · Widget packs: [vitrine-org](https://github.com/vitrine-org) |
+| — | Website: [vitrine-org.github.io](https://github.com/vitrine-org/vitrine-org.github.io) |
 | `assets/` | Icon and artwork |
 
 ## License

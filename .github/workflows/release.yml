@@ -37,7 +37,7 @@ jobs:
           Copy-Item target/release/vitrine.exe dist/vitrine/
           Copy-Item LICENSE dist/vitrine/
           # Bundle the latest Essentials pack (skipped if the repo has no release yet).
-          gh release download --repo vitrine-widgets/essentials --pattern "*.vitrine" --dir dist/vitrine/packs 2>$null
+          gh release download --repo vitrine-org/essentials --pattern "*.vitrine" --dir dist/vitrine/packs 2>$null
           if ($LASTEXITCODE -ne 0) { Write-Warning "no Essentials release found; installer ships without packs" }
           Get-ChildItem -Recurse dist/vitrine | Select-Object FullName, Length
 

@@ -91,7 +91,7 @@ Section "Vitrine" SecCore
   WriteRegStr HKCU "${UNINST_KEY}" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "${UNINST_KEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNINST_KEY}" "Publisher" "Vitrine"
-  WriteRegStr HKCU "${UNINST_KEY}" "URLInfoAbout" "https://vitrine-widgets.github.io/"
+  WriteRegStr HKCU "${UNINST_KEY}" "URLInfoAbout" "https://vitrine-org.github.io/"
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoRepair" 1
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2

@@ -818,7 +818,7 @@ pub fn run(instance: Option<String>) -> Result<(), String> {
         }
     }));
     ui.on_open_folder(|| shellapi::open(&paths::data_dir().to_string_lossy()));
-    ui.on_open_site(|| shellapi::open("https://vitrine-widgets.github.io/"));
+    ui.on_open_site(|| shellapi::open("https://vitrine-org.github.io/"));
     ui.on_edit_layout(with!(|ui, _st| {
         if !runtime::send_command(runtime::Runtime::CMD_EDIT) {
             ui.set_status(s("Vitrine is not running"));

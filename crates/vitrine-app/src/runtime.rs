@@ -888,6 +888,10 @@ impl Runtime {
             HostMsg::Timer(_) => {}
             HostMsg::TaskbarCreated => {
                 log::info!("Explorer restarted: re-attaching");
+                // The new taskbar has no notification icons yet.
+                if let Some(tray) = &mut self.tray {
+                    tray.show();
+                }
                 self.detach();
                 unsafe {
                     SetTimer(Some(self.host), TIMER_REATTACH, 1500, None);
@@ -1321,7 +1325,7 @@ impl Runtime {
 
 // ── pure helpers (menus, commands, pause) ────────────────────────────
 
-const SITE_URL: &str = "https://vitrine-widgets.github.io/";
+const SITE_URL: &str = "https://vitrine-org.github.io/";
 
 /// Pausing: the session is locked, the display is off, a full-screen app runs,
 /// or the user paused from the tray.

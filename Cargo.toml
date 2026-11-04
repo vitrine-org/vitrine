@@ -13,3 +13,8 @@ repository = "https://github.com/frascella-dev/vitrine"
 lto = true
 codegen-units = 1
 strip = true
+
+# Dependencies (QuickJS above all) are optimised in dev builds too: unoptimised
+# QuickJS is slow enough to trip the script time limit.
+[profile.dev.package."*"]
+opt-level = 2

@@ -17,7 +17,7 @@ for (const [name, bg] of [['dark', '#161616'], ['light', '#f4f4f3']]) {
   <svg x="${off}" y="${off}" width="${ICON}" height="${ICON}" viewBox="0 0 48 48">${inner}</svg>
 </svg>`;
   const png = new Resvg(svg, { fitTo: { mode: 'width', value: SIZE } }).render().asPng();
-  const file = path.join(out, `vitrine-widgets-avatar-${name}.png`);
+  const file = path.join(out, `vitrine-org-avatar-${name}.png`);
   fs.writeFileSync(file, png);
   fs.writeFileSync(file.replace(/\.png$/, '.svg'), svg);
   console.log(file, png.length);

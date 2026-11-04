@@ -303,7 +303,7 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"{
-      "id": "dev.vitrine.serbas", "name": "Serbas", "version": "2.0.0", "author": "me",
+      "id": "dev.vitrine.sargas", "name": "Sargas", "version": "2.0.0", "author": "me",
       "description": "d", "homepage": "https://x.y", "minEngine": "2.0.0",
       "fonts": ["assets/fonts/BebasNeue-Regular.ttf"],
       "widgets": [{ "id": "clock", "name": "Clock", "description": "c",
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn bad_ids_and_versions() {
-        assert!(with(|m| m.id = "serbas".into()).is_err());
+        assert!(with(|m| m.id = "sargas".into()).is_err());
         assert!(with(|m| m.id = "Dev.Vitrine".into()).is_err());
         assert!(with(|m| m.id = "con.x".into()).is_err());
         assert!(with(|m| m.id = "dev.a-b.c9".into()).is_ok());
