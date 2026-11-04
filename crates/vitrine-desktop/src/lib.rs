@@ -11,4 +11,5 @@ pub mod monitors;
 pub mod shell;
 pub mod surface;
 pub mod util;
+pub mod wallpaper;
 pub mod window;

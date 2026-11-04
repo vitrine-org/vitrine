@@ -3,6 +3,7 @@
 
 mod edit;
 mod flyout;
+mod glass;
 mod grid;
 mod headless;
 mod instance;
@@ -27,7 +28,8 @@ USAGE:
   vitrine --edit | --quit         toggle edit mode / quit the running instance
   vitrine install <file.vitrine>  install a widget package
   vitrine render <package> <widget> [--cells WxH | --size WxH] [--scale S]
-                 [--settings JSON] [--wait MS] [--network] --out <file.png>
+                 [--settings JSON] [--wait MS] [--network] [--backdrop IMAGE]
+                 --out <file.png>
   vitrine --version"
 }
 
@@ -164,6 +166,7 @@ fn parse_args(args: &[String]) -> Cmd {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(300),
                 network: args.iter().any(|a| a == "--network"),
+                backdrop: flag(args, "--backdrop").map(PathBuf::from),
             })
         }
         Some("install") => match args.get(1) {
@@ -426,6 +429,7 @@ mod tests {
                 out: PathBuf::from("widget.png"),
                 wait_ms: 300,
                 network: false,
+                backdrop: None,
             }
         );
     }
@@ -445,9 +449,12 @@ mod tests {
             "--wait",
             "50",
             "--network",
+            "--backdrop",
+            "wall.jpg",
             "--out",
             "o.png",
         ]);
+        assert_eq!(r.backdrop, Some(PathBuf::from("wall.jpg")));
         assert_eq!(r.package, PathBuf::from("pkg"));
         assert_eq!(r.widget, "clock");
         assert_eq!(r.size, headless::cells_to_dips(3, 2));

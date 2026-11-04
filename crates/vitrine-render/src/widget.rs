@@ -3,12 +3,13 @@
 use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 use windows::core::Result;
 
+use crate::backdrop::BackdropView;
 use crate::gpu::Gpu;
 use crate::image::{Assets, ImageCache};
 use crate::layout::{Laid, Measurer, TextRun, layout};
 use crate::paint::Painter;
 use crate::scene::{NodeId, Op, Scene};
-use crate::style::Transform2D;
+use crate::style::{BackdropFilter, Transform2D};
 use crate::text::TextEngine;
 
 struct Measure<'a> {
@@ -37,7 +38,27 @@ pub struct WidgetRenderer {
     images: ImageCache,
     assets: Box<dyn Assets>,
     laid: Option<Laid>,
+    /// Animation time of the last layout.
+    laid_at: f64,
     size: (f32, f32),
+    /// Distinct `backdropFilter`s in the last layout.
+    backdrops: Vec<BackdropFilter>,
+}
+
+fn collect_backdrops(n: &Laid, out: &mut Vec<BackdropFilter>) {
+    if n.paint.opacity <= 0.0 {
+        return;
+    }
+    if let Some(f) = n.paint.backdrop
+        && n.rect.w > 0.0
+        && n.rect.h > 0.0
+        && !out.contains(&f)
+    {
+        out.push(f);
+    }
+    for c in &n.children {
+        collect_backdrops(c, out);
+    }
 }
 
 impl WidgetRenderer {
@@ -52,7 +73,9 @@ impl WidgetRenderer {
             images: ImageCache::new(gpu.wic.clone()),
             assets,
             laid: None,
+            laid_at: f64::NAN,
             size: (0.0, 0.0),
+            backdrops: Vec::new(),
         }
     }
 
@@ -82,13 +105,17 @@ impl WidgetRenderer {
 
     fn update_layout(&mut self, now: f64) {
         let animating = self.scene.animating(now);
-        if self.scene.layout_dirty || self.laid.is_none() || animating {
+        if self.scene.layout_dirty || self.laid.is_none() || (animating && self.laid_at != now) {
             let mut m = Measure {
                 text: &mut self.text,
                 images: &mut self.images,
                 assets: self.assets.as_ref(),
             };
-            self.laid = Some(layout(&self.scene, self.size.0, self.size.1, &mut m, now));
+            let laid = layout(&self.scene, self.size.0, self.size.1, &mut m, now);
+            self.backdrops.clear();
+            collect_backdrops(&laid, &mut self.backdrops);
+            self.laid = Some(laid);
+            self.laid_at = now;
             self.scene.layout_dirty = false;
         }
         if !animating {
@@ -96,13 +123,32 @@ impl WidgetRenderer {
         }
     }
 
+    /// Lays out (if needed) and returns the backdrop filters the next frame
+    /// paints, so their bitmaps can be prepared outside the frame.
+    pub fn prepare(&mut self, now: f64) -> &[BackdropFilter] {
+        self.update_layout(now);
+        &self.backdrops
+    }
+
+    /// Whether the last layout has a node with `backdropFilter` (its pixels then
+    /// depend on where the widget sits on screen).
+    pub fn uses_backdrop(&self) -> bool {
+        !self.backdrops.is_empty()
+    }
+
+    pub fn backdrop_filters(&self) -> &[BackdropFilter] {
+        &self.backdrops
+    }
+
     /// Lays out (if needed) and paints the widget with `base` mapping DIPs to pixels.
+    /// `backdrop` provides the wallpaper behind glass boxes (none: they stay clear).
     pub fn paint(
         &mut self,
         gpu: &Gpu,
         dc: &ID2D1DeviceContext,
         base: Transform2D,
         now: f64,
+        backdrop: Option<&BackdropView>,
     ) -> Result<()> {
         self.update_layout(now);
         self.scene.paint_dirty = false;
@@ -115,6 +161,7 @@ impl WidgetRenderer {
             text: &mut self.text,
             images: &mut self.images,
             assets: self.assets.as_ref(),
+            backdrop,
         };
         painter.paint(laid, base)
     }

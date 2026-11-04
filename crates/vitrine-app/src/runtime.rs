@@ -19,6 +19,7 @@ use vitrine_desktop::input::{
 use vitrine_desktop::monitors::{self, Monitor};
 use vitrine_desktop::shell::{self, DesktopLayer};
 use vitrine_desktop::window;
+use vitrine_render::backdrop::BackdropCache;
 use vitrine_render::compose::WindowVisual;
 use vitrine_render::gpu::Gpu;
 use vitrine_render::scene::NodeId;
@@ -58,6 +59,9 @@ const TIMER_REATTACH: usize = 1;
 const TIMER_POWER: usize = 2;
 const TIMER_RELAYOUT: usize = 3;
 const TIMER_DEV: usize = 4;
+/// Slideshow/Spotlight check while some widget shows glass.
+const TIMER_WALLPAPER: usize = 5;
+const WALLPAPER_POLL_MS: u32 = 60_000;
 
 /// `vitrine --dev <dir>`: an unpacked package loaded on top of the installed
 /// ones and restarted whenever its files change.
@@ -97,6 +101,8 @@ pub enum HostMsg {
     SessionLocked(bool),
     DisplayOn(bool),
     AppearanceChanged,
+    /// The desktop wallpaper changed (behind `backdropFilter` glass).
+    WallpaperChanged,
     Edit(crate::edit::Input),
 }
 
@@ -166,6 +172,10 @@ fn apply_rect(layer: Option<&DesktopLayer>, live: &mut Live, r: RECT) {
     if r == live.screen {
         return;
     }
+    if live.inst.renderer.uses_backdrop() {
+        // Glass shows the wallpaper behind the window, which moved.
+        live.force_paint = true;
+    }
     let (ow, oh) = rect_size(&live.screen);
     let (nw, nh) = rect_size(&r);
     if (ow, oh) != (nw, nh) {
@@ -209,6 +219,11 @@ pub struct Runtime {
     dying: Vec<(Live, Instant)>,
     quit: bool,
     dev_stamp: Option<std::time::SystemTime>,
+    /// Blurred wallpapers for `backdropFilter`, shared by all widgets.
+    backdrops: BackdropCache,
+    wallpaper_timer: bool,
+    /// Widget count at the last backdrop sweep.
+    swept_count: usize,
 }
 
 fn storage_path(instance: &str) -> PathBuf {
@@ -277,6 +292,9 @@ impl Runtime {
             dying: Vec::new(),
             quit: false,
             dev_stamp: DEV_DIR.get().and_then(|d| tree_stamp(d)),
+            backdrops: BackdropCache::new(),
+            wallpaper_timer: false,
+            swept_count: 0,
         })
     }
 
@@ -759,6 +777,8 @@ impl Runtime {
             timeout = timeout.min(30);
         }
         let mut settled = false;
+        let mut painted = false;
+        let mut device_lost = false;
         for live in &mut self.widgets {
             let Some(a) = &live.anim else { continue };
             let t = (a.start.elapsed().as_secs_f32() / a.secs).min(1.0);
@@ -843,12 +863,44 @@ impl Runtime {
                 let (pw, ph) = rect_size(&live.screen);
                 let scale = live.scale;
                 let gpu = &self.gpu;
+                // Glass: prepare the blurred wallpaper of the monitor under the widget.
+                let filters = live.inst.renderer.prepare(now).to_vec();
+                let glass = if filters.is_empty() {
+                    None
+                } else {
+                    if self.backdrops.store.is_stale() {
+                        self.backdrops
+                            .store
+                            .set_sources(crate::glass::sources(&self.monitors));
+                    }
+                    crate::glass::monitor_at(&self.monitors, &live.screen).map(|m| {
+                        self.backdrops
+                            .ensure(&self.dc, &gpu.wic, &m.device, &filters);
+                        let offset = (
+                            (live.screen.left - m.rect.left) as f32,
+                            (live.screen.top - m.rect.top) as f32,
+                        );
+                        (m.device.clone(), offset)
+                    })
+                };
+                let backdrops = &self.backdrops;
                 let renderer = &mut live.inst.renderer;
                 let result = visual.draw(gpu, &self.dc, pw, ph, |dc, origin| {
-                    renderer.paint(gpu, dc, Transform2D::scale(scale, scale).then(origin), now)
+                    let view = glass.as_ref().map(|(monitor, (ox, oy))| {
+                        backdrops.view(monitor, Transform2D::translate(-ox, -oy).then(origin))
+                    });
+                    renderer.paint(
+                        gpu,
+                        dc,
+                        Transform2D::scale(scale, scale).then(origin),
+                        now,
+                        view.as_ref(),
+                    )
                 });
+                painted = true;
                 if let Err(e) = result {
                     log::error!("paint {}: {e}", live.entry.id);
+                    device_lost |= is_device_lost(&e);
                 } else if live.appear {
                     live.appear = false;
                     let _ = visual.animate_opacity(gpu, 0.0, 1.0, 0.28);
@@ -866,6 +918,13 @@ impl Runtime {
         }
         if plan_changed {
             self.update_plan();
+        }
+        if device_lost {
+            self.recover_device();
+            return 0;
+        }
+        if painted || self.widgets.len() != self.swept_count {
+            self.sweep_backdrops();
         }
         if self.edit.is_some() {
             let items = self.edit_items();
@@ -898,6 +957,13 @@ impl Runtime {
                     let _ = KillTimer(Some(self.host), TIMER_RELAYOUT);
                 }
                 self.relayout();
+                // Monitor sizes, positions or DPI may have changed.
+                self.refresh_wallpapers(true);
+            }
+            HostMsg::Timer(TIMER_WALLPAPER) => {
+                if !self.paused() {
+                    self.refresh_wallpapers(false);
+                }
             }
             HostMsg::Timer(TIMER_POWER) => self.check_power(),
             HostMsg::Timer(TIMER_DEV) => {
@@ -932,6 +998,7 @@ impl Runtime {
                 self.apply_pause();
             }
             HostMsg::Edit(input) => self.edit_input(input),
+            HostMsg::WallpaperChanged => self.refresh_wallpapers(true),
             HostMsg::AppearanceChanged => {
                 shellapi::set_menu_theme(vitrine_script::appearance::is_dark());
                 let json = vitrine_script::appearance::appearance_json();
@@ -940,6 +1007,103 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    // ── frosted glass ─────────────────────────────────────────────────
+
+    /// Re-reads the wallpapers; widgets showing glass repaint if they changed.
+    /// Without glass in use this only marks the sources stale (read on demand).
+    /// `always` rebuilds even when the sources look unchanged (Explorer may
+    /// rewrite the image in place within the same second).
+    fn refresh_wallpapers(&mut self, always: bool) {
+        if self.backdrops.store.is_empty() {
+            self.backdrops.store.invalidate();
+            return;
+        }
+        let mut changed = self
+            .backdrops
+            .store
+            .set_sources(crate::glass::sources(&self.monitors));
+        if always && !changed {
+            self.backdrops.store.clear();
+            changed = true;
+        }
+        if changed {
+            log::debug!("wallpaper changed: repainting glass");
+            for live in &mut self.widgets {
+                if live.inst.renderer.uses_backdrop() {
+                    live.force_paint = true;
+                }
+            }
+        }
+    }
+
+    /// Frees the blurred wallpapers no widget uses any more, and runs the
+    /// slideshow check only while some are in use.
+    fn sweep_backdrops(&mut self) {
+        self.swept_count = self.widgets.len();
+        let monitors = &self.monitors;
+        let used: Vec<(&str, &vitrine_render::style::BackdropFilter)> = self
+            .widgets
+            .iter()
+            .filter(|l| l.window.is_some())
+            .flat_map(|l| {
+                let m = crate::glass::monitor_at(monitors, &l.screen);
+                l.inst
+                    .renderer
+                    .backdrop_filters()
+                    .iter()
+                    .filter_map(move |f| m.map(|m| (m.device.as_str(), f)))
+            })
+            .collect();
+        self.backdrops.store.retain_used(used);
+        let want = !self.backdrops.store.is_empty();
+        if want != self.wallpaper_timer {
+            self.wallpaper_timer = want;
+            unsafe {
+                if want {
+                    SetTimer(Some(self.host), TIMER_WALLPAPER, WALLPAPER_POLL_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.host), TIMER_WALLPAPER);
+                }
+            }
+            log::debug!(
+                "glass: {} bitmaps, {} KB",
+                self.backdrops.store.len(),
+                self.backdrops.bytes() / 1024
+            );
+        }
+    }
+
+    /// The GPU was reset or removed: rebuild the devices and every surface.
+    fn recover_device(&mut self) {
+        log::warn!("graphics device lost: recreating");
+        let (gpu, dc) = match Gpu::new(true).and_then(|g| g.new_context().map(|dc| (g, dc))) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("graphics: {e}; retrying");
+                unsafe {
+                    SetTimer(Some(self.host), TIMER_RELAYOUT, 1000, None);
+                }
+                return;
+            }
+        };
+        self.edit = None;
+        self.edit_closing = None;
+        if let Some(peek) = self.peek.take() {
+            peek.restore();
+        }
+        for live in &mut self.widgets {
+            Self::destroy_window(live);
+        }
+        for (live, _) in &mut self.dying {
+            Self::destroy_window(live);
+        }
+        self.dying.clear();
+        self.backdrops.store.clear();
+        self.gpu = gpu;
+        self.dc = dc;
+        self.relayout();
     }
 
     fn apply_pause(&self) {
@@ -1353,6 +1517,12 @@ impl Runtime {
 
 const SITE_URL: &str = "https://vitrine-org.github.io/";
 
+/// Errors after which the graphics devices must be recreated.
+fn is_device_lost(e: &windows::core::Error) -> bool {
+    // D2DERR_RECREATE_TARGET, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET
+    matches!(e.code().0 as u32, 0x8899_000C | 0x887A_0005 | 0x887A_0007)
+}
+
 /// Pausing: the session is locked, the display is off, a full-screen app runs,
 /// or the user paused from the tray.
 fn is_paused(locked: bool, display_off: bool, fullscreen: bool, user_paused: bool) -> bool {
@@ -1611,6 +1781,8 @@ unsafe extern "system" fn host_proc(
         WM_SETTINGCHANGE => {
             if wparam.0 as u32 == SPI_SETWORKAREA.0 {
                 push(HostMsg::DisplayChanged);
+            } else if wparam.0 as u32 == SPI_SETDESKWALLPAPER.0 {
+                push(HostMsg::WallpaperChanged);
             } else if lparam.0 != 0 {
                 let area =
                     unsafe { PCWSTR(lparam.0 as *const u16).to_string() }.unwrap_or_default();
@@ -2209,7 +2381,21 @@ mod tests {
             one(WM_SETTINGCHANGE, SPI_SETWORKAREA.0 as usize, 0),
             HostMsg::DisplayChanged
         ));
+        assert!(matches!(
+            one(WM_SETTINGCHANGE, SPI_SETDESKWALLPAPER.0 as usize, 0),
+            HostMsg::WallpaperChanged
+        ));
         assert!(host(WM_APP_WAKE, 0, 0).1.is_empty());
+    }
+
+    #[test]
+    fn device_loss_codes() {
+        use windows::core::{Error, HRESULT};
+        let e = |c: u32| Error::from_hresult(HRESULT(c as i32));
+        assert!(is_device_lost(&e(0x8899_000C)));
+        assert!(is_device_lost(&e(0x887A_0005)));
+        assert!(is_device_lost(&e(0x887A_0007)));
+        assert!(!is_device_lost(&e(0x8000_4005)));
     }
 
     #[test]

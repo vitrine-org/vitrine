@@ -199,7 +199,7 @@ fn renders_sample_widget() {
     w.set_size(width, height);
     let (pw, ph) = ((width * scale) as u32, (height * scale) as u32);
     let rgba = render_offscreen(&dc, pw, ph, |dc| {
-        w.paint(&gpu, dc, Transform2D::scale(scale, scale), 0.0)
+        w.paint(&gpu, dc, Transform2D::scale(scale, scale), 0.0, None)
     })
     .unwrap();
 
@@ -222,4 +222,133 @@ fn renders_sample_widget() {
     // The layout tree exists and the svg is 48 DIPs wide.
     let laid = w.layout_tree().unwrap();
     assert_eq!(laid.children[0].children[2].children[0].rect.w, 48.0);
+}
+
+#[test]
+fn renders_backdrop_glass() {
+    use vitrine_render::backdrop::{
+        BackdropCache, MonitorSource, Position, WallpaperImage, default_backdrop,
+    };
+    use vitrine_render::color::Color;
+    use vitrine_render::layout::RectF;
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_MULTITHREADED,
+        );
+    }
+    let gpu = Gpu::new(false).expect("gpu");
+    let dc = gpu.new_context().unwrap();
+    let mut w = WidgetRenderer::new(&gpu, Box::new(DirAssets(".".into())), &[]);
+    let mut b = B {
+        ops: vec![],
+        next: 0,
+    };
+    let root = b.el(
+        ROOT,
+        "view",
+        &[(
+            "style",
+            style(&[
+                ("width", "100%".into()),
+                ("height", "100%".into()),
+                ("padding", 16.0.into()),
+                ("gap", 16.0.into()),
+                ("flexDirection", "row".into()),
+            ]),
+        )],
+    );
+    for extra in [None, Some(("transform", "rotate(8)"))] {
+        let mut s = vec![
+            ("flexGrow", 1.0.into()),
+            ("borderRadius", 20.0.into()),
+            ("backdropFilter", "blur(12px) saturate(1.6)".into()),
+            ("background", "rgba(255,255,255,0.10)".into()),
+            ("border", "1px solid rgba(255,255,255,0.25)".into()),
+        ];
+        if let Some((k, v)) = extra {
+            s.push((k, v.into()));
+            s.push(("opacity", 0.85.into()));
+        }
+        let card = b.el(root, "view", &[("style", style(&s))]);
+        let t = b.el(
+            card,
+            "text",
+            &[(
+                "style",
+                style(&[
+                    ("color", "#fff".into()),
+                    ("fontSize", 18.0.into()),
+                    ("margin", 16.0.into()),
+                ]),
+            )],
+        );
+        b.text(t, "Glass");
+    }
+    w.apply(b.ops, 0.0);
+    let (width, height, scale) = (320.0f32, 160.0f32, 1.5f32);
+    w.set_size(width, height);
+    let (pw, ph) = ((width * scale) as u32, (height * scale) as u32);
+    let filters = w.prepare(0.0).to_vec();
+    assert_eq!(filters.len(), 1, "both cards share one filter");
+
+    let mut cache = BackdropCache::new();
+    let area = RectF {
+        x: 0.0,
+        y: 0.0,
+        w: pw as f32,
+        h: ph as f32,
+    };
+    cache.store.set_sources(vec![MonitorSource {
+        monitor: "preview".into(),
+        rect: area,
+        desktop: area,
+        scale,
+        image: WallpaperImage::Pixels(default_backdrop()),
+        position: Position::Fill,
+        background: Color::rgba(0.1, 0.1, 0.1, 1.0),
+    }]);
+    cache.ensure(&dc, &gpu.wic, "preview", &filters);
+    assert_eq!(cache.store.len(), 1);
+    assert!(cache.bytes() > 0 && cache.bytes() <= 3 << 20);
+
+    let view = cache.view("preview", Transform2D::IDENTITY);
+    let rgba = render_offscreen(&dc, pw, ph, |dc| {
+        w.paint(&gpu, dc, Transform2D::scale(scale, scale), 0.0, Some(&view))
+    })
+    .unwrap();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/render-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_png(&dir.join("backdrop-glass.png"), pw, ph, &rgba).unwrap();
+    let px = |x: u32, y: u32| rgba[((y * pw + x) * 4) as usize..][..4].to_vec();
+    assert_eq!(px(2, 2)[3], 0, "outside the cards stays transparent");
+    let inside = px(pw / 4, ph / 2);
+    assert_eq!(inside[3], 255, "the glass is opaque: {inside:?}");
+    // Corners follow the border radius.
+    assert_eq!(
+        px((16.0 * scale) as u32 + 1, (16.0 * scale) as u32 + 1)[3],
+        0
+    );
+
+    // Without a backdrop only the translucent fill remains.
+    let plain = render_offscreen(&dc, pw, ph, |dc| {
+        w.paint(&gpu, dc, Transform2D::scale(scale, scale), 0.0, None)
+    })
+    .unwrap();
+    assert!(plain[((ph / 2 * pw + pw / 4) * 4 + 3) as usize] < 60);
+
+    // The crop follows the widget's position on the monitor.
+    let moved = cache.view("preview", Transform2D::translate(-120.0, -60.0));
+    let shifted = render_offscreen(&dc, pw, ph, |dc| {
+        w.paint(
+            &gpu,
+            dc,
+            Transform2D::scale(scale, scale),
+            0.0,
+            Some(&moved),
+        )
+    })
+    .unwrap();
+    let i = ((ph / 2 * pw + pw / 4) * 4) as usize;
+    assert_ne!(shifted[i..i + 3], rgba[i..i + 3]);
 }

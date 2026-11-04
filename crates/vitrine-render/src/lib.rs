@@ -9,6 +9,7 @@ pub mod scene;
 pub mod style;
 pub mod value;
 
+pub mod backdrop;
 pub mod compose;
 pub mod gpu;
 pub mod image;

@@ -8,11 +8,12 @@ use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_RANGE, IDWriteTextLayout
 use windows::core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
+use crate::backdrop::BackdropView;
 use crate::color::Color;
 use crate::image::{Assets, ImageCache};
 use crate::layout::{Content, Fit, Geom, Laid, LineCap, LineJoin, RectF, Shape, Svg, TextRun};
 use crate::path::{PathCmd, parse_path};
-use crate::style::{BoxPaint, Fill, Transform2D};
+use crate::style::{BackdropFilter, BoxPaint, Fill, Transform2D};
 use crate::text::TextEngine;
 
 fn d2d_color(c: Color) -> D2D1_COLOR_F {
@@ -56,6 +57,8 @@ pub struct Painter<'a> {
     pub text: &'a mut TextEngine,
     pub images: &'a mut ImageCache,
     pub assets: &'a dyn Assets,
+    /// The blurred wallpaper behind the widget, for `backdropFilter`.
+    pub backdrop: Option<&'a BackdropView<'a>>,
 }
 
 impl Painter<'_> {
@@ -216,13 +219,18 @@ impl Painter<'_> {
         if let Some(shadow) = &p.shadow {
             self.shadow(n.rect, p.radius, shadow)?;
         }
-        let needs_geo =
-            p.background.is_some() || (p.border_width > 0.0 && p.border_color.is_some()) || p.clip;
+        let needs_geo = p.background.is_some()
+            || (p.border_width > 0.0 && p.border_color.is_some())
+            || p.clip
+            || p.backdrop.is_some();
         let geo = if needs_geo && n.rect.w > 0.0 && n.rect.h > 0.0 {
             Some(self.box_geometry(n.rect, p.radius)?)
         } else {
             None
         };
+        if let (Some(f), Some(g)) = (&p.backdrop, &geo) {
+            self.backdrop(g, f, t)?;
+        }
         if let (Some(bg), Some(g)) = (&p.background, &geo) {
             let brush = self.fill_brush(bg, n.rect, 1.0)?;
             unsafe { self.dc.FillGeometry(g, &brush, None) };
@@ -263,6 +271,34 @@ impl Painter<'_> {
         }
         if layered {
             unsafe { self.dc.PopLayer() };
+        }
+        Ok(())
+    }
+
+    /// Frosted glass: fills the box with the blurred wallpaper that lies behind
+    /// it on screen, whatever the node's own transform (`t`).
+    fn backdrop(&self, g: &ID2D1Geometry, f: &BackdropFilter, t: Transform2D) -> Result<()> {
+        let Some((bitmap, to_target)) = self.backdrop.and_then(|v| v.lookup(f)) else {
+            return Ok(());
+        };
+        let Some(inv) = t.invert() else {
+            return Ok(());
+        };
+        unsafe {
+            let brush = self.dc.CreateBitmapBrush(
+                bitmap,
+                Some(&D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                    extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                    extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                    interpolationMode: D2D1_INTERPOLATION_MODE_LINEAR,
+                }),
+                Some(&D2D1_BRUSH_PROPERTIES {
+                    opacity: 1.0,
+                    // Brush pixels → target pixels → the node's coordinates.
+                    transform: matrix(to_target.then(inv)),
+                }),
+            )?;
+            self.dc.FillGeometry(g, &brush, None);
         }
         Ok(())
     }

@@ -4,12 +4,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use vitrine_render::backdrop::BackdropCache;
 use vitrine_render::compose::{render_offscreen, write_png};
 use vitrine_render::gpu::Gpu;
 use vitrine_render::style::Transform2D;
 use vitrine_system::{Metric, Sampler};
 use vitrine_widgets::package::{self, InstalledPackage};
 
+use crate::glass::{self, Backdrop};
 use crate::instance::{Effect, WidgetInstance};
 
 #[derive(Debug, PartialEq)]
@@ -22,6 +24,8 @@ pub struct RenderArgs {
     pub out: PathBuf,
     pub wait_ms: u64,
     pub network: bool,
+    /// Image behind `backdropFilter` glass (default: a soft gradient).
+    pub backdrop: Option<PathBuf>,
 }
 
 pub const CELL: f32 = 64.0;
@@ -45,6 +49,7 @@ pub fn open_package(path: &Path) -> Result<InstalledPackage, String> {
 
 /// Runs a widget off-screen for `wait_ms` and returns `(width, height, rgba)`.
 /// `settings` overrides the schema defaults. Needs COM on the calling thread.
+#[allow(clippy::too_many_arguments)]
 pub fn render_rgba(
     pkg: &InstalledPackage,
     widget_id: &str,
@@ -53,6 +58,7 @@ pub fn render_rgba(
     settings: Option<&str>,
     wait_ms: u64,
     network: bool,
+    backdrop: &Backdrop,
 ) -> Result<(u32, u32, Vec<u8>), String> {
     let widget = pkg
         .widget(widget_id)
@@ -146,9 +152,18 @@ pub fn render_rgba(
         (size.1 * scale).round() as u32,
     );
     let now = inst.now() + 10_000.0; // settle running transitions
+    let filters = inst.renderer.prepare(now).to_vec();
+    let mut glass_cache = BackdropCache::new();
+    if !filters.is_empty() {
+        glass_cache
+            .store
+            .set_sources(vec![glass::preview_source(backdrop, pw, ph, scale)]);
+        glass_cache.ensure(&dc, &gpu.wic, glass::PREVIEW, &filters);
+    }
+    let view = glass_cache.view(glass::PREVIEW, Transform2D::IDENTITY);
     let rgba = render_offscreen(&dc, pw, ph, |dc| {
         inst.renderer
-            .paint(&gpu, dc, Transform2D::scale(scale, scale), now)
+            .paint(&gpu, dc, Transform2D::scale(scale, scale), now, Some(&view))
     })
     .map_err(|e| e.to_string())?;
     Ok((pw, ph, rgba))
@@ -161,6 +176,11 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
             windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
         );
     }
+    if let Some(p) = &args.backdrop
+        && !p.is_file()
+    {
+        return Err(format!("backdrop image not found: {}", p.display()));
+    }
     let pkg = open_package(&args.package)?;
     let (pw, ph, rgba) = render_rgba(
         &pkg,
@@ -170,6 +190,10 @@ pub fn run(args: RenderArgs) -> Result<(), String> {
         args.settings.as_deref(),
         args.wait_ms,
         args.network,
+        &match &args.backdrop {
+            Some(p) => Backdrop::Image(p.clone()),
+            None => Backdrop::Default,
+        },
     )?;
     write_png(&args.out, pw, ph, &rgba).map_err(|e| e.to_string())?;
     println!(

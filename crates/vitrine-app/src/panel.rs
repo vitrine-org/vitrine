@@ -172,6 +172,7 @@ fn request_preview(
                 settings.as_deref(),
                 700,
                 true,
+                &crate::glass::Backdrop::Wallpaper,
             );
             if latest.load(Ordering::SeqCst) != generation {
                 return;

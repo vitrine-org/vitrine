@@ -439,6 +439,23 @@ impl Transform2D {
         (a * x + c * y + e, b * x + d * y + f)
     }
 
+    /// The inverse transform, if the matrix is invertible.
+    pub fn invert(&self) -> Option<Self> {
+        let [a, b, c, d, e, f] = self.0;
+        let det = a * d - b * c;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        Some(Self([
+            d / det,
+            -b / det,
+            -c / det,
+            a / det,
+            (c * f - d * e) / det,
+            (b * e - a * f) / det,
+        ]))
+    }
+
     pub fn is_identity(&self) -> bool {
         *self == Self::IDENTITY
     }
@@ -500,6 +517,8 @@ pub struct BoxPaint {
     pub clip: bool,
     pub transform: Option<Transform2D>,
     pub shadow: Option<Shadow>,
+    /// Frosted glass: the blurred wallpaper drawn behind the background.
+    pub backdrop: Option<BackdropFilter>,
 }
 
 impl Default for BoxPaint {
@@ -513,6 +532,7 @@ impl Default for BoxPaint {
             clip: false,
             transform: None,
             shadow: None,
+            backdrop: None,
         }
     }
 }
@@ -712,7 +732,66 @@ pub fn box_paint(src: &dyn StyleSource, current_color: Color) -> BoxPaint {
     p.shadow = src
         .string("boxShadow")
         .and_then(|s| parse_shadow(&s, current_color));
+    p.backdrop = src
+        .string("backdropFilter")
+        .and_then(|s| parse_backdrop_filter(&s));
     p
+}
+
+/// `backdropFilter` (not inherited): the wallpaper behind the box, blurred and
+/// saturated like CSS `backdrop-filter`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackdropFilter {
+    /// Gaussian standard deviation in DIPs (the CSS `blur()` radius).
+    pub blur: f32,
+    /// Saturation factor; 1 leaves colours unchanged.
+    pub saturate: f32,
+}
+
+/// Parses `"blur(16px) saturate(1.6)"`, either function alone (in any order,
+/// `saturate` also as a percentage) or `"none"`. Repeated functions compose as
+/// in CSS; unsupported functions are ignored. A filter that changes nothing, or
+/// malformed input, yields `None`.
+pub fn parse_backdrop_filter(s: &str) -> Option<BackdropFilter> {
+    let mut f = BackdropFilter {
+        blur: 0.0,
+        saturate: 1.0,
+    };
+    let mut rest = s.trim();
+    if rest.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    while !rest.is_empty() {
+        let open = rest.find('(')?;
+        let close = open + rest[open..].find(')')?;
+        let name = rest[..open].trim().to_ascii_lowercase();
+        let arg = rest[open + 1..close].trim();
+        match name.as_str() {
+            "blur" => {
+                let b = if arg.is_empty() {
+                    0.0
+                } else {
+                    crate::value::parse_length_px(arg)? as f32
+                };
+                // Two Gaussians in a row are one with the variances added.
+                f.blur = (f.blur * f.blur + b.max(0.0).powi(2)).sqrt();
+            }
+            "saturate" => {
+                let v = if arg.is_empty() {
+                    1.0
+                } else if let Some(p) = arg.strip_suffix('%') {
+                    p.trim().parse::<f32>().ok()? / 100.0
+                } else {
+                    arg.parse::<f32>().ok()?
+                };
+                f.saturate *= v.max(0.0);
+            }
+            "" => return None,
+            _ => {}
+        }
+        rest = rest[close + 1..].trim_start();
+    }
+    (f.blur > 0.0 || (f.saturate - 1.0).abs() > 1e-3).then_some(f)
 }
 
 // ───────────────────────────── text ─────────────────────────────
@@ -950,6 +1029,60 @@ mod tests {
         }
         let s = parse_shadow("0 4px 12px rgba(0,0,0,0.3)", Color::WHITE).unwrap();
         assert_eq!((s.dy, s.blur), (4.0, 12.0));
+    }
+
+    #[test]
+    fn backdrop_filters() {
+        let f = |s: &str| parse_backdrop_filter(s).map(|f| (f.blur, f.saturate));
+        assert_eq!(f("blur(16px) saturate(1.6)"), Some((16.0, 1.6)));
+        assert_eq!(f("saturate(1.6) blur(16px)"), Some((16.0, 1.6)));
+        assert_eq!(f("  blur( 24 )  "), Some((24.0, 1.0)));
+        assert_eq!(f("saturate(180%)"), Some((0.0, 1.8)));
+        assert_eq!(f("BLUR(8px)"), Some((8.0, 1.0)));
+        // Repeated functions compose: Gaussians add variances, saturations multiply.
+        assert_eq!(
+            f("blur(3px) blur(4px) saturate(2) saturate(0.5)"),
+            Some((5.0, 1.0))
+        );
+        // Unsupported functions are skipped.
+        assert_eq!(f("brightness(1.2) blur(10px)"), Some((10.0, 1.0)));
+        // Nothing to do, or malformed.
+        for s in [
+            "none",
+            "NONE",
+            "",
+            "blur(0)",
+            "saturate(1)",
+            "saturate(100%)",
+            "blur()",
+            "brightness(1.2)",
+            "blur(16px",
+            "blur(abc)",
+            "saturate(x)",
+            "16px",
+            "(4px)",
+        ] {
+            assert_eq!(f(s), None, "{s:?}");
+        }
+        // Negative values clamp to zero (a fully desaturated, unblurred glass).
+        assert_eq!(f("blur(-4px) saturate(-1)"), Some((0.0, 0.0)));
+        // Not inherited: only the node that declares it gets a backdrop.
+        let p = box_paint(
+            &Map(vec![("backdropFilter", "blur(12px)".into())]),
+            Color::WHITE,
+        );
+        assert_eq!(p.backdrop.map(|b| b.blur), Some(12.0));
+        assert_eq!(box_paint(&Map(vec![]), Color::WHITE).backdrop, None);
+    }
+
+    #[test]
+    fn transform_inverse() {
+        let t = parse_transform("translate(10px, 5px) rotate(30) scale(2)");
+        let inv = t.invert().unwrap();
+        let (x, y) = t.apply(3.0, -7.0);
+        let (bx, by) = inv.apply(x, y);
+        assert!((bx - 3.0).abs() < 1e-4 && (by + 7.0).abs() < 1e-4);
+        assert!(Transform2D::scale(0.0, 1.0).invert().is_none());
     }
 
     #[test]
