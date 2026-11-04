@@ -129,6 +129,11 @@ pub struct WidgetManifest {
     pub preview: Option<String>,
     #[serde(default)]
     pub size: SizeSpec,
+    /// Sizes (cells) the gallery offers, one per layout the widget has;
+    /// each within `size.min`..`size.max`. Empty: one per shape among
+    /// default, min and max.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<[u32; 2]>,
     #[serde(default)]
     pub interactive: bool,
     #[serde(default)]
@@ -473,6 +478,20 @@ impl WidgetManifest {
                 ));
             }
         }
+        for (k, v) in self.variants.iter().enumerate() {
+            if !(0..2).all(|i| s.min[i] <= v[i] && v[i] <= s.max[i]) {
+                return err(format!(
+                    "widget `{id}`: variant {}×{} is outside size.min..size.max",
+                    v[0], v[1]
+                ));
+            }
+            if self.variants[..k].contains(v) {
+                return err(format!(
+                    "widget `{id}`: duplicate variant {}×{}",
+                    v[0], v[1]
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -632,6 +651,11 @@ mod tests {
         assert!(with(|m| m.icon = Some("assets/Icon.SVG".into())).is_ok());
         assert!(with(|m| m.icon = Some("../icon.png".into())).is_err());
         assert!(with(|m| m.icon = Some("icon.ico".into())).is_err());
+        // Variants stay within min..max (2×2..8×6) and don't repeat.
+        assert!(with(|m| m.widgets[0].variants = vec![[2, 2], [8, 6]]).is_ok());
+        assert!(with(|m| m.widgets[0].variants = vec![[1, 2]]).is_err());
+        assert!(with(|m| m.widgets[0].variants = vec![[9, 2]]).is_err());
+        assert!(with(|m| m.widgets[0].variants = vec![[4, 2], [4, 2]]).is_err());
         assert!(is_safe_relative_path("widgets/clock/index.js"));
     }
 

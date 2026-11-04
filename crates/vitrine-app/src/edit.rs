@@ -68,6 +68,8 @@ pub struct GalleryItem {
     pub size: (i32, i32),
     pub min: (i32, i32),
     pub max: (i32, i32),
+    /// The pack's own gallery sizes (`variants`), if any.
+    pub variants: Vec<(i32, i32)>,
     /// Starred in the control panel.
     pub favourite: bool,
     pub dir: std::path::PathBuf,
@@ -2944,6 +2946,7 @@ mod tests {
                 size: (2, 2),
                 min: (2, 2),
                 max: (4, 2),
+                variants: Vec::new(),
                 favourite: false,
                 dir: std::path::PathBuf::new(),
                 preview: None,
@@ -3795,6 +3798,7 @@ mod tests {
                 size: (2, 2),
                 min: (2, 2),
                 max: (2, 2),
+                variants: Vec::new(),
                 favourite: false,
                 dir,
                 preview: Some("src/weather/preview.bmp".into()),
@@ -3829,6 +3833,8 @@ mod tests {
             size: (2, 2),
             min: (2, 1),
             max: (4, 2),
+            // Three layouts, so the keyboard and preview tests walk several sizes.
+            variants: vec![(2, 1), (2, 2), (4, 2)],
             favourite,
             dir: std::path::PathBuf::new(),
             preview: None,

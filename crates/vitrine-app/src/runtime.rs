@@ -407,8 +407,20 @@ impl Runtime {
         let Some(pkg) = self.package("dev.vitrine.essentials").cloned() else {
             return;
         };
+        // Essentials 3 is the Conky column; older bundles had a clock and a
+        // system monitor. Otherwise whatever the pack starts with.
+        let mut seeds: Vec<&str> = ["conky", "clock", "system"]
+            .into_iter()
+            .filter(|id| pkg.widget(id).is_some())
+            .collect();
+        if seeds.contains(&"conky") {
+            seeds.truncate(1);
+        }
+        if seeds.is_empty() {
+            seeds.extend(pkg.manifest.widgets.first().map(|w| w.id.as_str()));
+        }
         let mut y = 0;
-        for wid in ["clock", "system"] {
+        for wid in seeds {
             if let Some(w) = pkg.widget(wid) {
                 let [cw, ch] = w.size.default;
                 let (cw, ch) = (cw as i32, ch as i32);
@@ -1599,6 +1611,7 @@ impl Runtime {
                         size: cells(w.size.default),
                         min: cells(w.size.min),
                         max: cells(w.size.max),
+                        variants: w.variants.iter().map(|v| cells(*v)).collect(),
                         favourite: prefs.is_favourite(&p.manifest.id, &w.id),
                         dir: p.dir.clone(),
                         preview: w.preview.clone(),

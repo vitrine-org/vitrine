@@ -309,21 +309,21 @@ fn request_preview(
         });
 }
 
-/// Size choices for a widget: its minimum, default and maximum, plus one step
-/// between default and maximum.
-fn size_choices(w: &vitrine_widgets::manifest::WidgetManifest) -> Vec<(i32, i32)> {
+/// Size choices for a widget: the same sizes the edit sheet offers, one per
+/// layout (see [`gallery::size_variants`]).
+fn size_choices(
+    w: &vitrine_widgets::manifest::WidgetManifest,
+    grid: (i32, i32),
+) -> Vec<(i32, i32)> {
     let c = |a: [u32; 2]| (a[0] as i32, a[1] as i32);
-    let (min, def, max) = (c(w.size.min), c(w.size.default), c(w.size.max));
-    let mid = ((def.0 + 1).min(max.0), (def.1 + 1).min(max.1));
-    let big = ((def.0 * 2).min(max.0), (def.1 * 2).min(max.1));
-    let mut out = Vec::new();
-    for v in [min, def, mid, big] {
-        if !out.contains(&v) {
-            out.push(v);
-        }
-    }
-    out.sort_by_key(|(w, h)| w * h);
-    out
+    let declared: Vec<(i32, i32)> = w.variants.iter().map(|v| c(*v)).collect();
+    gallery::size_variants(
+        c(w.size.min),
+        c(w.size.default),
+        c(w.size.max),
+        &declared,
+        grid,
+    )
 }
 
 /// The language selector: "Windows default", then each language in its own name.
@@ -346,7 +346,7 @@ fn open_detail(ui: &PanelWindow, st: &mut State, package: &str, widget: &str) {
     let Some(w) = pkg.widget(widget).cloned() else {
         return;
     };
-    let sizes = size_choices(&w);
+    let sizes = size_choices(&w, grid_limit(st));
     let def = (w.size.default[0] as i32, w.size.default[1] as i32);
     let index = sizes.iter().position(|s| *s == def).unwrap_or(0);
     ui.set_detail(LibraryRow {
@@ -464,8 +464,7 @@ fn grid_limit(st: &State) -> (i32, i32) {
 
 /// "2×1 · 4×2": the sizes a widget comes in.
 fn variants_text(w: &vitrine_widgets::manifest::WidgetManifest, grid: (i32, i32)) -> String {
-    let c = |a: [u32; 2]| (a[0] as i32, a[1] as i32);
-    gallery::size_variants(c(w.size.min), c(w.size.default), c(w.size.max), grid)
+    size_choices(w, grid)
         .iter()
         .map(|(w, h)| format!("{w}×{h}"))
         .collect::<Vec<_>>()
@@ -2165,24 +2164,31 @@ mod tests {
     }
 
     #[test]
-    fn size_choices_cover_min_default_and_bigger() {
+    fn size_choices_offer_one_size_per_shape() {
+        let grid = (26, 14);
+        // Square minimum, wide default and maximum: two layouts.
         let w = widget([4, 2], [2, 2], [8, 4]);
-        assert_eq!(size_choices(&w), vec![(2, 2), (4, 2), (5, 3), (8, 4)]);
+        assert_eq!(size_choices(&w, grid), vec![(2, 2), (4, 2)]);
+        // Fixed size: one choice.
+        let w = widget([3, 3], [3, 3], [3, 3]);
+        assert_eq!(size_choices(&w, grid), vec![(3, 3)]);
+        // A square that only scales: just the default.
+        let w = widget([2, 2], [1, 1], [3, 3]);
+        assert_eq!(size_choices(&w, grid), vec![(2, 2)]);
+        let w = widget([4, 1], [1, 1], [12, 1]);
+        assert_eq!(size_choices(&w, grid), vec![(1, 1), (4, 1)]);
     }
 
     #[test]
-    fn size_choices_are_deduplicated_and_capped() {
-        // Fixed size: one choice.
-        let w = widget([3, 3], [3, 3], [3, 3]);
-        assert_eq!(size_choices(&w), vec![(3, 3)]);
-        // Max right above default: mid and big coincide.
-        let w = widget([2, 2], [1, 1], [3, 3]);
-        assert_eq!(size_choices(&w), vec![(1, 1), (2, 2), (3, 3)]);
-        // Sorted by area.
-        let w = widget([4, 1], [1, 1], [12, 1]);
-        let c = size_choices(&w);
-        assert!(c.windows(2).all(|p| p[0].0 * p[0].1 <= p[1].0 * p[1].1));
-        assert_eq!(c, vec![(1, 1), (4, 1), (5, 1), (8, 1)]);
+    fn size_choices_follow_declared_variants() {
+        let w: WidgetManifest = serde_json::from_value(serde_json::json!({
+            "id": "w", "name": "W", "entry": "index.js",
+            "size": { "default": [2, 2], "min": [2, 2], "max": [4, 5] },
+            "variants": [[2, 2], [4, 2], [4, 5]]
+        }))
+        .unwrap();
+        assert_eq!(size_choices(&w, (26, 14)), vec![(2, 2), (4, 2), (4, 5)]);
+        assert_eq!(size_choices(&w, (4, 4)), vec![(2, 2), (4, 2), (4, 4)]);
     }
 
     #[test]

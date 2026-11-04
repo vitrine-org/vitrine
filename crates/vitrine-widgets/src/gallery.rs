@@ -173,19 +173,58 @@ pub fn section_view(
     }
 }
 
-/// The sizes a widget is offered in: its minimum, default and maximum (in
-/// cells), each kept on a `cols` × `rows` grid, without duplicates, smallest first.
+/// The outline of a widget, from the aspect ratio of its box: a widget lays
+/// out by shape and only scales with size, so the gallery offers one size per
+/// shape. The thresholds match the SDK's `shapeOf`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    Square,
+    Wide,
+    Tall,
+}
+
+/// Shape of a `w` × `h` cell box (64-DIP cells with 8-DIP gaps).
+pub fn shape_of((w, h): (i32, i32)) -> Shape {
+    let dips = |n: i32| (72 * n.max(1) - 8) as f32;
+    let aspect = dips(w) / dips(h);
+    if aspect >= 1.25 {
+        Shape::Wide
+    } else if aspect <= 0.8 {
+        Shape::Tall
+    } else {
+        Shape::Square
+    }
+}
+
+/// The sizes a widget is offered in (cells), each kept on a `cols` × `rows`
+/// grid, without duplicates, smallest first. A pack's own `variants` win;
+/// otherwise the default, minimum and maximum, keeping one per [`Shape`] (the
+/// default first), since a responsive widget only scales within a shape.
 pub fn size_variants(
     min: (i32, i32),
     default: (i32, i32),
     max: (i32, i32),
+    declared: &[(i32, i32)],
     (cols, rows): (i32, i32),
 ) -> Vec<(i32, i32)> {
     let fit = |(w, h): (i32, i32)| (w.clamp(1, cols.max(1)), h.clamp(1, rows.max(1)));
+    let within = |&(w, h): &(i32, i32)| w >= min.0 && h >= min.1 && w <= max.0 && h <= max.1;
+    let declared: Vec<(i32, i32)> = declared.iter().copied().filter(within).collect();
     let mut out: Vec<(i32, i32)> = Vec::new();
-    for v in [min, default, max].map(fit) {
-        if !out.contains(&v) {
-            out.push(v);
+    if declared.is_empty() {
+        let mut shapes = Vec::new();
+        for v in [default, min, max].map(fit) {
+            let shape = shape_of(v);
+            if !shapes.contains(&shape) {
+                shapes.push(shape);
+                out.push(v);
+            }
+        }
+    } else {
+        for v in declared.into_iter().map(fit) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
         }
     }
     out.sort_by_key(|&(w, h)| (w * h, w));
@@ -299,26 +338,57 @@ mod tests {
     }
 
     #[test]
-    fn size_variants_are_deduplicated_and_fit_the_grid() {
+    fn shapes_follow_the_aspect_ratio() {
+        assert_eq!(shape_of((2, 2)), Shape::Square);
+        assert_eq!(shape_of((4, 4)), Shape::Square);
+        assert_eq!(shape_of((3, 2)), Shape::Wide);
+        assert_eq!(shape_of((6, 5)), Shape::Square);
+        assert_eq!(shape_of((4, 2)), Shape::Wide);
+        assert_eq!(shape_of((2, 1)), Shape::Wide);
+        assert_eq!(shape_of((4, 5)), Shape::Tall);
+        assert_eq!(shape_of((2, 3)), Shape::Tall);
+        assert_eq!(shape_of((4, 8)), Shape::Tall);
+    }
+
+    #[test]
+    fn size_variants_keep_one_size_per_shape() {
         let grid = (26, 14);
+        // Same shape at three sizes: only the default.
+        assert_eq!(size_variants((2, 2), (3, 3), (4, 4), &[], grid), [(3, 3)]);
+        assert_eq!(size_variants((2, 1), (2, 1), (4, 2), &[], grid), [(2, 1)]);
+        assert_eq!(size_variants((3, 3), (3, 3), (3, 3), &[], grid), [(3, 3)]);
+        // Different shapes stay, smallest first.
         assert_eq!(
-            size_variants((2, 2), (3, 3), (4, 4), grid),
-            [(2, 2), (3, 3), (4, 4)]
+            size_variants((2, 2), (2, 2), (6, 2), &[], grid),
+            [(2, 2), (6, 2)]
         );
         assert_eq!(
-            size_variants((2, 1), (2, 1), (4, 2), grid),
-            [(2, 1), (4, 2)]
-        );
-        assert_eq!(size_variants((3, 3), (3, 3), (3, 3), grid), [(3, 3)]);
-        // The default 16×16 maximum is cut to the grid.
-        assert_eq!(
-            size_variants((1, 1), (4, 3), (16, 16), (12, 8)),
-            [(1, 1), (4, 3), (12, 8)]
+            size_variants((1, 1), (4, 3), (16, 4), &[], (12, 8)),
+            [(1, 1), (4, 3)]
         );
         // Narrower first at the same area.
         assert_eq!(
-            size_variants((2, 4), (4, 2), (4, 2), grid),
-            [(2, 4), (4, 2)]
+            size_variants((2, 4), (4, 2), (4, 4), &[], grid),
+            [(2, 4), (4, 2), (4, 4)]
+        );
+    }
+
+    #[test]
+    fn declared_variants_win_within_the_range() {
+        let grid = (26, 14);
+        assert_eq!(
+            size_variants((2, 2), (2, 2), (4, 5), &[(4, 5), (2, 2), (4, 2)], grid),
+            [(2, 2), (4, 2), (4, 5)]
+        );
+        // Out-of-range entries are ignored; none left falls back to shapes.
+        assert_eq!(
+            size_variants((2, 2), (2, 2), (4, 4), &[(8, 8)], grid),
+            [(2, 2)]
+        );
+        // Cut to the grid.
+        assert_eq!(
+            size_variants((2, 2), (2, 2), (8, 8), &[(2, 2), (8, 8)], (6, 6)),
+            [(2, 2), (6, 6)]
         );
     }
 }

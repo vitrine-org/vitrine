@@ -76,7 +76,7 @@ pub fn groups(
         .filter(|(_, g)| selection.includes(g) && matches(g, query))
         .map(|(item, g)| Group {
             item,
-            variants: size_variants(g.min, g.size, g.max, grid),
+            variants: size_variants(g.min, g.size, g.max, &g.variants, grid),
         })
         .collect()
 }
@@ -148,6 +148,7 @@ mod tests {
             min: sizes[0],
             size: sizes[1],
             max: sizes[2],
+            variants: Vec::new(),
             favourite,
             dir: std::path::PathBuf::new(),
             preview: None,
@@ -201,18 +202,25 @@ mod tests {
     #[test]
     fn variants_are_deduplicated_per_widget() {
         let all = groups(&gallery(), &Selection::All, "", (26, 14));
-        assert_eq!(all[0].variants, [(2, 1), (4, 2)]);
-        assert_eq!(all[1].variants, [(3, 3), (4, 4)]);
-        assert_eq!(all[2].variants, [(4, 1), (5, 1), (8, 2)]);
+        // One size per shape: these all keep a single outline.
+        assert_eq!(all[0].variants, [(2, 1)]);
+        assert_eq!(all[1].variants, [(3, 3)]);
+        assert_eq!(all[2].variants, [(5, 1)]);
         assert_eq!(all[3].variants, [(3, 3)]);
-        // A small grid caps the largest size.
-        let small = groups(&gallery(), &Selection::All, "", (6, 2));
-        assert_eq!(small[2].variants, [(4, 1), (5, 1), (6, 2)]);
+        // A pack's own variants win, cut to the grid.
+        let mut g = gallery();
+        g[1].variants = vec![(3, 3), (4, 4)];
+        let small = groups(&g, &Selection::All, "", (3, 3));
+        assert_eq!(small[1].variants, [(3, 3)]);
     }
 
     #[test]
     fn keyboard_walks_the_variants() {
-        let gs = groups(&gallery(), &Selection::All, "", (26, 14));
+        let mut g = gallery();
+        g[0].variants = vec![(2, 1), (4, 2)];
+        g[1].variants = vec![(3, 3), (4, 4)];
+        g[2].variants = vec![(4, 1), (5, 1), (8, 2)];
+        let gs = groups(&g, &Selection::All, "", (26, 14));
         // Right runs through each widget's sizes, then on to the next widget.
         let mut c = (0, 0);
         let mut seen = vec![c];
