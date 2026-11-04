@@ -4,7 +4,7 @@ use std::mem::ManuallyDrop;
 
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE;
+use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_RANGE, IDWriteTextLayout};
 use windows::core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -313,12 +313,67 @@ impl Painter<'_> {
                 }
                 pos += len;
             }
+            if let Some(sh) = &run.base.shadow {
+                self.text_shadow(&layout, r, sh)?;
+            }
             let default = self.solid(run.base.color)?;
             self.dc.DrawTextLayout(
                 pt(r.x, r.y),
                 &layout,
                 &default,
                 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+            );
+        }
+        Ok(())
+    }
+
+    /// A real Gaussian text shadow: the glyphs are recorded into a command list
+    /// and drawn through the D2D shadow effect (blur radius as in CSS).
+    fn text_shadow(
+        &mut self,
+        layout: &IDWriteTextLayout,
+        r: RectF,
+        sh: &crate::style::Shadow,
+    ) -> Result<()> {
+        unsafe {
+            let mut xf = windows_numerics::Matrix3x2::default();
+            self.dc.GetTransform(&mut xf);
+            let target = self.dc.GetTarget()?;
+            let list = self.dc.CreateCommandList()?;
+            self.dc.SetTarget(&list);
+            self.dc
+                .SetTransform(&windows_numerics::Matrix3x2::identity());
+            let ink = self.solid(crate::color::Color::rgba(0.0, 0.0, 0.0, 1.0))?;
+            self.dc
+                .DrawTextLayout(pt(0.0, 0.0), layout, &ink, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            self.dc.SetTarget(&target);
+            self.dc.SetTransform(&xf);
+            list.Close()?;
+            let fx = self.dc.CreateEffect(&CLSID_D2D1Shadow)?;
+            fx.SetInput(0, &list, true);
+            let sigma = (sh.blur / 2.0).max(0.0);
+            fx.SetValue(
+                D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &sigma.to_le_bytes(),
+            )?;
+            let c = sh.color;
+            let mut rgba = Vec::with_capacity(16);
+            for v in [c.r, c.g, c.b, c.a] {
+                rgba.extend_from_slice(&v.to_le_bytes());
+            }
+            fx.SetValue(
+                D2D1_SHADOW_PROP_COLOR.0 as u32,
+                D2D1_PROPERTY_TYPE_VECTOR4,
+                &rgba,
+            )?;
+            let out = fx.GetOutput()?;
+            self.dc.DrawImage(
+                &out,
+                Some(&pt(r.x + sh.dx, r.y + sh.dy)),
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
         }
         Ok(())

@@ -748,6 +748,8 @@ pub struct TextStyle {
     pub case: TextCase,
     pub wrap: bool,
     pub ellipsis: bool,
+    /// `textShadow` (inherited, like CSS): blurred shadow drawn under the text.
+    pub shadow: Option<Shadow>,
 }
 
 impl Default for TextStyle {
@@ -764,6 +766,7 @@ impl Default for TextStyle {
             case: TextCase::None,
             wrap: true,
             ellipsis: false,
+            shadow: None,
         }
     }
 }
@@ -817,6 +820,13 @@ impl TextStyle {
         }
         if let Some(s) = src.string("fontStyle") {
             t.italic = s == "italic" || s == "oblique";
+        }
+        if let Some(sh) = src.string("textShadow") {
+            t.shadow = if sh.trim() == "none" {
+                None
+            } else {
+                parse_shadow(&sh, t.color)
+            };
         }
         if let Some(ls) = src.style("letterSpacing") {
             t.letter_spacing = match &ls {
