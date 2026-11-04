@@ -111,6 +111,12 @@ pub fn render_rgba(
                     inst.deliver("fetch", &result.to_string());
                 }
                 Effect::StorageSet { .. } | Effect::OpenUrl(_) => {}
+                Effect::Prompt { id, .. } => {
+                    inst.deliver(
+                        "prompt",
+                        &serde_json::json!({ "id": id, "value": null }).to_string(),
+                    );
+                }
             }
         }
         if !subscribed.is_empty() && !primed {

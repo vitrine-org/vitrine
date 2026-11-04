@@ -102,6 +102,7 @@ pub enum HostMsg {
 
 enum Event {
     Fetch { instance: String, payload: String },
+    Prompt { instance: String, payload: String },
     System(Value),
 }
 
@@ -710,6 +711,12 @@ impl Runtime {
                         l.inst.deliver("fetch", &payload);
                     }
                 }
+                Event::Prompt { instance, payload } => {
+                    if let Some(l) = self.widgets.iter_mut().find(|l| l.entry.id == instance) {
+                        l.inst.deliver("prompt", &payload);
+                        l.force_paint = true;
+                    }
+                }
                 Event::System(snapshot) => {
                     let Value::Object(all) = snapshot else {
                         continue;
@@ -810,6 +817,19 @@ impl Runtime {
                         if url.starts_with("https://") || url.starts_with("http://") {
                             shellapi::open(&url);
                         }
+                    }
+                    Effect::Prompt { id, options } => {
+                        let tx = self.tx.clone();
+                        let instance = live.entry.id.clone();
+                        let at = (live.screen.left, live.screen.bottom + 8);
+                        std::thread::spawn(move || {
+                            let value = crate::prompt::ask(&options, at);
+                            let payload =
+                                serde_json::json!({ "id": id, "value": value }).to_string();
+                            if tx.send(Event::Prompt { instance, payload }).is_ok() {
+                                wake(host_id);
+                            }
+                        });
                     }
                 }
             }
@@ -1022,14 +1042,20 @@ impl Runtime {
             self.user_paused,
             shellapi::autostart_enabled(),
         );
-        if let Some(cmd) = shellapi::popup(self.host, pt, &items) {
+        let anchor = crate::flyout::Anchor::Above(pt);
+        if let Some(cmd) =
+            crate::flyout::show(&self.gpu, &self.dc, self.hinst, anchor, &items, &menu_decor)
+        {
             self.command(cmd, None);
         }
     }
 
     fn widget_menu(&mut self, i: usize, pt: POINT) {
         let items = widget_items();
-        if let Some(cmd) = shellapi::popup(self.host, pt, &items) {
+        let anchor = crate::flyout::Anchor::Below(pt);
+        if let Some(cmd) =
+            crate::flyout::show(&self.gpu, &self.dc, self.hinst, anchor, &items, &menu_decor)
+        {
             let id = self.widgets.get(i).map(|l| l.entry.id.clone());
             self.command(cmd, id);
         }
@@ -1456,6 +1482,31 @@ fn tray_items(
         Item::Separator,
         Item::action(Runtime::CMD_QUIT, "Quit Vitrine"),
     ]
+}
+
+/// Icon and presentation of each menu command (Segoe Fluent Icons).
+fn menu_decor(cmd: u32) -> crate::flyout::Decor {
+    use crate::flyout::Decor;
+    let icon = |c: char| Decor {
+        icon: Some(c),
+        toggle: false,
+    };
+    let toggle = |c: char| Decor {
+        icon: Some(c),
+        toggle: true,
+    };
+    match MenuCommand::decode(cmd) {
+        MenuCommand::Gallery => icon('\u{E710}'),
+        MenuCommand::Edit => icon('\u{E70F}'),
+        MenuCommand::Panel => icon('\u{E713}'),
+        MenuCommand::Pause => toggle('\u{E769}'),
+        MenuCommand::Autostart => toggle('\u{E7E8}'),
+        MenuCommand::Folder => icon('\u{E8B7}'),
+        MenuCommand::Site => icon('\u{E719}'),
+        MenuCommand::Quit => icon('\u{E711}'),
+        MenuCommand::Remove => icon('\u{E74D}'),
+        MenuCommand::Add(_) | MenuCommand::Unknown => Decor::default(),
+    }
 }
 
 fn widget_items() -> Vec<Item> {

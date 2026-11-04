@@ -2,6 +2,7 @@
 //! Vitrine — desktop widgets for Windows, drawn beneath the desktop icons.
 
 mod edit;
+mod flyout;
 mod grid;
 mod headless;
 mod instance;
@@ -10,6 +11,7 @@ mod net;
 mod panel;
 mod peek;
 mod power;
+mod prompt;
 mod runtime;
 mod shellapi;
 
@@ -109,6 +111,11 @@ enum Cmd {
     Panel {
         instance: Option<String>,
     },
+    /// `--prompt <options json> [--at x,y]`: the text prompt shown for a widget.
+    Prompt {
+        options: String,
+        at: Option<(i32, i32)>,
+    },
     /// `--dev <dir>` (not canonicalized yet).
     Dev(PathBuf),
     /// No arguments or `--background`: run Vitrine.
@@ -169,6 +176,10 @@ fn parse_args(args: &[String]) -> Cmd {
         Some("--panel") => Cmd::Panel {
             instance: flag(args, "--instance").map(str::to_string),
         },
+        Some("--prompt") => Cmd::Prompt {
+            options: args.get(1).cloned().unwrap_or_else(|| "{}".into()),
+            at: flag(args, "--at").and_then(prompt::parse_at),
+        },
         Some("--dev") => match args.get(1) {
             Some(dir) => Cmd::Dev(PathBuf::from(dir)),
             None => Cmd::MissingArgs,
@@ -213,6 +224,12 @@ fn main() {
             if !runtime::send_command(cmd) {
                 attach_console();
                 eprintln!("Vitrine is not running");
+                std::process::exit(1);
+            }
+        }
+        Cmd::Prompt { options, at } => {
+            if let Err(e) = prompt::run(&options, at) {
+                eprintln!("prompt: {e}");
                 std::process::exit(1);
             }
         }
@@ -324,6 +341,20 @@ mod tests {
     #[test]
     fn panel() {
         assert_eq!(parse(&["--panel"]), Cmd::Panel { instance: None });
+        assert_eq!(
+            parse(&["--prompt", "{\"title\":\"x\"}", "--at", "5,6"]),
+            Cmd::Prompt {
+                options: "{\"title\":\"x\"}".into(),
+                at: Some((5, 6))
+            }
+        );
+        assert_eq!(
+            parse(&["--prompt"]),
+            Cmd::Prompt {
+                options: "{}".into(),
+                at: None
+            }
+        );
         assert_eq!(
             parse(&["--panel", "--instance", "a1b2"]),
             Cmd::Panel {

@@ -44,6 +44,11 @@ pub enum HostRequest {
         value: Option<String>,
     },
     OpenUrl(String),
+    /// Ask the user for a line of text; the answer comes back as a "prompt" event.
+    Prompt {
+        id: u32,
+        options: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,6 +387,16 @@ impl WidgetScript {
                     if url.starts_with("https://") || url.starts_with("http://") {
                         st.borrow_mut().requests.push(HostRequest::OpenUrl(url));
                     }
+                })?,
+            )?;
+            let st = self.state.clone();
+            host.set(
+                "prompt",
+                Function::new(ctx.clone(), move |id: u32, options: Opt<String>| {
+                    st.borrow_mut().requests.push(HostRequest::Prompt {
+                        id,
+                        options: options.0.unwrap_or_else(|| "{}".into()),
+                    });
                 })?,
             )?;
             host.set(

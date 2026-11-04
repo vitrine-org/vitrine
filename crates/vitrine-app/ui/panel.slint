@@ -734,3 +734,54 @@ export component PanelWindow inherits Window {
         }
     }
 }
+
+// A one-line text prompt for widgets (they never get keyboard focus).
+export component PromptWindow inherits Window {
+    in property <string> heading: "Add item";
+    in property <string> placeholder;
+    in property <string> initial;
+    callback accepted(string);
+    callback cancelled();
+    title: root.heading;
+    always-on-top: true;
+    preferred-width: 400px;
+    forward-focus: input;
+
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.cancelled();
+                return accept;
+            }
+            reject
+        }
+        VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+            Text {
+                text: root.heading;
+                font-size: 20px;
+                font-weight: 600;
+                color: Palette.foreground;
+            }
+            input := LineEdit {
+                placeholder-text: root.placeholder;
+                text: root.initial;
+                accepted(t) => { root.accepted(t); }
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                Button {
+                    text: "Cancel";
+                    clicked => { root.cancelled(); }
+                }
+                Button {
+                    text: "Save";
+                    primary: true;
+                    clicked => { root.accepted(input.text); }
+                }
+            }
+        }
+    }
+}

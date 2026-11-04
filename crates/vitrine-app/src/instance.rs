@@ -29,6 +29,11 @@ pub enum Effect {
         value: Option<String>,
     },
     OpenUrl(String),
+    /// Show a text prompt; reply with a "prompt" event `{id, value}`.
+    Prompt {
+        id: u32,
+        options: String,
+    },
 }
 
 pub struct WidgetInstance {
@@ -211,6 +216,7 @@ impl WidgetInstance {
                     effects.push(Effect::StorageSet { key, value })
                 }
                 HostRequest::OpenUrl(url) => effects.push(Effect::OpenUrl(url)),
+                HostRequest::Prompt { id, options } => effects.push(Effect::Prompt { id, options }),
             }
         }
         effects

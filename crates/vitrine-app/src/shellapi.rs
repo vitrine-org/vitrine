@@ -1,6 +1,6 @@
 //! Small Win32 shell helpers: tray icon, popup menus, autostart, opening URLs.
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::{LIM_SMALL, LoadIconMetric};
 use windows::Win32::UI::Shell::*;
@@ -115,46 +115,6 @@ impl Item {
     }
 }
 
-fn build(items: &[Item]) -> HMENU {
-    unsafe {
-        let menu = CreatePopupMenu().unwrap_or_default();
-        for item in items {
-            match item {
-                Item::Action {
-                    id,
-                    label,
-                    checked,
-                    enabled,
-                } => {
-                    let mut flags = MF_STRING;
-                    if *checked {
-                        flags |= MF_CHECKED;
-                    }
-                    if !*enabled {
-                        flags |= MF_GRAYED;
-                    }
-                    let text = wide(label);
-                    let _ = AppendMenuW(menu, flags, *id as usize, PCWSTR(text.as_ptr()));
-                }
-                Item::Sub { label, items } => {
-                    let sub = build(items);
-                    let text = wide(label);
-                    let _ = AppendMenuW(
-                        menu,
-                        MF_POPUP | MF_STRING,
-                        sub.0 as usize,
-                        PCWSTR(text.as_ptr()),
-                    );
-                }
-                Item::Separator => {
-                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                }
-            }
-        }
-        menu
-    }
-}
-
 /// Makes the process's popup menus follow the light/dark app theme.
 ///
 /// Uses the undocumented but stable uxtheme exports that Explorer and the
@@ -180,26 +140,6 @@ pub fn set_menu_theme(dark: bool) -> bool {
             flush();
         }
         true
-    }
-}
-
-/// Shows a menu at `pt` (screen pixels) and returns the chosen id.
-pub fn popup(owner: HWND, pt: POINT, items: &[Item]) -> Option<u32> {
-    unsafe {
-        let menu = build(items);
-        // Required so the menu closes when the user clicks elsewhere.
-        let _ = SetForegroundWindow(owner);
-        let id = TrackPopupMenuEx(
-            menu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN).0,
-            pt.x,
-            pt.y,
-            owner,
-            None,
-        );
-        let _ = PostMessageW(Some(owner), WM_NULL, Default::default(), Default::default());
-        let _ = DestroyMenu(menu);
-        (id.0 != 0).then_some(id.0 as u32)
     }
 }
 
@@ -338,111 +278,6 @@ mod tests {
                 enabled: false
             }
         );
-    }
-
-    struct Info {
-        id: u32,
-        text: String,
-        checked: bool,
-        grayed: bool,
-        separator: bool,
-        sub: Option<HMENU>,
-    }
-
-    fn info(menu: HMENU, pos: u32) -> Info {
-        let mut buf = [0u16; 128];
-        let mut mii = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_ID | MIIM_STATE | MIIM_FTYPE | MIIM_SUBMENU | MIIM_STRING,
-            dwTypeData: windows::core::PWSTR(buf.as_mut_ptr()),
-            cch: buf.len() as u32,
-            ..Default::default()
-        };
-        unsafe { GetMenuItemInfoW(menu, pos, true, &mut mii) }.unwrap();
-        Info {
-            id: mii.wID,
-            text: String::from_utf16_lossy(&buf[..mii.cch as usize]),
-            checked: (mii.fState & MFS_CHECKED).0 != 0,
-            grayed: (mii.fState & MFS_GRAYED).0 != 0,
-            separator: (mii.fType & MFT_SEPARATOR).0 != 0,
-            sub: (!mii.hSubMenu.is_invalid()).then_some(mii.hSubMenu),
-        }
-    }
-
-    fn count(menu: HMENU) -> i32 {
-        unsafe { GetMenuItemCount(Some(menu)) }
-    }
-
-    #[test]
-    fn build_creates_real_menus() {
-        let items = vec![
-            Item::action(9, "Add widgets…"),
-            Item::Sub {
-                label: "Quick add".into(),
-                items: vec![
-                    Item::action(1000, "Clock"),
-                    Item::Separator,
-                    Item::action(1001, "Weather"),
-                ],
-            },
-            Item::check(1, "Edit layout", true),
-            Item::check(2, "Pause widgets", false),
-            Item::Separator,
-            Item::disabled("Nothing here"),
-        ];
-        let menu = build(&items);
-        assert!(!menu.is_invalid());
-        assert_eq!(count(menu), 6);
-
-        let a = info(menu, 0);
-        assert_eq!((a.id, a.text.as_str()), (9, "Add widgets…"));
-        assert!(!a.checked && !a.grayed && !a.separator && a.sub.is_none());
-
-        let sub = info(menu, 1);
-        assert_eq!(sub.text, "Quick add");
-        let sub_menu = sub.sub.expect("submenu");
-        assert_eq!(count(sub_menu), 3);
-        assert_eq!(info(sub_menu, 0).id, 1000);
-        assert_eq!(info(sub_menu, 0).text, "Clock");
-        assert!(info(sub_menu, 1).separator);
-        assert_eq!(info(sub_menu, 2).id, 1001);
-
-        let edit = info(menu, 2);
-        assert_eq!(edit.id, 1);
-        assert!(edit.checked && !edit.grayed);
-        let pause = info(menu, 3);
-        assert_eq!(pause.id, 2);
-        assert!(!pause.checked);
-
-        assert!(info(menu, 4).separator);
-
-        let none = info(menu, 5);
-        assert_eq!((none.id, none.text.as_str()), (0, "Nothing here"));
-        assert!(none.grayed && !none.checked);
-
-        // Destroying the parent destroys the submenu too.
-        unsafe { DestroyMenu(menu) }.unwrap();
-        assert_eq!(count(sub_menu), -1);
-    }
-
-    #[test]
-    fn build_empty_and_nested() {
-        let menu = build(&[]);
-        assert_eq!(count(menu), 0);
-        unsafe { DestroyMenu(menu) }.unwrap();
-
-        let menu = build(&[Item::Sub {
-            label: "a".into(),
-            items: vec![Item::Sub {
-                label: "b".into(),
-                items: vec![Item::action(77, "c")],
-            }],
-        }]);
-        let a = info(menu, 0).sub.unwrap();
-        let b = info(a, 0).sub.unwrap();
-        assert_eq!(info(a, 0).text, "b");
-        assert_eq!(info(b, 0).id, 77);
-        unsafe { DestroyMenu(menu) }.unwrap();
     }
 
     #[test]
