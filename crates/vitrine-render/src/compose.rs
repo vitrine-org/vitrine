@@ -5,7 +5,8 @@ use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectComposition::{
-    IDCompositionSurface, IDCompositionTarget, IDCompositionVisual,
+    IDCompositionAnimation, IDCompositionDevice, IDCompositionEffectGroup,
+    IDCompositionScaleTransform, IDCompositionSurface, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -29,11 +30,47 @@ fn bitmap_props(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
     }
 }
 
-/// A window's DirectComposition content: one visual with one surface.
+/// A window's DirectComposition content: one visual with one surface, plus
+/// compositor-driven opacity and scale animations (they run in DWM, without
+/// repainting or waking the app).
 pub struct WindowVisual {
     target: IDCompositionTarget,
     visual: IDCompositionVisual,
+    /// Surface and its allocated (capacity) size; content may be smaller.
     surface: Option<(IDCompositionSurface, u32, u32)>,
+    effect: Option<IDCompositionEffectGroup>,
+    scale: Option<IDCompositionScaleTransform>,
+}
+
+/// Surfaces are allocated in steps so that live resizing reuses them.
+const SURFACE_STEP: u32 = 128;
+
+fn capacity(n: u32) -> u32 {
+    n.div_ceil(SURFACE_STEP) * SURFACE_STEP
+}
+
+/// Ease-out cubic from `from` to `to` over `secs`, as a DComp animation curve.
+fn ease_out(
+    dcomp: &IDCompositionDevice,
+    from: f32,
+    to: f32,
+    secs: f64,
+) -> Result<IDCompositionAnimation> {
+    unsafe {
+        let anim = dcomp.CreateAnimation()?;
+        let d = secs.max(1e-3) as f32;
+        let delta = to - from;
+        // from + Δ(3u − 3u² + u³), u = t/d
+        anim.AddCubic(
+            0.0,
+            from,
+            3.0 * delta / d,
+            -3.0 * delta / (d * d),
+            delta / (d * d * d),
+        )?;
+        anim.End(secs.max(1e-3), to)?;
+        Ok(anim)
+    }
 }
 
 impl WindowVisual {
@@ -49,7 +86,66 @@ impl WindowVisual {
                 target,
                 visual,
                 surface: None,
+                effect: None,
+                scale: None,
             })
+        }
+    }
+
+    fn effect(&mut self, dcomp: &IDCompositionDevice) -> Result<IDCompositionEffectGroup> {
+        if self.effect.is_none() {
+            unsafe {
+                let e = dcomp.CreateEffectGroup()?;
+                self.visual.SetEffect(&e)?;
+                self.effect = Some(e);
+            }
+        }
+        Ok(self.effect.clone().unwrap())
+    }
+
+    /// Fades the whole window between two opacities.
+    pub fn animate_opacity(&mut self, gpu: &Gpu, from: f32, to: f32, secs: f64) -> Result<()> {
+        let dcomp = gpu.dcomp.as_ref().unwrap();
+        let effect = self.effect(dcomp)?;
+        unsafe {
+            effect.SetOpacity(&ease_out(dcomp, from, to, secs)?)?;
+            dcomp.Commit()
+        }
+    }
+
+    /// Sets the window opacity immediately.
+    pub fn set_opacity(&mut self, gpu: &Gpu, opacity: f32) -> Result<()> {
+        let dcomp = gpu.dcomp.as_ref().unwrap();
+        let effect = self.effect(dcomp)?;
+        unsafe {
+            effect.SetOpacity2(opacity)?;
+            dcomp.Commit()
+        }
+    }
+
+    /// Scales the content around `center` (pixels) from `from` to `to`.
+    pub fn animate_scale(
+        &mut self,
+        gpu: &Gpu,
+        center: (f32, f32),
+        from: f32,
+        to: f32,
+        secs: f64,
+    ) -> Result<()> {
+        let dcomp = gpu.dcomp.as_ref().unwrap();
+        unsafe {
+            if self.scale.is_none() {
+                let t = dcomp.CreateScaleTransform()?;
+                self.visual.SetTransform(&t)?;
+                self.scale = Some(t);
+            }
+            let t = self.scale.as_ref().unwrap();
+            t.SetCenterX2(center.0)?;
+            t.SetCenterY2(center.1)?;
+            let anim = ease_out(dcomp, from, to, secs)?;
+            t.SetScaleX(&anim)?;
+            t.SetScaleY(&anim)?;
+            dcomp.Commit()
         }
     }
 
@@ -66,17 +162,22 @@ impl WindowVisual {
         let dcomp = gpu.dcomp.as_ref().unwrap();
         let (w, h) = (w.max(1), h.max(1));
         unsafe {
-            if !matches!(&self.surface, Some((_, sw, sh)) if *sw == w && *sh == h) {
+            // Reuse the surface while the content fits and is not much smaller.
+            let fits = matches!(&self.surface, Some((_, sw, sh))
+                if *sw >= w && *sh >= h && *sw <= capacity(w) + SURFACE_STEP && *sh <= capacity(h) + SURFACE_STEP);
+            if !fits {
+                let (cw, ch) = (capacity(w), capacity(h));
                 let s = dcomp.CreateSurface(
-                    w,
-                    h,
+                    cw,
+                    ch,
                     DXGI_FORMAT_B8G8R8A8_UNORM,
                     DXGI_ALPHA_MODE_PREMULTIPLIED,
                 )?;
                 self.visual.SetContent(&s)?;
-                self.surface = Some((s, w, h));
+                self.surface = Some((s, cw, ch));
             }
-            let (surface, _, _) = self.surface.as_ref().unwrap();
+            let (surface, cw, ch) = self.surface.as_ref().unwrap();
+            let (cw, ch) = (*cw, *ch);
             let mut offset = POINT::default();
             let dxgi: IDXGISurface = surface.BeginDraw(None, &mut offset)?;
             let bitmap = dc.CreateBitmapFromDxgiSurface(
@@ -88,15 +189,15 @@ impl WindowVisual {
             dc.SetTarget(&bitmap);
             dc.BeginDraw();
             let origin = Transform2D::translate(offset.x as f32, offset.y as f32);
-            // Clear only our rectangle of the (possibly shared) surface. The clip is
+            // Clear our whole allocation of the (possibly shared) surface. The clip is
             // set in surface space, before the offset transform.
             dc.SetTransform(&windows_numerics::Matrix3x2::identity());
             dc.PushAxisAlignedClip(
                 &D2D_RECT_F {
                     left: offset.x as f32,
                     top: offset.y as f32,
-                    right: (offset.x + w as i32) as f32,
-                    bottom: (offset.y + h as i32) as f32,
+                    right: (offset.x + cw as i32) as f32,
+                    bottom: (offset.y + ch as i32) as f32,
                 },
                 D2D1_ANTIALIAS_MODE_ALIASED,
             );

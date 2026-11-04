@@ -119,10 +119,6 @@ pub(crate) fn push_host(msg: HostMsg) {
     push(msg);
 }
 
-fn contains(r: &RECT, pt: POINT) -> bool {
-    pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
-}
-
 /// A widget instance placed on the desktop.
 struct Live {
     entry: Instance,
@@ -137,6 +133,49 @@ struct Live {
     storage: Map<String, Value>,
     /// Package version the instance was created from (to detect upgrades).
     version: String,
+    /// Running move/resize animation of the window.
+    anim: Option<RectAnim>,
+    /// The window was just created: fade and scale in after the first frame.
+    appear: bool,
+}
+
+struct RectAnim {
+    from: RECT,
+    to: RECT,
+    start: Instant,
+    secs: f32,
+}
+
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn lerp_rect(a: RECT, b: RECT, t: f32) -> RECT {
+    let l = |x: i32, y: i32| (x as f32 + (y - x) as f32 * t).round() as i32;
+    RECT {
+        left: l(a.left, b.left),
+        top: l(a.top, b.top),
+        right: l(a.right, b.right),
+        bottom: l(a.bottom, b.bottom),
+    }
+}
+
+/// Moves/resizes a widget window to `r` (pixels); the widget re-lays out at the new size.
+fn apply_rect(layer: Option<&DesktopLayer>, live: &mut Live, r: RECT) {
+    if r == live.screen {
+        return;
+    }
+    let (ow, oh) = rect_size(&live.screen);
+    let (nw, nh) = rect_size(&r);
+    if (ow, oh) != (nw, nh) {
+        live.inst
+            .set_size(nw as f32 / live.scale, nh as f32 / live.scale);
+        live.force_paint = true;
+    }
+    live.screen = r;
+    if let (Some(layer), Some((hwnd, _))) = (layer, &live.window) {
+        let _ = window::place(layer, *hwnd, r);
+    }
 }
 
 pub struct Runtime {
@@ -161,6 +200,12 @@ pub struct Runtime {
     fullscreen: bool,
     user_paused: bool,
     edit: Option<EditMode>,
+    /// Edit mode fading out, dropped at the deadline.
+    edit_closing: Option<(EditMode, Instant)>,
+    /// Windows minimized for edit mode, restored when it ends.
+    peek: Option<crate::peek::Peek>,
+    /// Removed widgets fading out.
+    dying: Vec<(Live, Instant)>,
     quit: bool,
     dev_stamp: Option<std::time::SystemTime>,
 }
@@ -226,6 +271,9 @@ impl Runtime {
             fullscreen: false,
             user_paused: false,
             edit: None,
+            edit_closing: None,
+            peek: None,
+            dying: Vec::new(),
             quit: false,
             dev_stamp: DEV_DIR.get().and_then(|d| tree_stamp(d)),
         })
@@ -512,6 +560,8 @@ impl Runtime {
                     pressed: None,
                     storage,
                     version,
+                    anim: None,
+                    appear: true,
                 });
             }
             Err(e) => log::error!("widget {}: {e}", entry.id),
@@ -533,6 +583,9 @@ impl Runtime {
         self.monitors = monitors::monitors();
         let grid = self.layout.grid;
         for live in &mut self.widgets {
+            if live.anim.is_some() {
+                continue; // the animation owns the window until it settles
+            }
             let Some(m) = monitors::resolve(&self.monitors, &live.entry.monitor) else {
                 continue;
             };
@@ -556,9 +609,11 @@ impl Runtime {
                 None => match window::create_widget_window(layer, WIDGET_CLASS, self.hinst, screen)
                 {
                     Ok(hwnd) => match WindowVisual::new(&self.gpu, hwnd) {
-                        Ok(v) => {
+                        Ok(mut v) => {
+                            let _ = v.set_opacity(&self.gpu, 0.0);
                             live.window = Some((hwnd, v));
                             live.force_paint = true;
+                            live.appear = true;
                         }
                         Err(e) => {
                             log::error!("composition for {}: {e}", live.entry.id);
@@ -674,6 +729,39 @@ impl Runtime {
         let paused = self.paused();
         let mut timeout = u32::MAX;
         let host_id = self.host.0 as isize;
+        let now_i = Instant::now();
+        self.dying.retain_mut(|(live, deadline)| {
+            let done = now_i >= *deadline;
+            if done {
+                Self::destroy_window(live);
+            }
+            !done
+        });
+        if !self.dying.is_empty() {
+            timeout = timeout.min(30);
+        }
+        if self.edit_closing.as_ref().is_some_and(|(_, d)| now_i >= *d) {
+            self.edit_closing = None;
+        }
+        if self.edit_closing.is_some() {
+            timeout = timeout.min(30);
+        }
+        let mut settled = false;
+        for live in &mut self.widgets {
+            let Some(a) = &live.anim else { continue };
+            let t = (a.start.elapsed().as_secs_f32() / a.secs).min(1.0);
+            let r = lerp_rect(a.from, a.to, ease_out(t));
+            if t >= 1.0 {
+                live.anim = None;
+                settled = true;
+            } else {
+                timeout = timeout.min(8);
+            }
+            apply_rect(self.layer.as_ref(), live, r);
+        }
+        if settled {
+            self.update_routing();
+        }
         for i in 0..self.widgets.len() {
             let live = &mut self.widgets[i];
             if !paused {
@@ -736,6 +824,11 @@ impl Runtime {
                 });
                 if let Err(e) = result {
                     log::error!("paint {}: {e}", live.entry.id);
+                } else if live.appear {
+                    live.appear = false;
+                    let _ = visual.animate_opacity(gpu, 0.0, 1.0, 0.28);
+                    let center = (pw as f32 / 2.0, ph as f32 / 2.0);
+                    let _ = visual.animate_scale(gpu, center, 0.94, 1.0, 0.34);
                 }
                 live.force_paint = false;
                 if live.inst.renderer.needs_paint(now + 16.0) {
@@ -911,6 +1004,7 @@ impl Runtime {
     const CMD_PANEL: u32 = 6;
     const CMD_REMOVE: u32 = 7;
     const CMD_SITE: u32 = 8;
+    pub const CMD_GALLERY: u32 = 9;
     const CMD_ADD: u32 = 1000;
 
     fn add_menu(&self) -> Item {
@@ -928,7 +1022,7 @@ impl Runtime {
             items.push(Item::disabled("No widget packages installed"));
         }
         Item::Sub {
-            label: "Add widget".into(),
+            label: "Quick add".into(),
             items,
         }
     }
@@ -947,6 +1041,7 @@ impl Runtime {
 
     fn tray_menu(&mut self, pt: POINT) {
         let items = vec![
+            Item::action(Self::CMD_GALLERY, "Add widgets…"),
             self.add_menu(),
             Item::check(Self::CMD_EDIT, "Edit layout", self.edit.is_some()),
             Item::action(Self::CMD_PANEL, "Settings…"),
@@ -997,6 +1092,7 @@ impl Runtime {
             }
             Self::CMD_FOLDER => shellapi::open(&paths::data_dir().to_string_lossy()),
             Self::CMD_SITE => shellapi::open("https://vitrine-widgets.github.io/"),
+            Self::CMD_GALLERY => self.open_gallery(),
             Self::CMD_PANEL => crate::open_panel(instance.as_deref()),
             Self::CMD_REMOVE => {
                 if let Some(id) = instance {
@@ -1017,26 +1113,41 @@ impl Runtime {
     }
 
     pub(crate) fn add_instance(&mut self, package: &str, widget: &str) {
+        self.add_instance_at(package, widget, None);
+    }
+
+    /// Adds a widget at a cell span, or at the first free place on the main monitor.
+    pub(crate) fn add_instance_at(
+        &mut self,
+        package: &str,
+        widget: &str,
+        at: Option<(String, crate::edit::Cells)>,
+    ) {
         let Some(g) = self.primary_geometry() else {
             return;
         };
         let Some(w) = self.package(package).and_then(|p| p.widget(widget)) else {
             return;
         };
-        let [cw, ch] = w.size.default;
-        let (cw, ch) = (cw as i32, ch as i32);
-        let Some((x, y)) = self
-            .layout
-            .find_free_spot("primary", g.cols, g.rows, cw, ch)
-        else {
-            log::warn!("no free space for {package}/{widget}");
-            return;
+        let (cw, ch) = (w.size.default[0] as i32, w.size.default[1] as i32);
+        let (monitor, (x, y, cw, ch)) = match at {
+            Some(spot) => spot,
+            None => match self
+                .layout
+                .find_free_spot("primary", g.cols, g.rows, cw, ch)
+            {
+                Some((x, y)) => ("primary".to_string(), (x, y, cw, ch)),
+                None => {
+                    log::warn!("no free space for {package}/{widget}");
+                    return;
+                }
+            },
         };
         let entry = Instance {
             id: vitrine_widgets::layout::new_instance_id(),
             package: package.into(),
             widget: widget.into(),
-            monitor: "primary".into(),
+            monitor,
             x,
             y,
             w: cw,
@@ -1055,20 +1166,23 @@ impl Runtime {
         self.save_layout();
         if let Some(pos) = self.widgets.iter().position(|l| l.entry.id == id) {
             let mut live = self.widgets.remove(pos);
-            Self::destroy_window(&mut live);
+            // Fade and shrink, then destroy (see `tick`).
+            let (w, h) = rect_size(&live.screen);
+            if let Some((_, v)) = &mut live.window {
+                let _ = v.animate_opacity(&self.gpu, 1.0, 0.0, 0.18);
+                let _ =
+                    v.animate_scale(&self.gpu, (w as f32 / 2.0, h as f32 / 2.0), 1.0, 0.92, 0.2);
+            }
+            self.dying
+                .push((live, Instant::now() + Duration::from_millis(220)));
         }
         let _ = std::fs::remove_file(storage_path(id));
         self.update_routing();
         self.update_plan();
     }
 
-    /// Applies an edited layout entry (from edit mode) to the running widget.
-    pub(crate) fn set_entry_rect(
-        &mut self,
-        id: &str,
-        monitor: &str,
-        (x, y, w, h): (i32, i32, i32, i32),
-    ) {
+    /// Moves a layout entry (from edit mode) without touching its window.
+    fn set_entry(&mut self, id: &str, monitor: &str, (x, y, w, h): crate::edit::Cells) {
         if let Some(e) = self.layout.instances.iter_mut().find(|i| i.id == id) {
             (e.x, e.y, e.w, e.h) = (x, y, w, h);
             e.monitor = monitor.into();
@@ -1077,7 +1191,27 @@ impl Runtime {
             (l.entry.x, l.entry.y, l.entry.w, l.entry.h) = (x, y, w, h);
             l.entry.monitor = monitor.into();
         }
-        self.relayout();
+    }
+
+    /// Animates a widget window from `from` to its layout position.
+    fn settle(&mut self, id: &str, from: RECT) {
+        let grid = self.layout.grid;
+        let monitors = self.monitors.clone();
+        let Some(live) = self.widgets.iter_mut().find(|l| l.entry.id == id) else {
+            return;
+        };
+        let Some(m) = monitors::resolve(&monitors, &live.entry.monitor) else {
+            return;
+        };
+        let g = Geometry::for_monitor(&grid, m);
+        let (x, y, w, h) = g.clamp(live.entry.x, live.entry.y, live.entry.w, live.entry.h);
+        live.scale = g.scale;
+        live.anim = Some(RectAnim {
+            from,
+            to: g.rect(x, y, w, h),
+            start: Instant::now(),
+            secs: 0.24,
+        });
     }
 
     fn monitor_name(&self, name: &str) -> String {
@@ -1088,142 +1222,116 @@ impl Runtime {
     }
 
     fn edit_input(&mut self, input: crate::edit::Input) {
-        use crate::edit::{Drag, Input};
         let items = self.edit_items();
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
-        let item = |id: &str| items.iter().find(|i| i.id == id);
-        match input {
-            Input::Escape => self.close_edit(),
-            Input::Down(pt) => {
-                if contains(&edit.done_button(), pt) {
-                    self.close_edit();
-                } else if let Some((id, resize)) = edit.hit(&items, pt)
-                    && let Some(it) = item(&id)
-                {
-                    edit.drag = Some(Drag {
-                        id,
-                        resize,
-                        start: pt,
-                        from: it.rect,
-                        moved: false,
-                        monitor: it.monitor.clone(),
-                    });
-                    edit.invalidate();
-                }
-            }
-            Input::Move(pt) => {
-                let Some(drag) = edit.drag.clone() else {
-                    let hover = edit.hit(&items, pt);
-                    let cursor = match &hover {
-                        Some((_, true)) => IDC_SIZENWSE,
-                        Some(_) => IDC_SIZEALL,
-                        None => IDC_ARROW,
-                    };
-                    unsafe {
-                        let _ = SetCursor(LoadCursorW(None, cursor).ok());
-                    }
-                    let id = hover.map(|h| h.0);
-                    if id != edit.hover {
-                        edit.hover = id;
-                        edit.invalidate();
-                    }
-                    return;
-                };
-                let Some(it) = item(&drag.id) else { return };
-                let Some(from_geo) = edit.geometry(&drag.monitor) else {
-                    return;
-                };
-                let (fx, fy, fw, fh) = drag.from;
-                let from_px = from_geo.rect(fx, fy, fw, fh);
-                let (dx, dy) = ((pt.x - drag.start.x) as f32, (pt.y - drag.start.y) as f32);
-                let (monitor, rect) = if drag.resize {
-                    let w = from_geo
-                        .span((from_px.right - from_px.left) as f32 + dx)
-                        .clamp(it.min.0, it.max.0);
-                    let h = from_geo
-                        .span((from_px.bottom - from_px.top) as f32 + dy)
-                        .clamp(it.min.1, it.max.1);
-                    (drag.monitor.clone(), from_geo.clamp(fx, fy, w, h))
-                } else {
-                    let Some((monitor, g)) = edit.monitor_at(pt) else {
-                        return;
-                    };
-                    let (x, y) = g.snap(from_px.left as f32 + dx, from_px.top as f32 + dy);
-                    (monitor, g.clamp(x, y, fw, fh))
-                };
-                if (monitor.as_str(), rect) == (it.monitor.as_str(), it.rect)
-                    || self.layout.rect_collides(&monitor, rect, Some(&drag.id))
-                {
-                    return;
-                }
-                if let Some(d) = &mut edit.drag {
-                    d.moved = true;
-                }
-                edit.invalidate();
-                self.set_entry_rect(&drag.id, &monitor, rect);
-            }
-            Input::Up => {
-                let moved = edit.drag.take().is_some_and(|d| d.moved);
-                edit.invalidate();
-                if moved {
-                    self.save_layout();
-                }
-            }
-            Input::RightUp(pt) => {
-                let Some((id, _)) = edit.hit(&items, pt) else {
-                    return;
-                };
-                let menu = vec![
-                    Item::action(Self::CMD_PANEL, "Widget settings…"),
-                    Item::Separator,
-                    Item::action(Self::CMD_REMOVE, "Remove widget"),
-                ];
-                if let Some(cmd) = shellapi::popup(self.host, pt, &menu) {
-                    self.command(cmd, Some(id));
-                }
-                if let Some(e) = &mut self.edit {
-                    e.invalidate();
-                }
-            }
+        for action in edit.input(input, &items) {
+            self.edit_action(action);
         }
     }
 
+    fn edit_action(&mut self, action: crate::edit::Action) {
+        use crate::edit::Action;
+        match action {
+            Action::Preview { id, rect } => {
+                let layer = self.layer;
+                if let Some(live) = self.widgets.iter_mut().find(|l| l.entry.id == id) {
+                    live.anim = None;
+                    apply_rect(layer.as_ref(), live, rect);
+                }
+            }
+            Action::Commit {
+                id,
+                monitor,
+                cells,
+                from,
+            } => {
+                self.set_entry(&id, &monitor, cells);
+                self.save_layout();
+                self.settle(&id, from);
+                self.relayout();
+            }
+            Action::Cancel { id, from } => self.settle(&id, from),
+            Action::Remove { id } => self.remove_instance(&id),
+            Action::Settings { id } => {
+                self.close_edit();
+                crate::open_panel(Some(&id));
+            }
+            Action::Add {
+                package,
+                widget,
+                at,
+            } => self.add_instance_at(&package, &widget, at),
+            Action::Close => self.close_edit(),
+        }
+    }
+
+    fn gallery(&self) -> Vec<crate::edit::GalleryItem> {
+        self.packages
+            .iter()
+            .flat_map(|p| {
+                p.manifest
+                    .widgets
+                    .iter()
+                    .map(move |w| crate::edit::GalleryItem {
+                        package: p.manifest.id.clone(),
+                        widget: w.id.clone(),
+                        name: w.name.clone(),
+                        size: (w.size.default[0] as i32, w.size.default[1] as i32),
+                        dir: p.dir.clone(),
+                        preview: w.preview.clone(),
+                    })
+            })
+            .collect()
+    }
+
     fn toggle_edit(&mut self) {
-        if let Some(edit) = self.edit.take() {
-            drop(edit);
+        if let Some(mut edit) = self.edit.take() {
+            edit.begin_close(&self.gpu);
+            self.edit_closing = Some((edit, Instant::now() + Duration::from_millis(200)));
+            if let Some(peek) = self.peek.take() {
+                peek.restore();
+            }
             self.save_layout();
         } else {
+            self.edit_closing = None;
             let geometries: Vec<(String, Geometry, RECT)> = self
                 .monitors
                 .iter()
                 .map(|m| {
-                    (
-                        if m.primary {
-                            "primary".to_string()
-                        } else {
-                            m.device.clone()
-                        },
-                        Geometry::for_monitor(&self.layout.grid, m),
-                        m.rect,
-                    )
+                    let name = if m.primary {
+                        "primary".to_string()
+                    } else {
+                        m.device.clone()
+                    };
+                    (name, Geometry::for_monitor(&self.layout.grid, m), m.rect)
                 })
                 .collect();
-            let icons = self
-                .routing
-                .read()
-                .map(|r| r.icons.rects.clone())
-                .unwrap_or_default();
-            match EditMode::open(&self.gpu, self.hinst, geometries, icons) {
+            self.peek = Some(crate::peek::Peek::show_desktop());
+            match EditMode::open(&self.gpu, self.hinst, geometries, self.gallery()) {
                 Ok(e) => self.edit = Some(e),
-                Err(e) => log::error!("edit mode: {e}"),
+                Err(e) => {
+                    log::error!("edit mode: {e}");
+                    if let Some(peek) = self.peek.take() {
+                        peek.restore();
+                    }
+                }
             }
         }
         self.update_routing();
     }
 
-    /// Instances as `(id, name, monitor, x, y, w, h, min, max)` for edit mode.
+    /// Opens edit mode with the widget gallery showing.
+    pub(crate) fn open_gallery(&mut self) {
+        if self.edit.is_none() {
+            self.toggle_edit();
+        }
+        if let Some(e) = &mut self.edit {
+            e.open_gallery();
+        }
+    }
+
     pub(crate) fn edit_items(&self) -> Vec<crate::edit::Item> {
         self.layout
             .instances
@@ -1476,6 +1584,9 @@ pub fn run() -> Result<(), String> {
         RUNTIME.with_borrow_mut(|r| {
             if let Some(mut rt) = r.take() {
                 rt.edit = None;
+                if let Some(peek) = rt.peek.take() {
+                    peek.restore();
+                }
                 rt.detach();
             }
         });

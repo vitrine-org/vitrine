@@ -8,6 +8,7 @@ mod instance;
 mod logger;
 mod net;
 mod panel;
+mod peek;
 mod power;
 mod runtime;
 mod shellapi;
@@ -155,11 +156,11 @@ fn main() {
             };
             std::process::exit(install(path));
         }
-        Some("--edit") | Some("--quit") => {
-            let cmd = if cmd == Some("--edit") {
-                runtime::Runtime::CMD_EDIT
-            } else {
-                runtime::Runtime::CMD_QUIT
+        Some("--edit") | Some("--quit") | Some("--gallery") => {
+            let cmd = match cmd {
+                Some("--edit") => runtime::Runtime::CMD_EDIT,
+                Some("--gallery") => runtime::Runtime::CMD_GALLERY,
+                _ => runtime::Runtime::CMD_QUIT,
             };
             if !runtime::send_command(cmd) {
                 attach_console();

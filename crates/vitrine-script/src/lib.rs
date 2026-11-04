@@ -78,7 +78,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             memory_bytes: 48 << 20,
-            stack_bytes: 1 << 20,
+            stack_bytes: 4 << 20, // the host thread has an 8 MB stack
             slice_ms: 250,
             init_ms: 3000,
         }
