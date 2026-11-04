@@ -1495,6 +1495,9 @@ fn menu_decor(cmd: u32) -> crate::flyout::Decor {
         icon: Some(c),
         toggle: true,
     };
+    if cmd == crate::flyout::SUBMENU {
+        return icon('\u{E71D}');
+    }
     match MenuCommand::decode(cmd) {
         MenuCommand::Gallery => icon('\u{E710}'),
         MenuCommand::Edit => icon('\u{E70F}'),
