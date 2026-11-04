@@ -180,6 +180,12 @@ impl TextEngine {
                     layout.SetFontFamilyName(PCWSTR(fam.as_ptr()), range)?;
                     layout.SetFontCollection(self.collection_for(&st.family).as_ref(), range)?;
                 }
+                if st.underline {
+                    layout.SetUnderline(true, range)?;
+                }
+                if st.strike {
+                    layout.SetStrikethrough(true, range)?;
+                }
                 if st.letter_spacing != 0.0
                     && let Some(l1) = &layout1
                 {

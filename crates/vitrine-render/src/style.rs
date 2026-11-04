@@ -829,6 +829,10 @@ pub struct TextStyle {
     pub ellipsis: bool,
     /// `textShadow` (inherited, like CSS): blurred shadow drawn under the text.
     pub shadow: Option<Shadow>,
+    /// `textDecoration` / `textDecorationLine`: `underline`, `line-through`.
+    /// Applies to nested text too, as decorations do in CSS.
+    pub underline: bool,
+    pub strike: bool,
 }
 
 impl Default for TextStyle {
@@ -846,8 +850,19 @@ impl Default for TextStyle {
             wrap: true,
             ellipsis: false,
             shadow: None,
+            underline: false,
+            strike: false,
         }
     }
+}
+
+/// `(underline, line-through)` from a CSS `text-decoration` value.
+pub fn parse_decoration(s: &str) -> (bool, bool) {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    (
+        words.contains(&"underline"),
+        words.contains(&"line-through"),
+    )
 }
 
 fn parse_weight(v: &PropValue) -> Option<u16> {
@@ -949,6 +964,14 @@ impl TextStyle {
         }
         if let Some(w) = src.string("whiteSpace") {
             t.wrap = !(w == "nowrap" || w == "pre");
+        }
+        if let Some(d) = src
+            .string("textDecorationLine")
+            .or_else(|| src.string("textDecoration"))
+        {
+            let (underline, strike) = parse_decoration(&d);
+            t.underline = underline;
+            t.strike = strike;
         }
         if let Some(o) = src.string("textOverflow") {
             t.ellipsis = o == "ellipsis";
@@ -1092,6 +1115,24 @@ mod tests {
         assert!((x - 10.0).abs() < 1e-4 && (y - 20.0).abs() < 1e-4);
         let t = parse_transform("translate(10px, 0) scale(2)");
         assert_eq!(t.apply(1.0, 1.0), (12.0, 2.0));
+    }
+
+    #[test]
+    fn text_decoration() {
+        assert_eq!(parse_decoration("line-through"), (false, true));
+        assert_eq!(parse_decoration("underline line-through"), (true, true));
+        assert_eq!(parse_decoration("underline dotted red"), (true, false));
+        assert_eq!(parse_decoration("none"), (false, false));
+        let done = TextStyle::inherit(
+            &TextStyle::default(),
+            &Map(vec![("textDecoration", "line-through".into())]),
+        );
+        assert!(done.strike && !done.underline);
+        // Nested text keeps the decoration unless it sets its own.
+        let child = TextStyle::inherit(&done, &Map(vec![("fontSize", 20.0.into())]));
+        assert!(child.strike);
+        let cleared = TextStyle::inherit(&done, &Map(vec![("textDecorationLine", "none".into())]));
+        assert!(!cleared.strike);
     }
 
     #[test]
