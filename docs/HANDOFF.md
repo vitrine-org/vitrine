@@ -7,14 +7,14 @@ Where things stand, so work can resume in a new session. All repositories live u
 
 | Local folder | Repo | State |
 | --- | --- | --- |
-| `vitrine` | `vitrine-org/vitrine` | **v2.0.3 released**: Mica panel chrome (`chrome.rs`), pack icons (manifest `icon`), previews without text shadow (light tile for dark text), headless renders show host "DESKTOP". Installer unsigned. |
-| `vitrine-sdk` | `vitrine-org/sdk` | v2.2.2 (`pack` copies the manifest `icon`). Theme packs still build with `#v2.1.0`, which copies only a root `icon.png`: keep icons at the pack root. No npm. |
-| `vitrine-essentials` | `vitrine-org/essentials` | **3.0.0: only the `conky` widget** (user's choice; the 13 older widgets live on in 2.2.1). |
-| `packs/vega` | `vitrine-org/vega` | 1.0.0: clean rounded widgets in the style of the macOS desktop widgets (Clock, Calendar, Weather, Batteries, Reminders, Note), Inter, own SVG icons. Never named after Apple products. |
-| `packs/sargas` | `vitrine-org/sargas` | 2.1.3 |
-| `packs/antares` | `vitrine-org/antares` | 2.1.4 |
-| `packs/mond` | `vitrine-org/mond` | 2.1.3 |
-| `packs/alnitak` | `vitrine-org/alnitak` | 2.2.2 (word clock + weather in one widget) |
+| `vitrine` | `vitrine-org/vitrine` | **v2.0.4 released and installed**: gallery offers one size per shape (`gallery::shape_of`, thresholds wide ≥ 1.25, tall ≤ 0.8) or the manifest `variants`; first run seeds Conky. 2.0.3 brought Mica panel chrome (`chrome.rs`), pack icons, previews without shadow, headless host "DESKTOP". Installer unsigned. Build in `CARGO_TARGET_DIR=target-dev` when agents render with `target/debug`. |
+| `vitrine-sdk` | `vitrine-org/sdk` | v2.3.0: `useResponsive`, `shapeOf`, `fitScale` (same thresholds as the engine); 2.2.2 copies the manifest `icon`. Theme packs still build with `#v2.1.0`, which copies only a root `icon.png`: keep icons at the pack root. No npm. |
+| `vitrine-essentials` | `vitrine-org/essentials` | **3.1.0: only the `conky` widget** (user's choice; the 13 older widgets live on in 2.2.1). |
+| `packs/vega` | `vitrine-org/vega` | 1.1.1 (responsive: layout per shape, text ≥ 11/12 DIP, fluid rows): clean rounded widgets in the style of the macOS desktop widgets (Clock, Calendar, Weather, Batteries, Reminders, Note), Inter, own SVG icons. Never named after Apple products. |
+| `packs/sargas` | `vitrine-org/sargas` | 2.2.0 |
+| `packs/antares` | `vitrine-org/antares` | 2.2.0 |
+| `packs/mond` | `vitrine-org/mond` | 2.2.0 (real Anurati font for the weekday, licence note in assets/fonts) |
+| `packs/alnitak` | `vitrine-org/alnitak` | 2.3.0 (word clock + weather in one widget) |
 | `vitrine-store` | `vitrine-org/store` | Catalogue every 6 h → `https://vitrine-org.github.io/store/index.json`; now carries `icon` (`icons/<pack>.png`). Vega listed. |
 | `vitrine-org.github.io` | site | Landing, Store at `/packs/`, docs EN/IT (manifest `icon` documented). |
 
@@ -47,13 +47,16 @@ the 2.1.0 theme releases deleted. Don't add widgets to the themes without asking
 
 ## Next steps
 
-1. Ask the user for feedback on 2.0.3 (Mica panel, pack icons), Vega and the Conky-only Essentials.
-2. Essentials store preview is rendered in Italian (this PC's locale); an English render would suit the
-   public Store better (the renderer has no language flag yet: worth adding `render --lang`).
-3. Engine gaps found while building Vega: continuous (squircle) corners, SVG gradients, time zones,
-   multi-line `prompt()`, calendar events.
-4. Ideas not started: code signing; time zones; per-process CPU; multi-monitor glass testing;
-   vitrine:// links from the website Store.
+1. Ask the user for feedback on 2.0.4 and the responsive packs (installed on their PC).
+2. Responsive rule for every widget (user's request, 2026-11-05): shape picks the layout, size only
+   scales it; nothing appears/disappears within a shape; fluid rows; text never below 11/12 DIP.
+3. Known small leftovers in Vega 1.1.1: 4×3 analog world clocks leave ~30 DIP bands, short range
+   bars on 2-wide tall weather, tight month grid at 2 wide, "New York" truncated at 3×2.
+4. Site: hero render, panel shot and intro image still show old widgets; Essentials store preview
+   is rendered in Italian (add `render --lang`). The Anurati licence text is in the Mond repo but not
+   in the .vitrine (the SDK copies only manifest files, README and LICENSE).
+5. Ideas not started: code signing; time zones in the engine; squircle corners and SVG gradients
+   (Vega works around them); multi-line prompt(); multi-monitor glass testing; vitrine:// links.
 
 ## Working notes
 
