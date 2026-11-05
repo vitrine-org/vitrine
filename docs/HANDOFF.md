@@ -41,9 +41,27 @@ the 2.1.0 theme releases deleted. Don't add widgets to the themes without asking
   from the header menu, collapse/expand all, grid or list view; `gallery.json` via
   `vitrine_widgets::gallery::Prefs`); every preview on one neutral dark tile. Edit mode's "Add widget"
   is a centred sheet (`edit.rs` + `sheet.rs`): sidebar (search, All, Favourites, packs), each widget in
-  its min/default/max sizes rendered off-screen at true proportions (worker in `runtime.rs`, cached
+  its sizes (one per shape, or the manifest `variants`) rendered off-screen at true proportions (worker in `runtime.rs`, cached
   per session), drag or "+" to add, Tab/arrows/Enter/Esc.
 - 145+ tests (app 94+, store builder, locales).
+
+## Last cycle (2026-11-05): what the user has to review
+
+Installed on the user's PC: Vitrine 2.0.4 and alnitak 2.3.0, antares 2.2.0, essentials 3.1.0,
+mond 2.2.0, sargas 2.2.0, vega 1.1.1. The user has not given feedback yet.
+
+- Gallery: one size per shape (Vega's clock no longer offered at both 2×2 and 4×4); packs may declare
+  `variants`.
+- Vega 1.1.1: fluid layouts; 5-day forecast is the tall shape (4×5), city clocks the wide one.
+- Mond 2.2.0: real Anurati (`assets/fonts/Anurati-Regular.otf`, free for commercial use, Emmeran
+  Richard; credit in README); date and weather start at 5×2 (1 row was illegible).
+- Sargas, Antares, Alnitak: paddings, line heights and tabular digits fixed against the originals;
+  some minimum sizes raised (Alnitak's word clock no longer square).
+- Essentials 3.1.0 (Conky): always shows every enabled section, fits the height instead of hiding graphs.
+- SDK 2.3.0 `useResponsive()` / `shapeOf()`; site guidelines describe the rule.
+- Contact sheets of every widget at every allowed size (session scratchpad, may be gone):
+  `C:\Users\emanuele\AppData\Local\Temp\claude\ddb4c628772fff85\2ffeb8ec-f4d1-4828-b2ae-de91dd5ad372\scratchpad\sheets\`
+  and `...\scratchpad\vega\`. Regenerate with `vitrine render <pack>/<widget> --size WxH --out f.png`.
 
 ## Next steps
 
@@ -69,7 +87,7 @@ the 2.1.0 theme releases deleted. Don't add widgets to the themes without asking
 - **Desktop testing:** the scratchpad scripts `desk.ps1` (shot/click/rclick/drag/move/key/showdesktop)
   and `winshot.ps1` / PrintWindow. Edit mode minimises the user's windows (Peek) and restores them
   on close; never close or move the user's windows yourself.
-- **Installed build:** `%LOCALAPPDATA%\Programs\Vitrine\vitrine.exe` (2.0.3) owns autostart and the
+- **Installed build:** `%LOCALAPPDATA%\Programs\Vitrine\vitrine.exe` (2.0.4) owns autostart and the
   `.vitrine` association. `taskkill //f //im vitrine.exe` also closes an open control panel;
   restart the installed exe after testing a debug build. Releases: if a tag push does not trigger
   `release.yml`, run `gh workflow run release.yml -f tag=vX.Y.Z`.
